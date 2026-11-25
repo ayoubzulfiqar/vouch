@@ -1,0 +1,141 @@
+# AGENTS.md — contributing to `vouch`
+
+`vouch` is a local authentication multiplexer and process-supervised gateway for
+AI orchestrators. It exposes OpenAI `GET /v1/models` and `POST
+/v1/chat/completions`, plus Anthropic `POST /v1/messages`, over TCP and an
+optional Unix socket. It routes public model names to ordered fallback chains
+of HTTP/SSE daemons, headless CLIs, and PTY subprocesses.
+
+Rust 2024, single binary crate with a library target. No database. All durable
+state is the TOML file plus ephemeral worktrees.
+
+## Architecture map
+
+| Module | Responsibility |
+| --- | --- |
+| `src/config.rs` | Typed TOML schema, validation, `ConfigStore` (ArcSwap snapshot) |
+| `src/error.rs` | The single `GatewayError` type and `Result` alias |
+| `src/cli/mod.rs` | clap definitions for `serve`, `routes`, `doctor`, `service` |
+| `src/ingress/mod.rs` | Shared auth/model/affinity/header/SSE plumbing and the axum router |
+| `src/ingress/openai.rs` | OpenAI wire-format adapter |
+| `src/ingress/anthropic.rs` | Anthropic Messages wire-format adapter |
+| `src/ingress/ops.rs` | `/healthz`, `/readyz`, `/metrics` (unauthenticated) |
+| `src/auth/tokens.rs` | Virtual tokens, constant-time compare, RPM window, model globs |
+| `src/auth/discovery.rs` | Read-only local binary/auth-file/daemon discovery for `doctor` |
+| `src/router/mod.rs` | Route table, sticky sessions, fallback, circuit breakers |
+| `src/router/circuit_breaker.rs` | Per-backend closed/half-open/open state machine |
+| `src/driver/mod.rs` | `Driver` trait, normalized requests, permits, PGID guard, SSE decode |
+| `src/driver/http_proxy.rs` | HTTP/SSE proxy backend |
+| `src/driver/cli_pipe.rs` | stdin/stdout subprocess backend |
+| `src/driver/pty_runner.rs` | `portable-pty` subprocess backend |
+| `src/driver/workspace.rs` | git worktree lifecycle |
+| `src/telemetry.rs` | JSON tracing + secret redaction (global registry) |
+| `src/metrics.rs` | Prometheus recorder and all `vouch_*` instruments |
+| `src/state.rs` | `AppState`: config, router, tokens, workspaces, shutdown, reload |
+
+### Request lifecycle
+
+1. axum middleware records protocol/endpoint/status/latency.
+2. The adapter deserializes its payload; `ingress::prepare` authenticates the
+   token, resolves the public model, applies `X-Session-ID` (or hashes system +
+   first user turn) for affinity, and parses `X-Workspace-Mode`.
+3. `ExecutionRequest` is normalized; `server.request_timeout_secs` wraps the
+   whole routed execution.
+4. `Router::execute` loads an immutable table snapshot, promotes the sticky
+   backend to the front of the chain, and walks it. Circuit-open, saturated,
+   or failing backends are skipped; a failure before a stream starts fails over
+   transparently.
+5. A driver acquires a bounded concurrency permit, executes, and returns a
+   complete `Completion` or a bounded `ChunkStream`.
+6. The adapter renders OpenAI or Anthropic JSON/SSE and attaches
+   `x-vouch-backend`, `x-vouch-fallback`, `x-vouch-request-id`.
+
+## Conventions that must hold
+
+### No `unwrap`/`expect` in runtime paths
+
+Fallible work returns `Result<T>` with `GatewayError` variants. Convert with
+`ok_or_else`, `map_err`, `?`, or `unwrap_or(_default)` for genuinely benign
+fallbacks. `expect`/`unwrap` are acceptable only in `#[cfg(test)]` code and for
+static, provably infallible initialization (for example the `LazyLock` regexes
+in `telemetry.rs`). Never let a malformed request, bad upstream, or missing
+env var panic the daemon. Client-visible error strings go through
+`telemetry::redact_text`.
+
+### Bound every channel and buffer
+
+- Stream bridges use `mpsc::channel::<Result<StreamChunk>>(32)`, never an
+  unbounded channel. A slow SSE consumer applies backpressure through the
+  `PermitGuard` held for the stream's lifetime.
+- Subprocess stdout is capped at 16 MiB, captured stderr at 8 KiB, collected
+  streams at 16 MiB, and request bodies by `server.max_body_bytes`.
+- `PermitGuard::acquire` waits at most `queue_timeout_ms`, honors client
+  cancellation, releases on `Drop`, and updates the active-permit gauge.
+
+### PGID supervision for every child process
+
+Subprocess backends spawn with `process_group(0)` so PGID == PID. Move a
+`ProcessGroupGuard` into the task that owns the child: `disarm()` on clean
+exit, `terminate()` on timeout, I/O error, cancellation, or dropped stream.
+Termination sends `SIGTERM` to the whole group, waits 500 ms, then escalates to
+`SIGKILL` if members remain — grandchildren must never outlive a request.
+PTY work is blocking (`portable-pty`) so it runs inside `spawn_blocking` and
+communicates over bounded channels with the same guard.
+
+### Hot reload via ArcSwap (never tearing down in-flight work)
+
+`ConfigStore`, `Router::table`, `TokenRegistry::policies`, and
+`RedactionRegistry::secrets` are `ArcSwap`-backed. A reload is atomic:
+validate the file, rebuild token policies, rebuild the router table, update
+workspace settings and redaction secrets, then `store_snapshot` last. If any
+step fails, keep the previous snapshot. Circuit breakers are reused by backend
+id so cooldown state survives reload. Changing `server.tcp_listen` or
+`server.unix_socket` requires a restart — log that explicitly. Readers keep
+their `Arc` snapshot for the duration of a request.
+
+### reqwest feature flag
+
+`Cargo.toml` pins `reqwest` with `default-features = false` and features
+`["json", "stream", "rustls"]`. Keep `rustls` — do **not** switch to
+`rustls-tls` or enable default TLS. The gateway is a local daemon and must not
+silently depend on system OpenSSL.
+
+### License headers
+
+`vouch` is `GPL-3.0-or-later`; see [LICENSE](LICENSE), [NOTICE](NOTICE), and
+"Choosing a license" in [README.md](README.md). Add
+`//! SPDX-License-Identifier: GPL-3.0-or-later` to new source files. Never copy
+in code whose license is incompatible with GPLv3, and never paste credentials,
+user prompts, or third-party snippets with unknown provenance into source,
+tests, docs, or fixtures.
+
+### Config is a strict contract
+
+Every schema struct uses `#[serde(deny_unknown_fields)]`. Adding a field means
+updating the struct, its `Default`/default fn, `vouch.example.toml`, and this
+repo's docs together. Re-validate the example with
+`GatewayConfig::from_toml_str` after any change. Validation invariants live in
+`GatewayConfig::validate` / `BackendConfig::validate`: non-empty backends and
+routes, unique backend ids, known/no-duplicate route ids, valid globs, tokens
+at least 8 chars, and workspace consistency.
+
+### Secrets
+
+`GatewayConfig::secrets()` collects token values, secret-looking `env` values,
+secret-looking `extra_headers`, and the value of `api_key_env`. Feed these to
+`telemetry::set_global_secrets` whenever config installs or reloads. Never log
+a token, prompt body, or upstream key. `/healthz`, `/readyz`, and `/metrics`
+expose only ids and circuit state.
+
+## Working on this repo
+
+- Keep clap argument definitions in `src/cli/mod.rs`. `src/main.rs` dispatches
+  those commands and owns the serve/listener/signal/hot-reload wiring:
+  SIGINT/SIGTERM drain gracefully, SIGHUP and config-file changes reload
+  atomically, and `doctor` exits `2` when a check is unhealthy.
+- Keep adapters protocol-only: auth, model resolution, affinity, and fallback
+  belong in shared code, not duplicated per wire format.
+- Tests are colocated in `#[cfg(test)]` modules; `tempfile` is available as a
+  dev-dependency. Run `cargo test` and `cargo build` before handing work off.
+- Documentation lives in `README.md`; the runnable schema reference is
+  `vouch.example.toml`. Keep both in sync with `src/config.rs`.
