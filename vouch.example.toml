@@ -1,0 +1,181 @@
+# vouch — example production configuration
+#
+# Copy to `vouch.toml` and edit. Every table and field below is part of the
+# real `GatewayConfig` schema (all structs use `serde(deny_unknown_fields)`),
+# so a typo fails validation at startup instead of being silently ignored.
+#
+# Start with:  vouch serve --config vouch.toml
+# Check first: vouch doctor --config vouch.toml  /  vouch routes --config vouch.toml
+#
+# Secret handling: the token values below are placeholders. Prefer keeping
+# real secrets OUT of this file — HTTP upstream keys are read from the
+# environment via `api_key_env`, and subprocess secrets via `env`. This file
+# is scanned by `vouch doctor` and its values are fed to the log redactor.
+
+# ---------------------------------------------------------------------------
+# [server] — listener and process-wide deadlines. All fields are optional.
+# ---------------------------------------------------------------------------
+[server]
+# TCP bind address. Default: "127.0.0.1:8080" (loopback only).
+tcp_listen = "127.0.0.1:8080"
+# Optional Unix domain socket, created with mode 0600. Omit to disable.
+unix_socket = "/run/user/1000/vouch.sock"
+# Deadline for non-streaming requests, including workspace setup. Default: 300.
+request_timeout_secs = 300
+# Maximum lifetime of a single streaming response. Default: 900.
+stream_timeout_secs = 900
+# SSE keep-alive comment interval in seconds; 0 disables keep-alives. Default: 15.
+keep_alive_interval_secs = 15
+# Maximum accepted request body size in bytes (8 MiB). Must be > 0.
+max_body_bytes = 8388608
+# Tracing filter; the RUST_LOG environment variable takes precedence. Default: "info".
+log_level = "info"
+# Allow permissive CORS for browser clients. Default: false (off).
+cors_permissive = false
+
+# ---------------------------------------------------------------------------
+# [defaults] — inherited by backends and by request handling.
+# ---------------------------------------------------------------------------
+[defaults]
+# Model used when a caller omits `model`. If set, it MUST name a [routes] key.
+# When unset, a single-route config still resolves that route as the default.
+model = "coding/default"
+# Idle lifetime of sticky sessions and isolated worktrees. Default: 3600.
+session_ttl_secs = 3600
+# Default per-backend concurrency limit. Default: 4. Must be > 0.
+max_concurrency = 4
+# Default ms to wait for a backend permit before failing over. Default: 250.
+queue_timeout_ms = 250
+
+# ---------------------------------------------------------------------------
+# [resilience] — shared circuit-breaker tuning. Non-zero values required.
+# ---------------------------------------------------------------------------
+[resilience]
+# Consecutive failures that open a circuit. Default: 3.
+failure_threshold = 3
+# Cooldown before an open circuit admits a half-open probe. Default: 30.
+reset_timeout_secs = 30
+# Maximum concurrent probes while half-open. Default: 1.
+half_open_max_probes = 1
+# Open the circuit immediately on an upstream HTTP 429. Default: true.
+open_on_rate_limit = true
+
+# ---------------------------------------------------------------------------
+# [workspace] — optional git worktree isolation for cli/pty backends.
+# Enabling requires repo_path; disabling forbids `isolate_workspace = true`.
+# ---------------------------------------------------------------------------
+[workspace]
+enabled = true
+# MUST be an existing git repository when enabled = true.
+repo_path = "/path/to/agent-workspace"
+# Parent directory for ephemeral worktrees. Omit to use <temp>/vouch-worktrees.
+root = "/path/to/vouch-worktrees"
+# Idle time before an unused worktree is removed. Default: 3600.
+ttl_secs = 3600
+git_binary = "git"
+# Remove all worktrees on graceful shutdown. Default: true.
+cleanup_on_shutdown = true
+
+# ---------------------------------------------------------------------------
+# [discovery] — read-only checks used by `vouch doctor`.
+# ---------------------------------------------------------------------------
+[discovery]
+# Inspect well-known local auth files. Default: true.
+enabled = true
+# TCP-probe configured HTTP backends. Default: true.
+probe_ports = true
+# Extra credential paths to report on (metadata only, never contents).
+extra_auth_paths = ["/path/to/my-agent/token.json"]
+
+# ---------------------------------------------------------------------------
+# [[backends]] — egress targets. At least one is required; ids must be unique.
+# kind = "http" | "cli" | "pty". All three shapes are shown below.
+# ---------------------------------------------------------------------------
+
+# 1) HTTP/SSE proxy to a local daemon that already speaks the OpenAI wire
+#    format (e.g. `hermes proxy`, `opencode serve`). HTTP backends REQUIRE
+#    base_url and MUST NOT set `command`.
+[[backends]]
+id = "local-hermes"
+kind = "http"
+max_concurrency = 2
+timeout_secs = 300
+queue_timeout_ms = 500
+isolate_workspace = false
+# Model name sent upstream; omit to forward the requested public model.
+model = "hermes/default"
+base_url = "http://127.0.0.1:8645"
+upstream_path = "/v1/chat/completions"
+health_path = "/healthz"
+# Name of an environment variable holding the upstream bearer token.
+api_key_env = "HERMES_UPSTREAM_KEY"
+extra_headers = { "X-Vouch-Client" = "vouch" }
+
+# 2) Headless stdin/stdout subprocess. cli/pty backends REQUIRE `command` and
+#    MUST NOT set `base_url`. Prompt transport: set `stdin = true` OR include
+#    `{prompt}` in `args`. Substitutions: {prompt}, {model}, {session_id},
+#    {request_id}. Child also receives VOUCH_REQUEST_ID / VOUCH_SESSION_ID /
+#    VOUCH_MODEL. Each child runs in its own process group (PGID = PID).
+[[backends]]
+id = "codex-cli"
+kind = "cli"
+max_concurrency = 1
+timeout_secs = 300
+queue_timeout_ms = 1000
+isolate_workspace = true
+command = "codex"
+args = ["exec", "--model", "{model}", "--skip-git-repo-check"]
+stdin = true
+env = { CODEX_HOME = "/path/to/.codex" }
+# Ignored while workspace isolation is active.
+workdir = "/path/to/projects"
+# stdout interpretation: "text" (ANSI stripped, default) | "json" | "json_lines".
+output_mode = "json"
+pty_send_eof = true
+
+# 3) Pseudo-terminal subprocess for CLIs that need a TTY or render a TUI.
+#    Runs in spawn_blocking with bounded channels; here the prompt is passed
+#    as an argument instead of stdin, which also satisfies prompt transport.
+[[backends]]
+id = "interactive-pty"
+kind = "pty"
+max_concurrency = 1
+timeout_secs = 600
+queue_timeout_ms = 1000
+isolate_workspace = false
+command = "opencode"
+args = ["run", "{prompt}"]
+stdin = false
+env = { TERM = "xterm-256color" }
+output_mode = "text"
+# Send EOT after the prompt when the child reads stdin. Default: true.
+pty_send_eof = true
+
+# ---------------------------------------------------------------------------
+# [routes] — public model name -> ORDERED fallback chain of backend ids.
+# A sticky session's backend is tried first; then the chain in order. Circuit-
+# open or saturated backends are skipped. At least one route is required.
+# ---------------------------------------------------------------------------
+[routes]
+"coding/default" = ["codex-cli", "local-hermes", "interactive-pty"]
+"coding/fast" = ["local-hermes", "codex-cli"]
+"general" = ["interactive-pty", "local-hermes"]
+
+# ---------------------------------------------------------------------------
+# [[tokens]] — optional virtual ingress credentials. When this list is EMPTY,
+# vouch runs in local mode and accepts any/no credential. Once present, every
+# ingress call requires Authorization: Bearer <token> or x-api-key.
+# Tokens must be >= 8 chars and unique; rpm, when set, must be > 0.
+# allowed_models are globs; empty means all models.
+# ---------------------------------------------------------------------------
+[[tokens]]
+token = "vouch-replace-me-laptop"
+name = "laptop-agent"
+rpm = 60
+allowed_models = ["coding/*", "general"]
+
+[[tokens]]
+token = "vouch-replace-me-ci"
+name = "ci-runner"
+rpm = 20
+allowed_models = ["coding/fast"]
