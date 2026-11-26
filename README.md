@@ -127,7 +127,7 @@ Add `~/.local/bin` to `PATH`, then install the user service:
 ```bash
 vouch service install --config "$HOME/.config/vouch/vouch.toml"
 systemctl --user status vouch.service          # Linux
-# launchctl print gui/$(id -u)/com.nousresearch.vouch   # macOS
+# launchctl print gui/$(id -u)/io.github.ayoubzulfiqar.vouch   # macOS
 ```
 
 `service install` writes a unit under `$HOME` (never system-wide), defaults the executable to the current binary, and accepts `--binary` and `--no-start`. `service uninstall` stops/disables the unit unless `--no-stop` is given. See [Running as a service](#running-as-a-service).
@@ -550,15 +550,15 @@ journalctl --user -u vouch.service -f
 
 # Edit config, then reload without dropping requests
 $EDITOR "$HOME/.config/vouch/vouch.toml"
-pkill -HUP -x vouch                # SIGHUP triggers atomic reload
+systemctl --user reload vouch.service   # SIGHUP triggers atomic reload
 
 # Remove
 vouch service uninstall
 ```
 
-On macOS the agent lives at `~/Library/LaunchAgents/com.nousresearch.vouch.plist` and is managed with `launchctl load`/`unload`. The generated unit uses `Restart=on-failure`, `KillMode=control-group`, and a `0600` file mode.
+On macOS the agent is `io.github.ayoubzulfiqar.vouch`, installed at `~/Library/LaunchAgents/io.github.ayoubzulfiqar.vouch.plist` and managed with `launchctl load`/`unload`. The generated systemd unit uses `Restart=on-failure`, `KillMode=control-group`, `ExecReload=/bin/kill -HUP $MAINPID`, and a `0600` file mode.
 
-The generated unit does not declare `ExecReload`, so `systemctl --user reload` will not work out of the box. Send `SIGHUP` directly (`pkill -HUP -x vouch`), or add `ExecReload=/bin/kill -HUP $MAINPID` to the `[Service]` section of the generated unit.
+`systemctl --user reload vouch.service` sends `SIGHUP` to the daemon, which swaps the configuration atomically without dropping in-flight requests.
 
 ## Development
 
