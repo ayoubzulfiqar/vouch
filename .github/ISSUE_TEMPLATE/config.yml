@@ -1,0 +1,13 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Bug reports
+    url: <repository-url>/issues/new/choose
+    about: Use the Bug report issue form. Include reproduction steps, redacted config, version, OS, and logs.
+
+  - name: Feature requests
+    url: <repository-url>/issues/new/choose
+    about: Use the Feature request issue form. Describe the problem, your proposal, and alternatives considered.
+
+  - name: Security vulnerability
+    url: <repository-url>/blob/main/SECURITY.md
+    about: Report vulnerabilities privately as described in SECURITY.md. Do not open a public issue or paste credentials.
