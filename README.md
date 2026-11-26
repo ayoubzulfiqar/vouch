@@ -88,7 +88,7 @@ Processes are supervised, not just spawned. Each child runs in its own process g
 ## Quick start
 
 ```bash
-git clone <repository-url> vouch       # replace with your repository URL
+git clone https://github.com/ayoubzulfiqar/vouch.git vouch
 cd vouch
 cargo build --release
 cp vouch.example.toml vouch.toml

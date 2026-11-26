@@ -73,12 +73,10 @@ templates are for bugs and features only.
 
 Report privately using either channel:
 
-- GitHub private vulnerability reporting: `<repository-url>/security/advisories/new`
-  (**placeholder** — replace with the repository's actual security-advisory URL
-  once a remote is configured).
-- Email: **[SECURITY EMAIL — placeholder: replace with a maintainer-monitored
-  address before publishing. Do not substitute a real personal address here
-  without its owner's consent.]**
+- GitHub private vulnerability reporting:
+  <https://github.com/ayoubzulfiqar/vouch/security/advisories/new> (preferred).
+- Email: `ayoubzulfiqar3@gmail.com` (maintainer-monitored; use only if the
+  advisory channel is unavailable).
 
 Include:
 

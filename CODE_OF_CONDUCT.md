@@ -72,9 +72,8 @@ representative at an online or offline event.
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the community leaders responsible for enforcement at:
 
-> **[REPORTING CONTACT — placeholder: replace with the maintainer's contact
-> method, e.g. a private email address or GitHub private reporting link. Do
-> not publish a real personal address here without the owner's consent.]**
+> **`ayoubzulfiqar3@gmail.com`** (maintainer). Reports are handled privately by
+> the project maintainers.
 
 All complaints will be reviewed and investigated promptly and fairly.
 
