@@ -1,0 +1,54 @@
+name: Feature request
+description: Propose a new capability or an improvement to vouch
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the problem first, then your proposal. This helps
+        maintainers understand the use case before debating an implementation.
+        For security vulnerabilities, follow SECURITY.md and report privately
+        instead of using this form.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: |
+        What problem are you trying to solve? What are you doing today, and
+        why is the current behavior insufficient? Include the use case and who
+        it affects.
+      placeholder: "I want to ... but vouch currently ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        Describe the behavior or API you would like. If it touches config,
+        name the proposed section/field and how it should validate; if it
+        touches a backend, name the driver or protocol. Be concrete about
+        observable behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: |
+        What other approaches or workarounds did you consider, and why did you
+        reject them? Note any impact on existing config or behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: References, examples, or related issues. Do not include secrets.
+    validations:
+      required: false
