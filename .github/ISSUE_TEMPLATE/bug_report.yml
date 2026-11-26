@@ -1,0 +1,95 @@
+name: Bug report
+description: Report incorrect or unexpected behavior in vouch
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please redact all tokens,
+        API keys, prompts, and auth-file contents before submitting.
+        For security vulnerabilities, follow SECURITY.md and report privately
+        instead of using this form.
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal, concrete steps that reliably trigger the problem.
+      placeholder: |
+        1. Start vouch with the config below (`vouch serve -c vouch.toml`).
+        2. Send a POST to /v1/chat/completions with a minimal messages payload ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-vs-actual
+    attributes:
+      label: Expected vs. actual behavior
+      description: What you expected to happen and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration (secrets redacted)
+      description: |
+        Paste the relevant vouch.toml sections with every token, api key, env
+        value, extra header, and path to credentials replaced by REDACTED.
+        Never include real credentials, prompts, or auth-file contents.
+      render: toml
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: vouch version / commit
+      description: Output of `vouch --version`, or the git commit hash.
+      placeholder: "vouch 0.1.0 (or commit abc1234)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      description: Platform on which vouch is running.
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: rust-toolchain
+    attributes:
+      label: Rust toolchain (if building from source)
+      description: Output of `rustc --version`. Optional for binary installs.
+      placeholder: "rustc 1.85.0 (edition 2024)"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: |
+        Include redacting JSON logs from the failing request. Remove any token,
+        upstream key, prompt body, or other sensitive value. Use the smallest
+        excerpt that shows the failure.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: workarounds
+    attributes:
+      label: Workarounds or additional context
+      description: Anything else that may help, such as a workaround you found.
+    validations:
+      required: false
