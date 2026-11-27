@@ -21,9 +21,9 @@ use crate::{
     config::{BackendConfig, BackendKind, DefaultsConfig},
     driver::{
         ChunkStream, Completion, Driver, DriverResponse, ExecutionRequest, PermitGuard, SseDecoder,
-        StreamChunk, ToolCallDelta, Usage, extract_content, extract_delta,
+        StreamChunk, ToolCallDelta, Usage, extract_content, extract_delta_full, extract_thinking,
         extract_tool_call_deltas, extract_tool_calls, extract_upstream_error, extract_usage,
-        map_upstream_status, truncate,
+        map_upstream_status_with_headers, truncate,
     },
     error::{GatewayError, Result},
     telemetry,
@@ -155,11 +155,16 @@ impl HttpProxyDriver {
         {
             object.insert("tool_choice".into(), tool_choice.clone());
         }
+        if let Some(format) = &request.response_format
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("response_format".into(), format.to_openai_json());
+        }
         if let Some(object) = body.as_object_mut() {
             for (key, value) in &request.extra {
                 if !matches!(
                     key.as_str(),
-                    "model" | "messages" | "stream" | "tools" | "tool_choice"
+                    "model" | "messages" | "stream" | "tools" | "tool_choice" | "response_format"
                 ) {
                     object.insert(key.clone(), value.clone());
                 }
@@ -177,9 +182,14 @@ impl HttpProxyDriver {
             .send()
             .await?;
         let status = response.status();
+        let resp_headers = response.headers().clone();
         let text = response.text().await?;
         if !status.is_success() {
-            return Err(map_upstream_status(status.as_u16(), &text));
+            return Err(map_upstream_status_with_headers(
+                status.as_u16(),
+                Some(&resp_headers),
+                &text,
+            ));
         }
         let value: Value = serde_json::from_str(&text).map_err(|error| {
             GatewayError::Upstream(format!(
@@ -195,9 +205,10 @@ impl HttpProxyDriver {
             )));
         }
         let tool_calls = extract_tool_calls(&value);
+        let thinking = extract_thinking(&value);
         let content = match extract_content(&value) {
             Some(content) => content,
-            None if !tool_calls.is_empty() => String::new(),
+            None if !tool_calls.is_empty() || !thinking.is_empty() => String::new(),
             None => {
                 return Err(GatewayError::Upstream(format!(
                     "backend {} response did not contain assistant content",
@@ -224,6 +235,7 @@ impl HttpProxyDriver {
             usage,
             raw: Some(value),
             tool_calls,
+            thinking,
         })
     }
 
@@ -240,9 +252,14 @@ impl HttpProxyDriver {
             .send()
             .await?;
         let status = response.status();
+        let resp_headers = response.headers().clone();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(map_upstream_status(status.as_u16(), &text));
+            return Err(map_upstream_status_with_headers(
+                status.as_u16(),
+                Some(&resp_headers),
+                &text,
+            ));
         }
         let is_sse = response
             .headers()
@@ -262,9 +279,10 @@ impl HttpProxyDriver {
                 ))
             })?;
             let tool_calls = extract_tool_calls(&value);
+            let thinking = extract_thinking(&value);
             let content = match extract_content(&value) {
                 Some(content) => content,
-                None if !tool_calls.is_empty() => String::new(),
+                None if !tool_calls.is_empty() || !thinking.is_empty() => String::new(),
                 None => {
                     return Err(GatewayError::Upstream(format!(
                         "backend {} response did not contain assistant content",
@@ -274,6 +292,23 @@ impl HttpProxyDriver {
             };
             let usage = extract_usage(&value);
             let mut items = Vec::new();
+            for block in thinking {
+                match block {
+                    crate::driver::ThinkingBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => {
+                        let mut chunk = StreamChunk::thinking(thinking);
+                        chunk.signature_delta = signature;
+                        items.push(Ok(chunk));
+                    }
+                    crate::driver::ThinkingBlock::RedactedThinking { data } => {
+                        let mut chunk = StreamChunk::delta("");
+                        chunk.redacted_thinking = Some(data);
+                        items.push(Ok(chunk));
+                    }
+                }
+            }
             if !content.is_empty() {
                 items.push(Ok(StreamChunk::delta(content)));
             }
@@ -353,12 +388,27 @@ impl HttpProxyDriver {
                             .await;
                         return;
                     }
-                    let (delta, finish, event_usage) = extract_delta(&value);
+                    let parts = extract_delta_full(&value);
                     let tool_deltas = extract_tool_call_deltas(&value);
-                    if event_usage.is_some() {
-                        usage = event_usage;
+                    if parts.usage.is_some() {
+                        usage = parts.usage;
                     }
-                    if let Some(delta) = delta
+                    if let Some(redacted) = parts.redacted_thinking {
+                        let mut c = StreamChunk::delta("");
+                        c.redacted_thinking = Some(redacted);
+                        if sender.send(Ok(c)).await.is_err() {
+                            return;
+                        }
+                    }
+                    if parts.thinking.is_some() || parts.signature.is_some() {
+                        let mut c = StreamChunk::delta("");
+                        c.thinking_delta = parts.thinking;
+                        c.signature_delta = parts.signature;
+                        if sender.send(Ok(c)).await.is_err() {
+                            return;
+                        }
+                    }
+                    if let Some(delta) = parts.content
                         && !delta.is_empty()
                     {
                         produced.push_str(&delta);
@@ -376,7 +426,7 @@ impl HttpProxyDriver {
                             return;
                         }
                     }
-                    if let Some(reason) = finish {
+                    if let Some(reason) = parts.finish_reason {
                         let _ = sender.send(Ok(StreamChunk::finish(reason, usage))).await;
                         finished = true;
                         break;
