@@ -26,6 +26,7 @@ pub mod metrics;
 pub mod router;
 pub mod state;
 pub mod telemetry;
+pub mod usage;
 
 /// Crate version, sourced from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
