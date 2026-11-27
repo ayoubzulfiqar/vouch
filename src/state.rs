@@ -18,16 +18,17 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     auth::TokenRegistry,
+    cache::ResponseCache,
     cli::mcp::McpTaskStore,
     config::{ConfigStore, GatewayConfig},
-    driver::workspace::WorkspaceManager,
+    driver::{Usage, workspace::WorkspaceManager},
     error::{GatewayError, Result},
     ingress::responses::ResponseStore,
     metrics::Metrics,
     persistence::{GatewaySnapshot, load_snapshot, save_snapshot},
     router::{ResolvedRoute, Router, RoutingInput, SessionAffinity},
     telemetry::{self, OtelExporter},
-    usage::UsageTracker,
+    usage::{UsageTracker, calculate_cost_usd},
 };
 
 /// Process-wide gateway state.
@@ -37,6 +38,7 @@ pub struct AppState {
     tokens: Arc<TokenRegistry>,
     workspaces: Arc<WorkspaceManager>,
     responses: Arc<ResponseStore>,
+    cache: Arc<ResponseCache>,
     mcp_tasks: Arc<McpTaskStore>,
     metrics: Metrics,
     usage: Arc<UsageTracker>,
@@ -77,6 +79,7 @@ impl AppState {
         let tokens = Arc::new(TokenRegistry::new(&config.tokens)?);
         let workspaces = Arc::new(WorkspaceManager::new(config.workspace.clone()));
         let responses = Arc::new(ResponseStore::with_max_entries(max_entries));
+        let cache = Arc::new(ResponseCache::new(config.cache.clone()));
         let mcp_tasks = Arc::new(McpTaskStore::new());
 
         if let Some(state_dir) = config.defaults.state_dir.as_deref()
@@ -86,10 +89,12 @@ impl AppState {
             responses.restore_snapshot(&snapshot.responses, ttl);
             tokens.restore_daily_state(&snapshot.daily_token_budgets);
             usage.restore(&snapshot.usage);
+            cache.restore_snapshot(&snapshot.cached_responses);
             tracing::info!(
                 dir = %state_dir.display(),
                 sessions = sessions.len(),
                 responses = responses.len(),
+                cached = cache.len(),
                 "restored persistent state snapshot"
             );
         }
@@ -102,6 +107,7 @@ impl AppState {
             tokens,
             workspaces,
             responses,
+            cache,
             mcp_tasks,
             metrics,
             usage,
@@ -116,6 +122,16 @@ impl AppState {
     /// Cumulative usage and latency analytics tracker.
     pub fn usage(&self) -> &Arc<UsageTracker> {
         &self.usage
+    }
+
+    /// Deterministic response cache.
+    pub fn cache(&self) -> &Arc<ResponseCache> {
+        &self.cache
+    }
+
+    /// Calculate USD cost for `usage` using `[pricing]` overrides.
+    pub fn calculate_cost_usd(&self, route: &str, backend_id: &str, usage: Usage) -> f64 {
+        calculate_cost_usd(&self.config.load().pricing, route, backend_id, usage)
     }
 
     /// Non-blocking OpenTelemetry trace span exporter.
@@ -213,6 +229,7 @@ impl AppState {
 
         self.responses
             .set_max_entries(next.defaults.max_session_entries);
+        self.cache.update_config(next.cache.clone());
         self.workspaces.update_config(next.workspace.clone());
         self.otel.reconfigure(&next.telemetry);
         telemetry::set_global_secrets(next.secrets());
@@ -266,6 +283,7 @@ impl AppState {
             self.workspaces
                 .spawn_eviction_task(self.shutdown_token.clone()),
         );
+        background.push(self.cache.spawn_eviction_task(self.shutdown_token.clone()));
         if let Some(otel_handle) = self.otel.start_worker(self.shutdown_token.clone()) {
             background.push(otel_handle);
         }
@@ -299,7 +317,9 @@ impl AppState {
         let responses = self.responses.export_snapshot(ttl);
         let budgets = self.tokens.export_daily_state();
         let usage = self.usage.snapshot();
-        let snapshot = GatewaySnapshot::new(affinity, backend_sessions, responses, budgets, usage);
+        let cached = self.cache.export_snapshot();
+        let snapshot = GatewaySnapshot::new(affinity, backend_sessions, responses, budgets, usage)
+            .with_cached_responses(cached);
         save_snapshot(state_dir, &snapshot)
     }
 
