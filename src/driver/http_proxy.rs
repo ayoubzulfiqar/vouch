@@ -21,7 +21,8 @@ use crate::{
     config::{BackendConfig, BackendKind, DefaultsConfig},
     driver::{
         ChunkStream, Completion, Driver, DriverResponse, ExecutionRequest, PermitGuard, SseDecoder,
-        StreamChunk, Usage, extract_content, extract_delta, extract_upstream_error, extract_usage,
+        StreamChunk, ToolCallDelta, Usage, extract_content, extract_delta,
+        extract_tool_call_deltas, extract_tool_calls, extract_upstream_error, extract_usage,
         map_upstream_status, truncate,
     },
     error::{GatewayError, Result},
@@ -144,9 +145,22 @@ impl HttpProxyDriver {
         {
             object.insert("max_tokens".into(), json!(max_tokens));
         }
+        if !request.tools.is_empty()
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("tools".into(), json!(request.tools));
+        }
+        if let Some(tool_choice) = &request.tool_choice
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("tool_choice".into(), tool_choice.clone());
+        }
         if let Some(object) = body.as_object_mut() {
             for (key, value) in &request.extra {
-                if key != "model" && key != "messages" && key != "stream" {
+                if !matches!(
+                    key.as_str(),
+                    "model" | "messages" | "stream" | "tools" | "tool_choice"
+                ) {
                     object.insert(key.clone(), value.clone());
                 }
             }
@@ -180,24 +194,36 @@ impl HttpProxyDriver {
                 truncate(&telemetry::redact_text(&error), 500)
             )));
         }
-        let content = extract_content(&value).ok_or_else(|| {
-            GatewayError::Upstream(format!(
-                "backend {} response did not contain assistant content",
-                self.config.id
-            ))
-        })?;
+        let tool_calls = extract_tool_calls(&value);
+        let content = match extract_content(&value) {
+            Some(content) => content,
+            None if !tool_calls.is_empty() => String::new(),
+            None => {
+                return Err(GatewayError::Upstream(format!(
+                    "backend {} response did not contain assistant content",
+                    self.config.id
+                )));
+            }
+        };
+        let default_finish = if tool_calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        };
         let finish_reason = value
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)
-            .unwrap_or("stop")
+            .unwrap_or(default_finish)
             .to_string();
-        let usage = extract_usage(&value)
-            .unwrap_or_else(|| Usage::estimate(&request.rendered_prompt(), &content));
+        let usage = extract_usage(&value).unwrap_or_else(|| {
+            Usage::estimate_for_model(&request.model, &request.rendered_prompt(), &content)
+        });
         Ok(Completion {
             content,
             finish_reason,
             usage,
             raw: Some(value),
+            tool_calls,
         })
     }
 
@@ -227,7 +253,7 @@ impl HttpProxyDriver {
 
         if !is_sse {
             // Some daemons ignore `stream: true`. Fall back to a complete
-            // response delivered as a single streamed delta.
+            // response delivered as streamed chunks.
             let text = response.text().await?;
             let value: Value = serde_json::from_str(&text).map_err(|error| {
                 GatewayError::Upstream(format!(
@@ -235,22 +261,45 @@ impl HttpProxyDriver {
                     self.config.id
                 ))
             })?;
-            let content = extract_content(&value).ok_or_else(|| {
-                GatewayError::Upstream(format!(
-                    "backend {} response did not contain assistant content",
-                    self.config.id
-                ))
-            })?;
+            let tool_calls = extract_tool_calls(&value);
+            let content = match extract_content(&value) {
+                Some(content) => content,
+                None if !tool_calls.is_empty() => String::new(),
+                None => {
+                    return Err(GatewayError::Upstream(format!(
+                        "backend {} response did not contain assistant content",
+                        self.config.id
+                    )));
+                }
+            };
             let usage = extract_usage(&value);
-            let stream: ChunkStream = Box::pin(futures::stream::iter(vec![
-                Ok(StreamChunk::delta(content)),
-                Ok(StreamChunk::finish("stop", usage)),
-            ]));
+            let mut items = Vec::new();
+            if !content.is_empty() {
+                items.push(Ok(StreamChunk::delta(content)));
+            }
+            if !tool_calls.is_empty() {
+                let deltas = tool_calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, call)| ToolCallDelta {
+                        index,
+                        id: Some(call.id),
+                        name: Some(call.name),
+                        arguments_delta: Some(call.arguments),
+                    })
+                    .collect();
+                items.push(Ok(StreamChunk::tool_calls(deltas)));
+                items.push(Ok(StreamChunk::finish("tool_calls", usage)));
+            } else {
+                items.push(Ok(StreamChunk::finish("stop", usage)));
+            }
+            let stream: ChunkStream = Box::pin(futures::stream::iter(items));
             return Ok(DriverResponse::Stream(stream));
         }
 
         let backend = self.config.id.clone();
         let cancel = request.cancel.clone();
+        let model = request.model.clone();
         let prompt = request.rendered_prompt();
         let (sender, receiver) = mpsc::channel::<Result<StreamChunk>>(32);
         let mut bytes = response.bytes_stream();
@@ -260,6 +309,7 @@ impl HttpProxyDriver {
             let mut decoder = SseDecoder::new();
             let mut usage = None;
             let mut finished = false;
+            let mut saw_tool_calls = false;
             let mut produced = String::new();
 
             loop {
@@ -304,6 +354,7 @@ impl HttpProxyDriver {
                         return;
                     }
                     let (delta, finish, event_usage) = extract_delta(&value);
+                    let tool_deltas = extract_tool_call_deltas(&value);
                     if event_usage.is_some() {
                         usage = event_usage;
                     }
@@ -312,6 +363,16 @@ impl HttpProxyDriver {
                     {
                         produced.push_str(&delta);
                         if sender.send(Ok(StreamChunk::delta(delta))).await.is_err() {
+                            return;
+                        }
+                    }
+                    if !tool_deltas.is_empty() {
+                        saw_tool_calls = true;
+                        if sender
+                            .send(Ok(StreamChunk::tool_calls(tool_deltas)))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -327,8 +388,10 @@ impl HttpProxyDriver {
             }
 
             if !finished {
-                let usage = usage.or_else(|| Some(Usage::estimate(&prompt, &produced)));
-                let _ = sender.send(Ok(StreamChunk::finish("stop", usage))).await;
+                let usage =
+                    usage.or_else(|| Some(Usage::estimate_for_model(&model, &prompt, &produced)));
+                let reason = if saw_tool_calls { "tool_calls" } else { "stop" };
+                let _ = sender.send(Ok(StreamChunk::finish(reason, usage))).await;
             }
         });
 
