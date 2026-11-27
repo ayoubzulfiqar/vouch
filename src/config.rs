@@ -227,6 +227,43 @@ pub struct BackendConfig {
     /// For PTY backends that read stdin, send EOT after the prompt.
     #[serde(default = "default_true")]
     pub pty_send_eof: bool,
+    /// Prompts larger than this (when `stdin = false`) spill to a `0600` temp
+    /// file to avoid `ARG_MAX` (`E2BIG`) execve failures. Default: `65536`.
+    #[serde(default = "default_max_inline_prompt_bytes")]
+    pub max_inline_prompt_bytes: usize,
+    /// Optional idle stall watchdog timeout in seconds (reset on every
+    /// stdout/stderr byte received). Default: unset.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    /// PTY width in columns (`portable-pty`). Default: `160`.
+    #[serde(default = "default_pty_cols")]
+    pub pty_cols: u16,
+    /// PTY height in rows (`portable-pty`). Default: `48`.
+    #[serde(default = "default_pty_rows")]
+    pub pty_rows: u16,
+    /// Automatic answers injected into PTY stdin when matching interactive
+    /// prompts appear in PTY output.
+    #[serde(default)]
+    pub pty_auto_respond: Vec<AutoRespondRule>,
+    /// Alternative argument template for continuing native multi-turn sessions
+    /// (`{prompt}`, `{backend_session_id}`, `{session_id}`, `{model}`,
+    /// `{request_id}`).
+    #[serde(default)]
+    pub resume_args: Vec<String>,
+    /// Regex to capture a backend-native session identifier from stdout/stderr
+    /// during turn 1 (prefers capture group 1 if present, otherwise full match).
+    #[serde(default)]
+    pub session_id_regex: Option<String>,
+}
+
+/// Interactive prompt auto-response rule for PTY backends.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoRespondRule {
+    /// Substring or regular expression matched against stripped PTY output.
+    pub pattern: String,
+    /// Text sent to PTY stdin when `pattern` matches.
+    pub response: String,
 }
 
 /// Egress transport.
@@ -556,6 +593,46 @@ impl BackendConfig {
                 self.id
             )));
         }
+        if self.max_inline_prompt_bytes == 0 {
+            return Err(GatewayError::Config(format!(
+                "backend {:?}: max_inline_prompt_bytes must be greater than zero",
+                self.id
+            )));
+        }
+        if self.idle_timeout_secs == Some(0) {
+            return Err(GatewayError::Config(format!(
+                "backend {:?}: idle_timeout_secs must be greater than zero when set",
+                self.id
+            )));
+        }
+        if self.pty_cols == 0 {
+            return Err(GatewayError::Config(format!(
+                "backend {:?}: pty_cols must be greater than zero",
+                self.id
+            )));
+        }
+        if self.pty_rows == 0 {
+            return Err(GatewayError::Config(format!(
+                "backend {:?}: pty_rows must be greater than zero",
+                self.id
+            )));
+        }
+        for rule in &self.pty_auto_respond {
+            if rule.pattern.is_empty() {
+                return Err(GatewayError::Config(format!(
+                    "backend {:?}: pty_auto_respond.pattern must not be empty",
+                    self.id
+                )));
+            }
+        }
+        if let Some(pattern) = &self.session_id_regex {
+            regex::Regex::new(pattern).map_err(|error| {
+                GatewayError::Config(format!(
+                    "backend {:?}: invalid session_id_regex {pattern:?}: {error}",
+                    self.id
+                ))
+            })?;
+        }
 
         match self.kind {
             BackendKind::Http => {
@@ -580,6 +657,12 @@ impl BackendConfig {
                 if self.command.is_some() {
                     return Err(GatewayError::Config(format!(
                         "backend {:?}: HTTP backends must not set command",
+                        self.id
+                    )));
+                }
+                if !self.resume_args.is_empty() || self.session_id_regex.is_some() {
+                    return Err(GatewayError::Config(format!(
+                        "backend {:?}: HTTP backends must not set resume_args or session_id_regex",
                         self.id
                     )));
                 }
@@ -609,6 +692,15 @@ impl BackendConfig {
                 if !templated && !self.stdin {
                     return Err(GatewayError::Config(format!(
                         "backend {:?}: set stdin = true or include {{prompt}} in args",
+                        self.id
+                    )));
+                }
+                if !self.resume_args.is_empty()
+                    && !self.stdin
+                    && !self.resume_args.iter().any(|arg| arg.contains("{prompt}"))
+                {
+                    return Err(GatewayError::Config(format!(
+                        "backend {:?}: resume_args must include {{prompt}} when stdin = false",
                         self.id
                     )));
                 }
@@ -720,6 +812,15 @@ fn default_true() -> bool {
 }
 fn default_probe_timeout_secs() -> u64 {
     30
+}
+fn default_max_inline_prompt_bytes() -> usize {
+    65_536
+}
+fn default_pty_cols() -> u16 {
+    160
+}
+fn default_pty_rows() -> u16 {
+    48
 }
 
 impl Default for ServerConfig {
@@ -879,5 +980,62 @@ stdin = true
         let text = format!("{}\n[discovery]\nprobe_timeout_secs = 0\n", minimal(""));
         let error = GatewayConfig::from_toml_str(&text).expect_err("must fail");
         assert!(error.to_string().contains("probe_timeout_secs"));
+    }
+
+    #[test]
+    fn parses_v2_defaults_and_overrides() {
+        let base = GatewayConfig::from_toml_str(&minimal("")).expect("valid v1 config");
+        let b = &base.backends[0];
+        assert_eq!(b.max_inline_prompt_bytes, 65_536);
+        assert_eq!(b.idle_timeout_secs, None);
+        assert_eq!(b.pty_cols, 160);
+        assert_eq!(b.pty_rows, 48);
+        assert!(b.pty_auto_respond.is_empty());
+        assert!(b.resume_args.is_empty());
+        assert_eq!(b.session_id_regex, None);
+
+        let override_text = minimal(
+            r#"
+max_inline_prompt_bytes = 4096
+idle_timeout_secs = 15
+pty_cols = 200
+pty_rows = 60
+resume_args = ["--resume", "{backend_session_id}", "{prompt}"]
+session_id_regex = "session=([a-z0-9-]+)"
+
+[[backends.pty_auto_respond]]
+pattern = "Continue? [y/N]"
+response = "y"
+"#,
+        );
+        let custom = GatewayConfig::from_toml_str(&override_text).expect("valid v2 overrides");
+        let b2 = &custom.backends[0];
+        assert_eq!(b2.max_inline_prompt_bytes, 4096);
+        assert_eq!(b2.idle_timeout_secs, Some(15));
+        assert_eq!(b2.pty_cols, 200);
+        assert_eq!(b2.pty_rows, 60);
+        assert_eq!(b2.pty_auto_respond.len(), 1);
+        assert_eq!(b2.resume_args.len(), 3);
+        assert_eq!(b2.session_id_regex.as_deref(), Some("session=([a-z0-9-]+)"));
+    }
+
+    #[test]
+    fn rejects_invalid_v2_fields() {
+        let err_idle = GatewayConfig::from_toml_str(&minimal("idle_timeout_secs = 0"))
+            .expect_err("zero idle timeout must fail");
+        assert!(err_idle.to_string().contains("idle_timeout_secs"));
+
+        let err_regex = GatewayConfig::from_toml_str(&minimal("session_id_regex = \"[unclosed\""))
+            .expect_err("bad regex must fail");
+        assert!(err_regex.to_string().contains("session_id_regex"));
+
+        let err_pty =
+            GatewayConfig::from_toml_str(&minimal("pty_cols = 0")).expect_err("zero pty cols");
+        assert!(err_pty.to_string().contains("pty_cols"));
+
+        let err_resume = GatewayConfig::from_toml_str(
+            &minimal("resume_args = [\"--resume\", \"foo\"]").replace("stdin = true", ""),
+        );
+        assert!(err_resume.is_err());
     }
 }
