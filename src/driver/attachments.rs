@@ -8,16 +8,22 @@
 use std::{
     fs::OpenOptions,
     io::Write,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use base64::Engine as _;
 use uuid::Uuid;
 
 use crate::{
+    config::AttachmentsConfig,
     driver::{ChatMessage, ContentPart, ExecutionRequest, MessageContent, tool_bridge},
     error::{GatewayError, Result},
 };
+
+const MAX_IMAGE_REDIRECTS: usize = 5;
+const REMOTE_IMAGE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// RAII temporary file used when `stdin = false` and an inline CLI/PTY prompt
 /// exceeds `max_inline_prompt_bytes` (`ARG_MAX` / `E2BIG` guard).
@@ -114,8 +120,30 @@ pub fn write_base64_attachment(media_type: &str, data: &str) -> Result<PathBuf> 
 /// output instructions.
 pub fn materialize_prompt(request: &ExecutionRequest) -> Result<(String, TempAttachmentGuard)> {
     let mut guard = TempAttachmentGuard::new();
-    let mut prompt = String::new();
+    let mut prompt = init_system_prompt(request);
+    for message in request.active_messages() {
+        render_message_with_attachments(message, &mut prompt, &mut guard)?;
+    }
+    Ok((finalize_prompt_suffix(request, prompt), guard))
+}
 
+/// Async version of [`materialize_prompt`] that honors `[attachments]` settings,
+/// including SSRF-safe downloading of remote `image_url` payloads when
+/// `attachments.fetch_remote_urls` is enabled.
+pub async fn materialize_prompt_with_config(
+    request: &ExecutionRequest,
+    config: &AttachmentsConfig,
+) -> Result<(String, TempAttachmentGuard)> {
+    let mut guard = TempAttachmentGuard::new();
+    let mut prompt = init_system_prompt(request);
+    for message in request.active_messages() {
+        render_message_with_attachments_async(message, &mut prompt, &mut guard, config).await?;
+    }
+    Ok((finalize_prompt_suffix(request, prompt), guard))
+}
+
+fn init_system_prompt(request: &ExecutionRequest) -> String {
+    let mut prompt = String::new();
     if !request.is_resuming()
         && let Some(system) = request.system.as_deref()
         && !system.trim().is_empty()
@@ -124,12 +152,10 @@ pub fn materialize_prompt(request: &ExecutionRequest) -> Result<(String, TempAtt
         prompt.push_str(system.trim());
         prompt.push_str("\n\n");
     }
+    prompt
+}
 
-    let messages = request.active_messages();
-    for message in messages {
-        render_message_with_attachments(message, &mut prompt, &mut guard)?;
-    }
-
+fn finalize_prompt_suffix(request: &ExecutionRequest, prompt: String) -> String {
     let mut prompt = prompt.trim_end().to_string();
     if !request.tools.is_empty() {
         tool_bridge::append_tool_instructions(
@@ -141,8 +167,85 @@ pub fn materialize_prompt(request: &ExecutionRequest) -> Result<(String, TempAtt
     if let Some(format) = &request.response_format {
         tool_bridge::append_structured_output_instructions(&mut prompt, format);
     }
+    prompt
+}
 
-    Ok((prompt, guard))
+async fn render_message_with_attachments_async(
+    message: &ChatMessage,
+    output: &mut String,
+    guard: &mut TempAttachmentGuard,
+    config: &AttachmentsConfig,
+) -> Result<()> {
+    match &message.content {
+        MessageContent::Text(_) => {
+            tool_bridge::format_message(message, output);
+        }
+        MessageContent::Parts(parts) => {
+            let mut flattened = String::new();
+            for part in parts {
+                match part {
+                    ContentPart::Text { text, .. } => {
+                        append_flattened_line(&mut flattened, text.trim());
+                    }
+                    ContentPart::ImageBase64 { media_type, data } => {
+                        let path = write_base64_attachment(media_type, data)?;
+                        guard.push(path.clone());
+                        append_flattened_line(
+                            &mut flattened,
+                            &format!("[Attached image file: {}]", path.display()),
+                        );
+                    }
+                    ContentPart::ImageUrl { url } => {
+                        if let Some((media_type, data)) = parse_data_uri(url) {
+                            let path = write_base64_attachment(&media_type, &data)?;
+                            guard.push(path.clone());
+                            append_flattened_line(
+                                &mut flattened,
+                                &format!("[Attached image file: {}]", path.display()),
+                            );
+                        } else if config.fetch_remote_urls {
+                            let (bytes, media_type) = fetch_remote_image(url, config).await?;
+                            let filename = format!(
+                                "vouch_att_{}.{}",
+                                Uuid::new_v4().simple(),
+                                extension_for_media_type(media_type)
+                            );
+                            let path = write_private_temp_file(&filename, &bytes)?;
+                            guard.push(path.clone());
+                            append_flattened_line(
+                                &mut flattened,
+                                &format!("[Attached image file: {}]", path.display()),
+                            );
+                        } else {
+                            append_flattened_line(
+                                &mut flattened,
+                                &format!("[Attached image URL: {url}]"),
+                            );
+                        }
+                    }
+                }
+            }
+            let rendered_message = ChatMessage {
+                role: message.role.clone(),
+                content: MessageContent::Text(flattened),
+                tool_calls: message.tool_calls.clone(),
+                tool_call_id: message.tool_call_id.clone(),
+                name: message.name.clone(),
+            };
+            tool_bridge::format_message(&rendered_message, output);
+        }
+    }
+    Ok(())
+}
+
+fn append_flattened_line(flattened: &mut String, piece: &str) {
+    if piece.is_empty() {
+        return;
+    }
+    if !flattened.is_empty() {
+        flattened.push('\n');
+    }
+    flattened.push_str(piece);
 }
 
 fn render_message_with_attachments(
@@ -226,6 +329,208 @@ fn extension_for_media_type(media_type: &str) -> &'static str {
     }
 }
 
+/// Check whether an IP address belongs to loopback, private, link-local, or
+/// otherwise non-public ranges that must be blocked for remote image fetches.
+pub fn is_forbidden_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_forbidden_v4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_forbidden_v4(mapped);
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+        }
+    }
+}
+
+fn is_forbidden_v4(v4: Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    let is_cgnat = octets[0] == 100 && (octets[1] & 0b1100_0000) == 64;
+    let is_benchmark = octets[0] == 198 && matches!(octets[1], 18 | 19);
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || v4.is_documentation()
+        || is_cgnat
+        || is_benchmark
+}
+
+async fn resolve_and_validate_addrs(
+    url: &reqwest::Url,
+    allow_private_ips: bool,
+) -> Result<(Option<String>, Vec<SocketAddr>)> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(GatewayError::BadRequest(format!(
+            "unsupported remote image URL scheme {:?}",
+            url.scheme()
+        )));
+    }
+    let Some(raw_host) = url.host_str() else {
+        return Err(GatewayError::BadRequest(
+            "remote image URL is missing a host".into(),
+        ));
+    };
+    let bare_host = raw_host.trim_start_matches('[').trim_end_matches(']');
+    let port = url.port_or_known_default().unwrap_or(80);
+    let (domain_for_pinning, addrs) = if let Ok(ip) = bare_host.parse::<IpAddr>() {
+        (None, vec![SocketAddr::new(ip, port)])
+    } else {
+        let resolved: Vec<SocketAddr> = tokio::net::lookup_host((bare_host, port))
+            .await
+            .map_err(|error| {
+                GatewayError::BadRequest(format!(
+                    "cannot resolve remote image host {bare_host:?}: {error}"
+                ))
+            })?
+            .collect();
+        if resolved.is_empty() {
+            return Err(GatewayError::BadRequest(format!(
+                "remote image host {bare_host:?} resolved to no addresses"
+            )));
+        }
+        (Some(bare_host.to_string()), resolved)
+    };
+    if !allow_private_ips {
+        for addr in &addrs {
+            if is_forbidden_ip(addr.ip()) {
+                return Err(GatewayError::BadRequest(format!(
+                    "refusing remote image fetch from blocked non-public IP {}",
+                    addr.ip()
+                )));
+            }
+        }
+    }
+    Ok((domain_for_pinning, addrs))
+}
+
+/// Download a remote `image_url` enforcing SSRF checks, redirect validation,
+/// bounded byte streaming, `Content-Type` header checks, and image magic bytes.
+pub async fn fetch_remote_image(
+    url_str: &str,
+    config: &AttachmentsConfig,
+) -> Result<(Vec<u8>, &'static str)> {
+    let mut current = reqwest::Url::parse(url_str).map_err(|error| {
+        GatewayError::BadRequest(format!("invalid remote image URL {url_str:?}: {error}"))
+    })?;
+
+    for hop in 0..=MAX_IMAGE_REDIRECTS {
+        let (domain, addrs) =
+            resolve_and_validate_addrs(&current, config.allow_private_ips).await?;
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(REMOTE_IMAGE_TIMEOUT);
+        if let Some(domain) = domain.as_deref() {
+            builder = builder.resolve_to_addrs(domain, &addrs);
+        }
+        let client = builder.build().map_err(|error| {
+            GatewayError::Internal(format!("cannot build image HTTP client: {error}"))
+        })?;
+
+        let mut response = client.get(current.clone()).send().await.map_err(|error| {
+            GatewayError::Upstream(format!("failed to fetch remote image: {error}"))
+        })?;
+
+        if response.status().is_redirection() {
+            if hop == MAX_IMAGE_REDIRECTS {
+                return Err(GatewayError::BadRequest(
+                    "remote image URL exceeded maximum redirect count".into(),
+                ));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    GatewayError::Upstream("remote image redirect missing Location header".into())
+                })?;
+            current = current.join(location).map_err(|error| {
+                GatewayError::BadRequest(format!("invalid redirect Location {location:?}: {error}"))
+            })?;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            return Err(GatewayError::Upstream(format!(
+                "remote image fetch returned HTTP {}",
+                response.status()
+            )));
+        }
+
+        if let Some(len) = response.content_length()
+            && len as usize > config.max_image_bytes
+        {
+            return Err(GatewayError::BadRequest(format!(
+                "remote image content-length ({len} bytes) exceeds max_image_bytes ({})",
+                config.max_image_bytes
+            )));
+        }
+
+        if let Some(ct) = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+        {
+            let mime = ct
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if !mime.is_empty() && !mime.starts_with("image/") {
+                return Err(GatewayError::BadRequest(format!(
+                    "remote image returned non-image Content-Type {mime:?}"
+                )));
+            }
+        }
+
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            GatewayError::Upstream(format!("error reading remote image body: {error}"))
+        })? {
+            if bytes.len() + chunk.len() > config.max_image_bytes {
+                return Err(GatewayError::BadRequest(format!(
+                    "remote image payload exceeds max_image_bytes ({})",
+                    config.max_image_bytes
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+
+        let detected = sniff_image_media_type(&bytes).ok_or_else(|| {
+            GatewayError::BadRequest(
+                "remote image payload did not match supported image magic bytes (png/jpeg/gif/webp)"
+                    .into(),
+            )
+        })?;
+        return Ok((bytes, detected));
+    }
+
+    Err(GatewayError::BadRequest(
+        "remote image fetch failed after redirects".into(),
+    ))
+}
+
+fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xFF\xD8\xFF") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 fn write_private_temp_file(filename: &str, bytes: &[u8]) -> Result<PathBuf> {
     let path = std::env::temp_dir().join(filename);
     let mut options = OpenOptions::new();
@@ -292,5 +597,22 @@ mod tests {
         assert!(path.exists());
         assert_eq!(path.extension().and_then(|s| s.to_str()), Some("png"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn blocks_loopback_private_link_local_and_mapped_v6_ips() {
+        assert!(is_forbidden_ip("127.0.0.1".parse().expect("ip")));
+        assert!(is_forbidden_ip("10.0.0.5".parse().expect("ip")));
+        assert!(is_forbidden_ip("172.16.0.1".parse().expect("ip")));
+        assert!(is_forbidden_ip("192.168.1.10".parse().expect("ip")));
+        assert!(is_forbidden_ip("169.254.169.254".parse().expect("ip")));
+        assert!(is_forbidden_ip("100.64.0.1".parse().expect("ip")));
+        assert!(is_forbidden_ip("::1".parse().expect("ip")));
+        assert!(is_forbidden_ip("::ffff:127.0.0.1".parse().expect("ip")));
+        assert!(is_forbidden_ip("fe80::1".parse().expect("ip")));
+        assert!(!is_forbidden_ip("8.8.8.8".parse().expect("ip")));
+        assert!(!is_forbidden_ip(
+            "2606:4700:4700::1111".parse().expect("ip")
+        ));
     }
 }
