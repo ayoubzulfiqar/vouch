@@ -122,11 +122,21 @@ With no `[[tokens]]` entries, `vouch` runs in zero-friction local mode and accep
 
 ## Installation
 
-### From source
+### From source or package managers
 
 ```bash
+# Quick binary install (cargo-binstall)
+cargo binstall vouch
+
+# Homebrew (after release tap / formula download)
+brew install --formula packaging/homebrew/vouch.rb
+
+# From source
 cargo build --release
 install -D -m 0755 target/release/vouch ~/.local/bin/vouch
+
+# Auto-discover local CLIs/daemons and scaffold vouch.toml
+vouch init --output vouch.toml
 ```
 
 Add `~/.local/bin` to `PATH`, then install the user service:
@@ -184,10 +194,18 @@ Everything else has a default. Start from the example config in production — i
 | | `log_level` | `"info"` | Tracing filter; `RUST_LOG` wins |
 | | `cors_permissive` | `false` | Permissive browser CORS |
 | | `enable_ui` | `false` | Serve read-only HTML status dashboard at `GET /ui` |
-| `defaults` | `model` | unset | Default public model; must be a route when set |
+| `defaults` | `model` | unset | Default public model or alias; must resolve when set |
 | | `session_ttl_secs` | `3600` | Idle TTL for sticky sessions and worktrees |
+| | `max_session_entries` | `10000` | Bounded capacity for session affinity and `/v1/responses` stores (evicts oldest) |
+| | `state_dir` | unset | Directory for atomic `0600` persistence across restarts |
 | | `max_concurrency` | `4` | Default per-backend concurrency |
 | | `queue_timeout_ms` | `250` | Permit wait before failover |
+| `attachments` | `fetch_remote_urls` | `false` | Download remote `http(s)://` `image_url` payloads on CLI/PTY backends |
+| | `max_image_bytes` | `10485760` | Maximum downloaded image payload size in bytes (10 MiB) |
+| | `allow_private_ips` | `false` | Block loopback/private/link-local IPs to prevent SSRF unless enabled |
+| `telemetry` | `otlp_endpoint` | unset | OTLP/HTTP JSON trace endpoint (e.g. `http://127.0.0.1:4318/v1/traces`) |
+| | `service_name` | `"vouch"` | Service name resource attribute exported with OTLP spans |
+| | `otlp_headers` | `{}` | Optional headers attached to OTLP HTTP export requests |
 | `resilience` | `failure_threshold` | `3` | Consecutive failures before a circuit opens |
 | | `reset_timeout_secs` | `30` | Cooldown before a half-open probe |
 | | `half_open_max_probes` | `1` | Concurrent half-open probes |
@@ -229,6 +247,7 @@ At least one `[[backends]]` is required and ids must be unique.
 | `env` | `{}` | Extra child environment variables |
 | `workdir` | unset | Ignored while workspace isolation is active |
 | `output_mode` | `"text"` | `"text"` (ANSI-stripped), `"json"`, or `"json_lines"` |
+| `read_mode` | `"chunk"` | `"chunk"` (real-time UTF-8 streaming without waiting for `\n`) or `"line"` |
 | `pty_send_eof` | `true` | Send EOT after the prompt for PTY readers |
 | `pty_cols` | `160` | PTY column width (`portable-pty`) |
 | `pty_rows` | `48` | PTY row height (`portable-pty`) |
@@ -253,6 +272,20 @@ A public model name maps to an **ordered** list of backend ids. The sticky backe
 
 At least one route is required, ids must resolve to configured backends, and a chain may not repeat an id.
 
+Optional `[aliases]` and trait-based `[[routing_rules]]` (evaluated before static `[routes]`):
+
+```toml
+[aliases]
+"gpt-4o" = "coding/default"
+
+[[routing_rules]]
+name = "tools-route"
+model_pattern = "general*"
+has_tools = true
+header_equals = { "x-tier" = "pro" }
+target_route = "coding/default"
+```
+
 ### Tokens
 
 | Field | Default | Notes |
@@ -260,7 +293,8 @@ At least one route is required, ids must resolve to configured backends, and a c
 | `token` | required | At least 8 characters and unique |
 | `name` | `token-<hash-prefix>` | Label used in logs and metrics |
 | `rpm` | unlimited | Sliding 60-second request cap; must be > 0 when set |
-| `allowed_models` | all models | Glob patterns, e.g. `["coding/*", "general"]` |
+| `daily_token_budget` | unlimited | Rolling UTC-day prompt + completion BPE token limit (`429 daily_token_budget_exceeded`) |
+| `allowed_models` | all models | Glob patterns matching requested alias or resolved route, e.g. `["coding/*", "gpt-4o"]` |
 
 ```toml
 [[tokens]]
@@ -370,6 +404,8 @@ data: [DONE]
 ### OpenAI responses
 
 `POST /v1/responses` accepts `model`, `input` (string or array of message, `input_image`, `function_call`, and `function_call_output` items), `instructions`, `previous_response_id`, `store` (default `true`; set `false` for Zero Data Retention), `stream`, `temperature`, `max_output_tokens`, `tools`, `tool_choice`, and `text.format`. Unknown or expired `previous_response_id` values return `404`.
+
+`GET /v1/responses` also accepts WebSocket upgrades (`WS /v1/responses`) with bearer/`x-api-key` handshake auth, handling client `response.create` and `response.cancel` messages and streaming JSON events (`response.created`, `response.output_text.delta`, `response.function_call_arguments.delta`, `response.completed`, `error`).
 
 Non-streaming returns a `response` object (`status: "completed"`, `store`, `output` array containing `output_text` and/or `function_call` items, and `usage` with `input_tokens` / `output_tokens` / `total_tokens`). Streaming (`"stream": true`) emits SSE lifecycle events (`response.created`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`, `response.function_call_arguments.delta`, `response.output_text.done`, `response.completed`).
 
@@ -561,9 +597,13 @@ To let a Docker Compose orchestrator (such as ARTEX, Open WebUI, or LiteLLM) rea
 `GET /healthz` — liveness:
 
 ```json
-{"status":"ok","version":"2.0.0","uptime_secs":42,"models":3,"backends":3,
+{"status":"ok","version":"3.0.0","uptime_secs":42,"models":3,"backends":3,
  "tokens_enforced":true,"workspace_enabled":false}
 ```
+
+`GET /v1/usage` — authenticated JSON report exposing cumulative per-token and per-backend requests, errors, BPE token counts, UTC daily budget usage, and `p50`/`p95`/`p99` latency quantiles (zero raw secrets).
+
+When `[telemetry].otlp_endpoint` is set, incoming W3C `traceparent`/`tracestate` headers (and MCP `_meta.traceparent`) propagate through `ingress`, `router.dispatch`, `workspace.worktree`, and `driver.exec` child spans exported asynchronously over OTLP/HTTP JSON with redacted attributes.
 
 `GET /readyz` — `200` when at least one backend circuit is not open, otherwise `503`. Body includes `ready` and per-backend `id`, `kind`, `max_concurrency`, `circuit`, `consecutive_failures`, `open_remaining_secs`, and `auth_expired`.
 
@@ -599,6 +639,8 @@ Logs are structured JSON with automatic secret redaction (including URL query pa
 | `vouch top` | `--url`, `--unix-socket`, `--interval-ms` | Live terminal UI polling `/healthz`, `/readyz`, and `/metrics` (highlights `AUTH_EXPIRED` backends). |
 | `vouch token create` | `--name`, `--rpm`, `--allow` | Generate a 256-bit `vouch_live_...` virtual token and print a ready-to-paste `[[tokens]]` TOML block. |
 | `vouch bench` | `-c/--config`, `-m/--model`, `-n/--requests`, `--concurrency`, `--prompt`, `--stream`, `--json` | Benchmark configured routes end-to-end for TTFT, p50/p95 latency, throughput, and fallbacks. |
+| `vouch stats` | `--url`, `--unix-socket`, `--token`, `--json` | Fetch and display cumulative per-token/per-backend usage & latency analytics from `GET /v1/usage`. |
+| `vouch init` | `-o/--output`, `--docker-bridge`, `--force` | Scan host agent CLIs & local daemons and write a validated `0600` `vouch.toml`. |
 | `vouch service install` | `-c/--config`, `--binary`, `--no-start` | Write and enable a user systemd unit (Linux) or launchd agent (macOS). |
 | `vouch service uninstall` | `--no-stop` | Stop, disable, and remove the user service. |
 
