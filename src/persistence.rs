@@ -16,13 +16,15 @@ use uuid::Uuid;
 
 use crate::{
     auth::tokens::DailyTokenCounter,
-    driver::ChatMessage,
+    driver::{ChatMessage, ThinkingBlock, ToolCall},
     error::{GatewayError, Result},
     usage::PersistedUsage,
 };
 
 /// Single consolidated snapshot file stored inside `defaults.state_dir`.
 pub const STATE_FILE_NAME: &str = "gateway_state.json";
+/// Advisory lock file serializing snapshot reads and atomic writes across processes.
+pub const STATE_LOCK_NAME: &str = "gateway_state.lock";
 
 const SNAPSHOT_VERSION: u32 = 1;
 
@@ -65,6 +67,33 @@ pub struct PersistedResponse {
     pub stored_at_unix_secs: u64,
 }
 
+/// Persisted deterministic response cache entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedCacheEntry {
+    /// SHA-256 hex digest cache key.
+    pub key: String,
+    /// Cached assistant response text.
+    pub content: String,
+    /// Finish reason (`stop`, `tool_calls`, ...).
+    pub finish_reason: String,
+    /// Cached structured tool calls.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
+    /// Cached extended thinking blocks.
+    #[serde(default)]
+    pub thinking: Vec<ThinkingBlock>,
+    /// Backend id that produced the entry.
+    pub backend_id: String,
+    /// Prompt BPE token count.
+    pub prompt_tokens: u64,
+    /// Completion BPE token count.
+    pub completion_tokens: u64,
+    /// Storage timestamp in seconds since UNIX epoch.
+    pub stored_at_unix_secs: u64,
+    /// Eviction ordering sequence number.
+    pub seq: u64,
+}
+
 /// Durable snapshot persisted to `defaults.state_dir/gateway_state.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GatewaySnapshot {
@@ -87,6 +116,9 @@ pub struct GatewaySnapshot {
     /// Cumulative per-token and per-backend usage and latency analytics.
     #[serde(default)]
     pub usage: PersistedUsage,
+    /// Optional persisted deterministic response cache entries (`cache.persist = true`).
+    #[serde(default)]
+    pub cached_responses: Vec<PersistedCacheEntry>,
 }
 
 impl GatewaySnapshot {
@@ -106,7 +138,14 @@ impl GatewaySnapshot {
             responses,
             daily_token_budgets,
             usage,
+            cached_responses: Vec::new(),
         }
+    }
+
+    /// Attach persisted deterministic cache entries to the snapshot.
+    pub fn with_cached_responses(mut self, entries: Vec<PersistedCacheEntry>) -> Self {
+        self.cached_responses = entries;
+        self
     }
 }
 
@@ -224,12 +263,71 @@ pub fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<()> {
             ),
         )));
     }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
     Ok(())
+}
+
+fn open_lock_file(state_dir: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(state_dir).map_err(|error| {
+        GatewayError::Io(std::io::Error::new(
+            error.kind(),
+            format!("cannot create directory {}: {error}", state_dir.display()),
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let lock_path = state_dir.join(STATE_LOCK_NAME);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(&lock_path).map_err(|error| {
+        GatewayError::Io(std::io::Error::new(
+            error.kind(),
+            format!("cannot open state lock {}: {error}", lock_path.display()),
+        ))
+    })
 }
 
 /// Load a persisted snapshot from `state_dir`, returning `None` cleanly when absent or unreadable.
 pub fn load_snapshot(state_dir: &Path) -> Option<GatewaySnapshot> {
     let path = state_dir.join(STATE_FILE_NAME);
+    if !path.exists() {
+        return None;
+    }
+    let _lock_guard = match open_lock_file(state_dir) {
+        Ok(file) => {
+            if let Err(error) = file.lock_shared() {
+                tracing::warn!(
+                    state_dir = %state_dir.display(),
+                    error = %error,
+                    "cannot acquire shared lock on state file; reading without lock"
+                );
+                None
+            } else {
+                Some(file)
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                state_dir = %state_dir.display(),
+                error = %error,
+                "cannot open state lock file; reading without lock"
+            );
+            None
+        }
+    };
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
@@ -257,6 +355,16 @@ pub fn load_snapshot(state_dir: &Path) -> Option<GatewaySnapshot> {
 
 /// Persist `snapshot` atomically to `state_dir/gateway_state.json` (`0600`).
 pub fn save_snapshot(state_dir: &Path, snapshot: &GatewaySnapshot) -> Result<()> {
+    let lock_file = open_lock_file(state_dir)?;
+    lock_file.lock().map_err(|error| {
+        GatewayError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "cannot acquire exclusive lock on state_dir {}: {error}",
+                state_dir.display()
+            ),
+        ))
+    })?;
     let path = state_dir.join(STATE_FILE_NAME);
     let payload = serde_json::to_vec_pretty(snapshot)
         .map_err(|error| GatewayError::Internal(format!("cannot serialize state: {error}")))?;
