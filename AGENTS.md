@@ -15,21 +15,27 @@ state is the TOML file plus ephemeral worktrees.
 | --- | --- |
 | `src/config.rs` | Typed TOML schema, validation, `ConfigStore` (ArcSwap snapshot) |
 | `src/error.rs` | The single `GatewayError` type and `Result` alias |
-| `src/cli/mod.rs` | clap definitions for `serve`, `routes`, `doctor`, `service` |
+| `src/usage.rs` | `tiktoken-rs` BPE token counter (`cl100k_base` / `o200k_base`) with fallback |
+| `src/cli/mod.rs` | clap definitions for `serve`, `routes`, `doctor`, `service`, `mcp`, `top` |
+| `src/cli/mcp.rs` | MCP JSON-RPC 2.0 server (`vouch mcp` stdio/HTTP and `POST /mcp`) |
+| `src/cli/top.rs` | Live terminal TUI (`vouch top`) polling `/healthz`, `/readyz`, `/metrics` |
 | `src/ingress/mod.rs` | Shared auth/model/affinity/header/SSE plumbing and the axum router |
-| `src/ingress/openai.rs` | OpenAI wire-format adapter |
-| `src/ingress/anthropic.rs` | Anthropic Messages wire-format adapter |
+| `src/ingress/openai.rs` | OpenAI Chat Completions wire-format adapter (`tools` / `tool_calls`) |
+| `src/ingress/responses.rs` | OpenAI Responses (`POST /v1/responses`) wire-format adapter |
+| `src/ingress/anthropic.rs` | Anthropic Messages wire-format adapter (`tools` / `tool_use`) |
+| `src/ingress/ui.rs` | Optional `server.enable_ui`-gated embedded read-only HTML dashboard (`GET /ui`) |
 | `src/ingress/ops.rs` | `/healthz`, `/readyz`, `/metrics` (unauthenticated) |
 | `src/auth/tokens.rs` | Virtual tokens, constant-time compare, RPM window, model globs |
 | `src/auth/discovery.rs` | Read-only local binary/auth-file/daemon discovery for `doctor` |
 | `src/router/mod.rs` | Route table, sticky sessions, fallback, circuit breakers |
 | `src/router/circuit_breaker.rs` | Per-backend closed/half-open/open state machine |
 | `src/driver/mod.rs` | `Driver` trait, normalized requests, permits, PGID guard, SSE decode |
+| `src/driver/tool_bridge.rs` | Structured `<vouch_tool_call>` prompt & output bridge for CLI/PTY backends |
 | `src/driver/http_proxy.rs` | HTTP/SSE proxy backend |
 | `src/driver/cli_pipe.rs` | stdin/stdout subprocess backend |
 | `src/driver/pty_runner.rs` | `portable-pty` subprocess backend |
 | `src/driver/workspace.rs` | git worktree lifecycle |
-| `src/telemetry.rs` | JSON tracing + secret redaction (global registry) |
+| `src/telemetry.rs` | JSON tracing + secret redaction (global registry, stderr support for MCP stdio) |
 | `src/metrics.rs` | Prometheus recorder and all `vouch_*` instruments |
 | `src/state.rs` | `AppState`: config, router, tokens, workspaces, shutdown, reload |
 
