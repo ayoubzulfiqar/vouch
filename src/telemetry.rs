@@ -76,12 +76,18 @@ static SK_KEY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"sk-[A-Za-z0-9_-]{6,}").expect("static sk regex"));
 static JSON_SECRET: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)("(?:api[_-]?key|token|authorization|secret|password|credential)"\s*:\s*")[^"]*(")"#,
+        r#"(?i)("(?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|authorization|secret|password|credential)"\s*:\s*")[^"]*(")"#,
     )
     .expect("static json secret regex")
 });
 static HEADER_SECRET: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(x-api-key\s*[:=]\s*)[^\s,;"']+"#).expect("static header regex")
+});
+static URL_SECRET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)([?&](?:key|api[_-]?key|token|access[_-]?token|refresh[_-]?token|secret)=)[^&\s"']*"#,
+    )
+    .expect("static url query secret regex")
 });
 
 /// Patterns applied after literal secrets.
@@ -94,6 +100,7 @@ static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         SK_KEY.clone(),
         JSON_SECRET.clone(),
         HEADER_SECRET.clone(),
+        URL_SECRET.clone(),
     ]
 });
 
@@ -274,5 +281,22 @@ mod tests {
     fn ignores_short_secrets() {
         let registry = RedactionRegistry::new(["abc"]);
         assert_eq!(registry.redact("abc stays"), "abc stays");
+    }
+
+    #[test]
+    fn redacts_url_query_params_and_oauth_tokens() {
+        let registry = RedactionRegistry::new(Vec::<String>::new());
+        let url = "GET https://api.example.com/v1?key=secret_url_key_123&api_key=ak_999&token=tok_abc&foo=bar";
+        let redacted_url = registry.redact(url);
+        assert!(!redacted_url.contains("secret_url_key_123"));
+        assert!(!redacted_url.contains("ak_999"));
+        assert!(!redacted_url.contains("tok_abc"));
+        assert!(redacted_url.contains("&foo=bar"));
+
+        let json = r#"{"access_token":"acc_secret_val","refresh_token":"ref_secret_val","ok":1}"#;
+        let redacted_json = registry.redact(json);
+        assert!(!redacted_json.contains("acc_secret_val"));
+        assert!(!redacted_json.contains("ref_secret_val"));
+        assert!(redacted_json.contains("\"ok\":1"));
     }
 }
