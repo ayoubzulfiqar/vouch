@@ -18,13 +18,16 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    config::{AutoRespondRule, BackendConfig, BackendKind, DefaultsConfig, OutputMode},
+    config::{
+        AttachmentsConfig, AutoRespondRule, BackendConfig, BackendKind, DefaultsConfig, OutputMode,
+    },
     driver::{
         AnsiStripper, ChunkStream, Driver, DriverResponse, ExecutionRequest, PermitGuard,
-        ProcessGroupGuard, ResponseFormat, StreamChunk,
-        attachments::{PromptSpillFile, TempAttachmentGuard, materialize_prompt},
-        capture_session_id, classify_cli_failure, emit_subprocess_tail,
-        finalize_subprocess_completion, io_error, strip_ansi,
+        ProcessGroupGuard, ResponseFormat, StreamChunk, Utf8ChunkDecoder,
+        attachments::{PromptSpillFile, TempAttachmentGuard, materialize_prompt_with_config},
+        capture_session_id, classify_cli_failure, dispatch_stream_chunks, emit_subprocess_tail,
+        finalize_subprocess_completion, finish_subprocess_text_stream, io_error, strip_ansi,
+        tool_bridge::SubprocessStreamFilter,
     },
     error::{GatewayError, Result},
     metrics,
@@ -93,6 +96,7 @@ struct SpawnedPty {
 #[derive(Debug)]
 pub struct PtyRunnerDriver {
     config: BackendConfig,
+    attachments: AttachmentsConfig,
     semaphore: Arc<Semaphore>,
     queue_timeout: Duration,
 }
@@ -109,8 +113,15 @@ impl PtyRunnerDriver {
         Ok(Self {
             semaphore: Arc::new(Semaphore::new(config.max_concurrency.max(1))),
             config,
+            attachments: AttachmentsConfig::default(),
             queue_timeout,
         })
+    }
+
+    /// Configure attachment fetching behavior (`[attachments]`).
+    pub fn with_attachments(mut self, attachments: AttachmentsConfig) -> Self {
+        self.attachments = attachments;
+        self
     }
 
     /// Spawn the PTY session and return the raw byte channel plus lifecycle
@@ -119,7 +130,8 @@ impl PtyRunnerDriver {
         let command = self.config.command.clone().ok_or_else(|| {
             GatewayError::Config(format!("backend {} has no command", self.config.id))
         })?;
-        let (full_prompt, attachments) = materialize_prompt(request)?;
+        let (full_prompt, attachments) =
+            materialize_prompt_with_config(request, &self.attachments).await?;
         let spill = if !self.config.stdin
             && full_prompt.len() > self.config.max_inline_prompt_bytes.max(1)
         {
@@ -483,11 +495,12 @@ impl PtyRunnerDriver {
 
             let total_deadline = tokio::time::Instant::now() + timeout;
             let mut last_activity = tokio::time::Instant::now();
+            let mut utf8_decoder = Utf8ChunkDecoder::new();
             let mut stripper = AnsiStripper::new();
+            let mut filter = SubprocessStreamFilter::new(parse_tools, response_format.clone());
             let mut json_buffer = String::new();
             let mut line_buffer = String::new();
             let mut produced = String::new();
-            let deferred_text = parse_tools || response_format.is_some();
 
             loop {
                 let effective_deadline = match idle_timeout {
@@ -527,7 +540,8 @@ impl PtyRunnerDriver {
                 if !bytes.is_empty() {
                     last_activity = tokio::time::Instant::now();
                 }
-                let stripped = stripper.feed(&bytes);
+                let utf8 = utf8_decoder.feed(&bytes);
+                let stripped = stripper.feed(utf8.as_bytes());
                 if stripped.is_empty() {
                     continue;
                 }
@@ -543,9 +557,8 @@ impl PtyRunnerDriver {
                 produced.push_str(&stripped);
                 match output_mode {
                     OutputMode::Text => {
-                        if !deferred_text
-                            && sender.send(Ok(StreamChunk::delta(stripped))).await.is_err()
-                        {
+                        let chunks = filter.push(&stripped);
+                        if !dispatch_stream_chunks(&sender, chunks).await {
                             guard.terminate();
                             return;
                         }
@@ -567,6 +580,25 @@ impl PtyRunnerDriver {
                                 return;
                             }
                         }
+                    }
+                }
+            }
+
+            let tail_utf8 = utf8_decoder.finish();
+            if !tail_utf8.is_empty() {
+                let stripped_tail = stripper.feed(tail_utf8.as_bytes());
+                if !stripped_tail.is_empty() {
+                    produced.push_str(&stripped_tail);
+                    match output_mode {
+                        OutputMode::Text => {
+                            let chunks = filter.push(&stripped_tail);
+                            if !dispatch_stream_chunks(&sender, chunks).await {
+                                guard.terminate();
+                                return;
+                            }
+                        }
+                        OutputMode::Json => json_buffer.push_str(&stripped_tail),
+                        OutputMode::JsonLines => line_buffer.push_str(&stripped_tail),
                     }
                 }
             }
@@ -635,16 +667,27 @@ impl PtyRunnerDriver {
                     }
                 }
 
-                let _ = emit_subprocess_tail(
-                    &sender,
-                    &model,
-                    &full_prompt,
-                    &produced,
-                    output_mode,
-                    parse_tools,
-                    response_format.as_ref(),
-                )
-                .await;
+                if output_mode == OutputMode::Text {
+                    let _ = finish_subprocess_text_stream(
+                        &sender,
+                        &mut filter,
+                        &model,
+                        &full_prompt,
+                        &produced,
+                    )
+                    .await;
+                } else {
+                    let _ = emit_subprocess_tail(
+                        &sender,
+                        &model,
+                        &full_prompt,
+                        &produced,
+                        output_mode,
+                        parse_tools,
+                        response_format.as_ref(),
+                    )
+                    .await;
+                }
             } else {
                 guard.disarm();
                 let _ = sender
