@@ -1,6 +1,6 @@
 [package]
 name = "vouch"
-version = "3.0.0"
+version = "4.0.0"
 edition = "2024"
 description = "Local authentication multiplexer and process-supervised gateway for AI orchestrators"
 license = "GPL-3.0-or-later"
