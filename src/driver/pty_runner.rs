@@ -160,9 +160,11 @@ impl PtyRunnerDriver {
                     .replace("{session_id}", &request.session_key)
                     .replace("{request_id}", &request.request_id)
                     .replace("{backend_session_id}", backend_session_id)
+                    .replace("{profile_id}", request.profile_id.as_deref().unwrap_or(""))
             })
             .collect();
         let env = self.config.env.clone();
+        let profile_env = request.profile_env.clone();
         let workdir = request
             .workdir
             .clone()
@@ -174,6 +176,7 @@ impl PtyRunnerDriver {
         let session_key = request.session_key.clone();
         let model = request.model.clone();
         let explicit_backend_sid = request.backend_session_id.clone();
+        let profile_id = request.profile_id.clone();
         let rows = self.config.pty_rows.max(1);
         let cols = self.config.pty_cols.max(1);
         let auto_respond = CompiledRespondRule::compile(&self.config.pty_auto_respond);
@@ -204,11 +207,17 @@ impl PtyRunnerDriver {
             for (key, value) in env {
                 builder.env(key, value);
             }
+            for (key, value) in profile_env {
+                builder.env(key, value);
+            }
             builder.env("VOUCH_REQUEST_ID", &request_id);
             builder.env("VOUCH_SESSION_ID", &session_key);
             builder.env("VOUCH_MODEL", &model);
             if let Some(sid) = explicit_backend_sid {
                 builder.env("VOUCH_BACKEND_SESSION_ID", sid);
+            }
+            if let Some(pid) = profile_id {
+                builder.env("VOUCH_PROFILE_ID", pid);
             }
             if let Some(workdir) = workdir {
                 builder.cwd(workdir);
