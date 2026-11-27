@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tiktoken_rs::{CoreBPE, cl100k_base, o200k_base};
 
-use crate::{auth::tokens::TokenBudgetStatus, driver::Usage};
+use crate::{auth::tokens::TokenBudgetStatus, config::PricingConfig, driver::Usage};
 
 const MAX_LATENCY_SAMPLES: usize = 1024;
 
@@ -51,6 +51,21 @@ pub fn estimate_usage(model: &str, prompt: &str, completion: &str) -> Usage {
     Usage::new(count_tokens(model, prompt), count_tokens(model, completion))
 }
 
+/// Compute USD cost for `usage` matching `[pricing.<backend_id>]` or fallback `[pricing.<route>]`.
+pub fn calculate_cost_usd(
+    pricing: &BTreeMap<String, PricingConfig>,
+    route: &str,
+    backend_id: &str,
+    usage: Usage,
+) -> f64 {
+    let Some(rule) = pricing.get(backend_id).or_else(|| pricing.get(route)) else {
+        return 0.0;
+    };
+    let in_cost = (usage.prompt_tokens as f64 / 1_000_000.0) * rule.input_per_1m_usd;
+    let out_cost = (usage.completion_tokens as f64 / 1_000_000.0) * rule.output_per_1m_usd;
+    in_cost + out_cost
+}
+
 /// Aggregate request, token, and latency statistics for a token or backend.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageSummary {
@@ -64,6 +79,9 @@ pub struct UsageSummary {
     pub completion_tokens: u64,
     /// Cumulative `prompt_tokens + completion_tokens`.
     pub total_tokens: u64,
+    /// Estimated cumulative USD cost computed from `[pricing.*]` rules.
+    #[serde(default)]
+    pub total_cost_usd: f64,
     /// 50th percentile latency in milliseconds across recent calls.
     pub p50_ms: u64,
     /// 95th percentile latency in milliseconds across recent calls.
@@ -120,6 +138,9 @@ pub struct PersistedEntityStats {
     pub prompt_tokens: u64,
     /// Completion tokens.
     pub completion_tokens: u64,
+    /// Cumulative estimated USD cost.
+    #[serde(default)]
+    pub total_cost_usd: f64,
     /// Recent latency samples in milliseconds (bounded).
     #[serde(default)]
     pub latencies_ms: Vec<u64>,
@@ -142,6 +163,7 @@ struct EntityStats {
     errors: u64,
     prompt_tokens: u64,
     completion_tokens: u64,
+    total_cost_usd: f64,
     latencies_ms: VecDeque<u64>,
 }
 
@@ -163,6 +185,7 @@ impl EntityStats {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             total_tokens: self.prompt_tokens.saturating_add(self.completion_tokens),
+            total_cost_usd: self.total_cost_usd,
             p50_ms: percentile(&sorted, 50),
             p95_ms: percentile(&sorted, 95),
             p99_ms: percentile(&sorted, 99),
@@ -175,6 +198,7 @@ impl EntityStats {
             errors: self.errors,
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
+            total_cost_usd: self.total_cost_usd,
             latencies_ms: self.latencies_ms.iter().copied().collect(),
         }
     }
@@ -186,6 +210,7 @@ impl EntityStats {
             errors: p.errors,
             prompt_tokens: p.prompt_tokens,
             completion_tokens: p.completion_tokens,
+            total_cost_usd: p.total_cost_usd,
             latencies_ms: p.latencies_ms[start..].iter().copied().collect(),
         }
     }
@@ -220,22 +245,55 @@ impl UsageTracker {
         usage: Usage,
         elapsed: Duration,
     ) {
+        self.record_success_with_cost(token_name, backend_id, usage, elapsed, 0.0);
+    }
+
+    /// Record a completed or early-terminated call with an estimated USD cost.
+    pub fn record_success_with_cost(
+        &self,
+        token_name: &str,
+        backend_id: &str,
+        usage: Usage,
+        elapsed: Duration,
+        cost_usd: f64,
+    ) {
+        self.record_outcome_with_cost(token_name, backend_id, usage, elapsed, cost_usd, false);
+    }
+
+    /// Record token usage, cost, and optional error count for a finished or interrupted call.
+    pub fn record_outcome_with_cost(
+        &self,
+        token_name: &str,
+        backend_id: &str,
+        usage: Usage,
+        elapsed: Duration,
+        cost_usd: f64,
+        is_error: bool,
+    ) {
         {
             let mut entry = self.by_token.entry(token_name.to_string()).or_default();
             entry.requests = entry.requests.saturating_add(1);
+            if is_error {
+                entry.errors = entry.errors.saturating_add(1);
+            }
             entry.prompt_tokens = entry.prompt_tokens.saturating_add(usage.prompt_tokens);
             entry.completion_tokens = entry
                 .completion_tokens
                 .saturating_add(usage.completion_tokens);
+            entry.total_cost_usd += cost_usd;
             entry.record_latency(elapsed);
         }
         {
             let mut entry = self.by_backend.entry(backend_id.to_string()).or_default();
             entry.requests = entry.requests.saturating_add(1);
+            if is_error {
+                entry.errors = entry.errors.saturating_add(1);
+            }
             entry.prompt_tokens = entry.prompt_tokens.saturating_add(usage.prompt_tokens);
             entry.completion_tokens = entry
                 .completion_tokens
                 .saturating_add(usage.completion_tokens);
+            entry.total_cost_usd += cost_usd;
             entry.record_latency(elapsed);
         }
     }
@@ -282,6 +340,7 @@ impl UsageTracker {
             totals.completion_tokens = totals
                 .completion_tokens
                 .saturating_add(entry.completion_tokens);
+            totals.total_cost_usd += entry.total_cost_usd;
             for &ms in &entry.latencies_ms {
                 if totals.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
                     totals.latencies_ms.pop_front();
