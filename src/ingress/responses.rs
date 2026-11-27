@@ -42,7 +42,8 @@ use crate::{
     },
     error::{GatewayError, Result},
     ingress::{
-        CancelOnDrop, RequestContext, completion, execute, execution_request, into_chunk_stream,
+        CancelOnDrop, RequestContext, StreamUsageGuard, completion, execute_or_cached,
+        execution_request, insert_routing_headers, into_chunk_stream,
         openai::parse_openai_response_format, parse_json_content, prepare_routed,
         record_completion_outcome, record_error_outcome, sse_response, start_ingress_span,
         unix_now,
@@ -50,7 +51,6 @@ use crate::{
     persistence::{PersistedResponse, evict_oldest_if_full, instant_from_unix, unix_now_secs},
     state::AppState,
     telemetry::ActiveSpan,
-    usage::count_tokens,
 };
 
 /// Persisted conversation state for stateful `/v1/responses` chaining.
@@ -288,6 +288,8 @@ struct PreparedResponsesExec {
     history_system: Option<String>,
     started: Instant,
     ingress_span: ActiveSpan,
+    cache_status: Option<axum::http::HeaderValue>,
+    cache_miss_key: Option<String>,
 }
 
 async fn prepare_responses_execution(
@@ -355,8 +357,8 @@ async fn prepare_responses_execution(
         extra,
         cancel,
     );
-    let routed = match execute(state, request).await {
-        Ok(routed) => routed,
+    let dispatched = match execute_or_cached(state, &context, headers, request).await {
+        Ok(dispatched) => dispatched,
         Err(error) => {
             record_error_outcome(
                 state,
@@ -371,15 +373,17 @@ async fn prepare_responses_execution(
     };
     Ok(PreparedResponsesExec {
         context,
-        routed_backend: routed.backend_id,
-        fallback: routed.fallback_used,
-        driver_response: routed.response,
+        routed_backend: dispatched.routed.backend_id,
+        fallback: dispatched.routed.fallback_used,
+        driver_response: dispatched.routed.response,
         response_id: format!("resp_{}", Uuid::new_v4().simple()),
         should_store: payload.store,
         history_before_reply,
         history_system,
         started,
         ingress_span,
+        cache_status: dispatched.cache_status,
+        cache_miss_key: dispatched.cache_miss_key,
     })
 }
 
@@ -403,6 +407,8 @@ async fn responses_inner(
         history_system,
         started,
         ingress_span,
+        cache_status,
+        cache_miss_key,
     } = prepared;
 
     if want_stream {
@@ -416,13 +422,18 @@ async fn responses_inner(
         let created_at = unix_now();
         let store = state.responses().clone();
         let resp_id_for_store = response_id.clone();
-        let stream_state = state.clone();
-        let stream_context = context.clone();
-        let stream_backend = backend.clone();
+        let mut usage_guard = StreamUsageGuard::new(
+            state.clone(),
+            context,
+            backend.clone(),
+            fallback,
+            started,
+            Some(ingress_span),
+            cache_miss_key,
+        );
 
         let stream = async_stream::stream! {
             let _guard = CancelOnDrop(stream_cancel.clone());
-            let mut ingress_span = Some(ingress_span);
             let msg_id = format!("msg_{}", Uuid::new_v4().simple());
             let created_payload = json!({
                 "type": "response.created",
@@ -459,14 +470,7 @@ async fn responses_inner(
                 };
                 if timed_out {
                     stream_cancel.cancel();
-                    record_error_outcome(
-                        &stream_state,
-                        &stream_context,
-                        Some(&stream_backend),
-                        started.elapsed(),
-                        "stream timeout",
-                        ingress_span.take(),
-                    );
+                    usage_guard.fail("stream timeout");
                     let error = json!({
                         "type": "error",
                         "error": {
@@ -480,6 +484,7 @@ async fn responses_inner(
                 }
                 match item {
                     Some(Ok(chunk)) => {
+                        usage_guard.observe_chunk(&chunk);
                         let StreamChunk { delta, tool_calls: tc_deltas, finish_reason, usage, .. } = chunk;
                         if usage.is_some() {
                             final_usage = usage;
@@ -549,7 +554,7 @@ async fn responses_inner(
                                     .data(delta_payload.to_string()));
                             }
                         }
-                        if finish_reason.is_some() {
+                        if let Some(reason) = finish_reason {
                             if text_started {
                                 let text_done = json!({
                                     "type": "response.output_text.done",
@@ -574,21 +579,7 @@ async fn responses_inner(
                                 });
                                 store.insert(&resp_id_for_store, history_system, full_history);
                             }
-                            let effective_usage = final_usage.unwrap_or_else(|| {
-                                Usage::new(
-                                    stream_context.prompt_tokens,
-                                    count_tokens(&model, &full_text),
-                                )
-                            });
-                            record_completion_outcome(
-                                &stream_state,
-                                &stream_context,
-                                &stream_backend,
-                                fallback,
-                                effective_usage,
-                                started.elapsed(),
-                                ingress_span.take(),
-                            );
+                            let effective_usage = usage_guard.complete(final_usage, &reason);
                             let completed_body = build_response_object(
                                 &response_id,
                                 created_at,
@@ -610,14 +601,7 @@ async fn responses_inner(
                         }
                     }
                     Some(Err(error)) => {
-                        record_error_outcome(
-                            &stream_state,
-                            &stream_context,
-                            Some(&stream_backend),
-                            started.elapsed(),
-                            &error.to_string(),
-                            ingress_span.take(),
-                        );
+                        usage_guard.fail(&error.to_string());
                         let payload = json!({
                             "type": "error",
                             "error": {
@@ -654,21 +638,12 @@ async fn responses_inner(
                             });
                             store.insert(&resp_id_for_store, history_system, full_history);
                         }
-                        let effective_usage = final_usage.unwrap_or_else(|| {
-                            Usage::new(
-                                stream_context.prompt_tokens,
-                                count_tokens(&model, &full_text),
-                            )
-                        });
-                        record_completion_outcome(
-                            &stream_state,
-                            &stream_context,
-                            &stream_backend,
-                            fallback,
-                            effective_usage,
-                            started.elapsed(),
-                            ingress_span.take(),
-                        );
+                        let reason = if collected_calls.is_empty() {
+                            "stop"
+                        } else {
+                            "tool_calls"
+                        };
+                        let effective_usage = usage_guard.complete(final_usage, reason);
                         let completed_body = build_response_object(
                             &response_id,
                             created_at,
@@ -693,13 +668,7 @@ async fn responses_inner(
         };
 
         let mut response = sse_response(stream, keep_alive);
-        crate::ingress::insert_header(&mut response, "x-vouch-backend", &backend);
-        crate::ingress::insert_header(
-            &mut response,
-            "x-vouch-fallback",
-            if fallback { "true" } else { "false" },
-        );
-        crate::ingress::insert_header(&mut response, "x-vouch-request-id", &request_id);
+        insert_routing_headers(&mut response, &backend, fallback, &request_id, cache_status);
         return Ok(response);
     }
 
@@ -714,6 +683,9 @@ async fn responses_inner(
                 started.elapsed(),
                 Some(ingress_span),
             );
+            if let Some(key) = cache_miss_key {
+                state.cache().store(key, &backend, &c);
+            }
             c
         }
         Err(error) => {
@@ -753,13 +725,13 @@ async fn responses_inner(
         completion.usage,
     );
     let mut response = (StatusCode::OK, Json(body)).into_response();
-    crate::ingress::insert_header(&mut response, "x-vouch-backend", &backend);
-    crate::ingress::insert_header(
+    insert_routing_headers(
         &mut response,
-        "x-vouch-fallback",
-        if fallback { "true" } else { "false" },
+        &backend,
+        fallback,
+        &context.request_id,
+        cache_status,
     );
-    crate::ingress::insert_header(&mut response, "x-vouch-request-id", &context.request_id);
     Ok(response)
 }
 
@@ -900,12 +872,22 @@ async fn run_ws_response(
         history_system,
         started,
         ingress_span,
+        cache_status: _,
+        cache_miss_key,
     } = prepared;
 
     let stream_timeout = state.config().server.stream_timeout_secs.max(1);
     let mut chunks = into_chunk_stream(driver_response);
-    let mut ingress_span = Some(ingress_span);
     let model = context.model.clone();
+    let mut usage_guard = StreamUsageGuard::new(
+        state.clone(),
+        context,
+        backend.clone(),
+        fallback,
+        started,
+        Some(ingress_span),
+        cache_miss_key,
+    );
     let created_at = unix_now();
     let msg_id = format!("msg_{}", Uuid::new_v4().simple());
 
@@ -927,14 +909,7 @@ async fn run_ws_response(
         .is_err()
     {
         cancel.cancel();
-        record_error_outcome(
-            &state,
-            &context,
-            Some(&backend),
-            started.elapsed(),
-            "websocket closed",
-            ingress_span.take(),
-        );
+        usage_guard.fail("websocket closed");
         return;
     }
 
@@ -956,26 +931,12 @@ async fn run_ws_response(
         };
         match next_item {
             WsLoopItem::Cancelled => {
-                record_error_outcome(
-                    &state,
-                    &context,
-                    Some(&backend),
-                    started.elapsed(),
-                    "response cancelled",
-                    ingress_span.take(),
-                );
+                usage_guard.fail("response cancelled");
                 break;
             }
             WsLoopItem::TimedOut => {
                 cancel.cancel();
-                record_error_outcome(
-                    &state,
-                    &context,
-                    Some(&backend),
-                    started.elapsed(),
-                    "stream timeout",
-                    ingress_span.take(),
-                );
+                usage_guard.fail("stream timeout");
                 let frame = ws_error_frame(
                     "stream_timeout",
                     &format!("stream timed out after {stream_timeout} seconds"),
@@ -984,6 +945,7 @@ async fn run_ws_response(
                 break;
             }
             WsLoopItem::Chunk(Some(Ok(chunk))) => {
+                usage_guard.observe_chunk(&chunk);
                 let StreamChunk {
                     delta,
                     tool_calls: tc_deltas,
@@ -1042,7 +1004,7 @@ async fn run_ws_response(
                         }
                     }
                 }
-                if finish_reason.is_some() {
+                if let Some(reason) = finish_reason {
                     let collected_calls: Vec<ToolCall> = tool_calls.into_values().collect();
                     if should_store {
                         let mut full_history = history_before_reply;
@@ -1057,18 +1019,7 @@ async fn run_ws_response(
                             .responses()
                             .insert(&response_id, history_system, full_history);
                     }
-                    let effective_usage = final_usage.unwrap_or_else(|| {
-                        Usage::new(context.prompt_tokens, count_tokens(&model, &full_text))
-                    });
-                    record_completion_outcome(
-                        &state,
-                        &context,
-                        &backend,
-                        fallback,
-                        effective_usage,
-                        started.elapsed(),
-                        ingress_span.take(),
-                    );
+                    let effective_usage = usage_guard.complete(final_usage, &reason);
                     let completed_body = build_response_object(
                         &response_id,
                         created_at,
@@ -1088,14 +1039,7 @@ async fn run_ws_response(
                 }
             }
             WsLoopItem::Chunk(Some(Err(error))) => {
-                record_error_outcome(
-                    &state,
-                    &context,
-                    Some(&backend),
-                    started.elapsed(),
-                    &error.to_string(),
-                    ingress_span.take(),
-                );
+                usage_guard.fail(&error.to_string());
                 let frame = ws_error_frame("stream_error", &error.to_string());
                 let _ = tx.send(WsMessage::Text(frame.into())).await;
                 break;
@@ -1115,18 +1059,12 @@ async fn run_ws_response(
                         .responses()
                         .insert(&response_id, history_system, full_history);
                 }
-                let effective_usage = final_usage.unwrap_or_else(|| {
-                    Usage::new(context.prompt_tokens, count_tokens(&model, &full_text))
-                });
-                record_completion_outcome(
-                    &state,
-                    &context,
-                    &backend,
-                    fallback,
-                    effective_usage,
-                    started.elapsed(),
-                    ingress_span.take(),
-                );
+                let reason = if collected_calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                };
+                let effective_usage = usage_guard.complete(final_usage, reason);
                 let completed_body = build_response_object(
                     &response_id,
                     created_at,
