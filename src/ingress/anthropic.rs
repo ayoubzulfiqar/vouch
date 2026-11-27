@@ -21,15 +21,17 @@ use uuid::Uuid;
 
 use crate::{
     driver::{
-        ChatMessage, ContentPart, MessageContent, StreamChunk, ThinkingBlock, ToolCall,
+        ChatMessage, ContentPart, MessageContent, StreamChunk, ThinkingBlock, ToolCall, Usage,
         tool_bridge::normalize_tools, truncate,
     },
     error::{GatewayError, Result},
     ingress::{
-        CancelOnDrop, completion, execute, execution_request, first_user_text, into_chunk_stream,
-        parse_json_content, prepare, sse_response,
+        CancelOnDrop, completion, execute, execution_request, into_chunk_stream,
+        parse_json_content, prepare_routed, record_completion_outcome, record_error_outcome,
+        sse_response, start_ingress_span,
     },
     state::AppState,
+    usage::count_tokens,
 };
 
 /// Anthropic `POST /v1/messages` request body.
@@ -118,15 +120,17 @@ async fn messages_inner(
             "messages must contain at least one turn".into(),
         ));
     }
-    let first_user = first_user_text(&messages);
-    let context = prepare(
+    let tools = normalize_tools(payload.tools);
+    let context = prepare_routed(
         &state,
         &headers,
         payload.model.as_deref(),
         system.as_deref(),
-        &first_user,
+        &messages,
+        &tools,
     )?;
-    let tools = normalize_tools(payload.tools);
+    let started = std::time::Instant::now();
+    let ingress_span = start_ingress_span(&state, &context, "/v1/messages");
     let cancel = CancellationToken::new();
     let request = execution_request(
         &context,
@@ -141,7 +145,20 @@ async fn messages_inner(
         extra,
         cancel.clone(),
     );
-    let routed = execute(&state, request).await?;
+    let routed = match execute(&state, request).await {
+        Ok(routed) => routed,
+        Err(error) => {
+            record_error_outcome(
+                &state,
+                &context,
+                None,
+                started.elapsed(),
+                &error.to_string(),
+                Some(ingress_span),
+            );
+            return Err(error);
+        }
+    };
     let backend = routed.backend_id.clone();
     let fallback = routed.fallback_used;
     let driver_response = routed.response;
@@ -155,9 +172,14 @@ async fn messages_inner(
         let model = context.model.clone();
         let request_id = context.request_id.clone();
         let stream_cancel = cancel.clone();
+        let stream_state = state.clone();
+        let stream_context = context.clone();
+        let stream_backend = backend.clone();
 
         let stream = async_stream::stream! {
             let _guard = CancelOnDrop(stream_cancel.clone());
+            let mut ingress_span = Some(ingress_span);
+            let mut collected_text = String::new();
             let start = json!({
                 "type": "message_start",
                 "message": {
@@ -194,6 +216,14 @@ async fn messages_inner(
                 };
                 if timed_out {
                     stream_cancel.cancel();
+                    record_error_outcome(
+                        &stream_state,
+                        &stream_context,
+                        Some(&stream_backend),
+                        started.elapsed(),
+                        "stream timeout",
+                        ingress_span.take(),
+                    );
                     let error = json!({
                         "type": "error",
                         "error": {
@@ -312,6 +342,7 @@ async fn messages_inner(
                                     idx
                                 }
                             };
+                            collected_text.push_str(&delta);
                             let payload = json!({
                                 "type": "content_block_delta",
                                 "index": idx,
@@ -400,7 +431,24 @@ async fn messages_inner(
                                     .event("content_block_stop")
                                     .data(json!({"type": "content_block_stop", "index": 0}).to_string()));
                             }
-                            let output_tokens = usage.map(|usage| usage.completion_tokens).unwrap_or(0);
+                            let effective_usage = usage.unwrap_or_else(|| {
+                                Usage::new(
+                                    stream_context.prompt_tokens,
+                                    count_tokens(&model, &collected_text),
+                                )
+                            });
+                            record_completion_outcome(
+                                &stream_state,
+                                &stream_context,
+                                &stream_backend,
+                                fallback,
+                                effective_usage,
+                                started.elapsed(),
+                                ingress_span.take(),
+                            );
+                            let output_tokens = usage
+                                .map(|usage| usage.completion_tokens)
+                                .unwrap_or(effective_usage.completion_tokens);
                             let effective_reason = if saw_tool_calls && reason == "stop" {
                                 "tool_use"
                             } else {
@@ -422,6 +470,14 @@ async fn messages_inner(
                         }
                     }
                     Some(Err(error)) => {
+                        record_error_outcome(
+                            &stream_state,
+                            &stream_context,
+                            Some(&stream_backend),
+                            started.elapsed(),
+                            &error.to_string(),
+                            ingress_span.take(),
+                        );
                         let payload = json!({
                             "type": "error",
                             "error": {"type": "api_error", "message": error.to_string()},
@@ -430,6 +486,19 @@ async fn messages_inner(
                         break;
                     }
                     None => {
+                        let effective_usage = Usage::new(
+                            stream_context.prompt_tokens,
+                            count_tokens(&model, &collected_text),
+                        );
+                        record_completion_outcome(
+                            &stream_state,
+                            &stream_context,
+                            &stream_backend,
+                            fallback,
+                            effective_usage,
+                            started.elapsed(),
+                            ingress_span.take(),
+                        );
                         if let Some(idx) = open_thinking_index.take() {
                             yield Ok(Event::default()
                                 .event("content_block_stop")
@@ -480,7 +549,31 @@ async fn messages_inner(
         return Ok(response);
     }
 
-    let completion = completion(driver_response).await?;
+    let completion = match completion(driver_response).await {
+        Ok(c) => {
+            record_completion_outcome(
+                &state,
+                &context,
+                &backend,
+                fallback,
+                c.usage,
+                started.elapsed(),
+                Some(ingress_span),
+            );
+            c
+        }
+        Err(error) => {
+            record_error_outcome(
+                &state,
+                &context,
+                Some(&backend),
+                started.elapsed(),
+                &error.to_string(),
+                Some(ingress_span),
+            );
+            return Err(error);
+        }
+    };
     let mut content_blocks = Vec::new();
     for block in &completion.thinking {
         match block {
