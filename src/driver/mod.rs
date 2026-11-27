@@ -9,6 +9,7 @@
 pub mod cli_pipe;
 pub mod http_proxy;
 pub mod pty_runner;
+pub mod tool_bridge;
 pub mod workspace;
 
 use std::{
@@ -31,13 +32,62 @@ use crate::{
     metrics, telemetry,
 };
 
+/// A tool call requested by an assistant response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Correlation id (`call_...` or `toolu_...`).
+    pub id: String,
+    /// Tool / function name.
+    pub name: String,
+    /// JSON-encoded argument payload.
+    pub arguments: String,
+}
+
+/// An incremental tool-call delta emitted during streaming.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallDelta {
+    /// Zero-based tool call index within the turn.
+    pub index: usize,
+    /// Correlation id, typically emitted on the first chunk for `index`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Function name, typically emitted on the first chunk for `index`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Incremental slice of the JSON arguments string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments_delta: Option<String>,
+}
+
 /// A single normalized conversation turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
-    /// `system`, `user`, or `assistant`.
+    /// `system`, `user`, `assistant`, or `tool`.
     pub role: String,
     /// Flattened textual content.
     pub content: String,
+    /// Structured tool calls emitted by an `assistant` turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// Correlation id when `role == "tool"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Optional function name when `role == "tool"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl ChatMessage {
+    /// Construct a plain text conversation turn.
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        }
+    }
 }
 
 /// Token accounting returned by a backend, or estimated locally.
@@ -61,11 +111,14 @@ impl Usage {
         }
     }
 
-    /// Coarse estimate used when a CLI backend does not report usage.
+    /// BPE token count used when a CLI/PTY backend does not report usage.
     pub fn estimate(prompt: &str, completion: &str) -> Self {
-        let prompt_tokens = (prompt.chars().count() as u64).div_ceil(4);
-        let completion_tokens = (completion.chars().count() as u64).div_ceil(4);
-        Self::new(prompt_tokens, completion_tokens)
+        crate::usage::estimate_usage("", prompt, completion)
+    }
+
+    /// Model-aware BPE token count used when a CLI/PTY backend does not report usage.
+    pub fn estimate_for_model(model: &str, prompt: &str, completion: &str) -> Self {
+        crate::usage::estimate_usage(model, prompt, completion)
     }
 }
 
@@ -119,6 +172,10 @@ pub struct ExecutionRequest {
     pub workdir: Option<PathBuf>,
     /// Cancellation triggered by client disconnect or shutdown.
     pub cancel: CancellationToken,
+    /// Normalized OpenAI-format tool declarations.
+    pub tools: Vec<Value>,
+    /// Tool selection policy (`"auto"`, `"none"`, `"required"`, or object).
+    pub tool_choice: Option<Value>,
     /// Protocol-specific fields forwarded to HTTP upstreams.
     pub extra: serde_json::Map<String, Value>,
 }
@@ -126,13 +183,22 @@ pub struct ExecutionRequest {
 impl ExecutionRequest {
     /// Render a plain-text prompt for subprocess backends.
     pub fn rendered_prompt(&self) -> String {
-        if !self.prompt.is_empty() {
-            return self.prompt.clone();
+        let mut prompt = if !self.prompt.is_empty() {
+            self.prompt.clone()
+        } else {
+            render_prompt(self.system.as_deref(), &self.messages)
+        };
+        if !self.tools.is_empty() {
+            tool_bridge::append_tool_instructions(
+                &mut prompt,
+                &self.tools,
+                self.tool_choice.as_ref(),
+            );
         }
-        render_prompt(self.system.as_deref(), &self.messages)
+        prompt
     }
 
-    /// OpenAI-shaped messages including the system turn.
+    /// OpenAI-shaped messages including the system turn and tool calls/results.
     pub fn openai_messages(&self) -> Vec<Value> {
         let mut messages = Vec::with_capacity(self.messages.len() + 1);
         if let Some(system) = &self.system
@@ -141,10 +207,40 @@ impl ExecutionRequest {
             messages.push(serde_json::json!({"role": "system", "content": system}));
         }
         for message in &self.messages {
-            messages.push(serde_json::json!({
-                "role": message.role,
-                "content": message.content,
-            }));
+            let mut item = serde_json::Map::new();
+            item.insert("role".into(), serde_json::json!(message.role));
+            if message.tool_calls.is_empty() {
+                item.insert("content".into(), serde_json::json!(message.content));
+            } else {
+                let content = if message.content.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::json!(message.content)
+                };
+                item.insert("content".into(), content);
+                let tool_calls: Vec<Value> = message
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        serde_json::json!({
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": call.arguments,
+                            }
+                        })
+                    })
+                    .collect();
+                item.insert("tool_calls".into(), Value::Array(tool_calls));
+            }
+            if let Some(call_id) = &message.tool_call_id {
+                item.insert("tool_call_id".into(), serde_json::json!(call_id));
+            }
+            if let Some(name) = &message.name {
+                item.insert("name".into(), serde_json::json!(name));
+            }
+            messages.push(Value::Object(item));
         }
         messages
     }
@@ -161,20 +257,9 @@ pub fn render_prompt(system: Option<&str>, messages: &[ChatMessage]) -> String {
         prompt.push_str("\n\n");
     }
     for message in messages {
-        prompt.push_str(&capitalize_role(&message.role));
-        prompt.push_str(":\n");
-        prompt.push_str(message.content.trim());
-        prompt.push_str("\n\n");
+        tool_bridge::format_message(message, &mut prompt);
     }
     prompt.trim_end().to_string()
-}
-
-fn capitalize_role(role: &str) -> String {
-    let mut chars = role.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-        None => "User".to_string(),
-    }
 }
 
 /// A complete non-streaming result.
@@ -182,12 +267,14 @@ fn capitalize_role(role: &str) -> String {
 pub struct Completion {
     /// Assistant text.
     pub content: String,
-    /// Normalized finish reason (`stop`, `length`, ...).
+    /// Normalized finish reason (`stop`, `tool_calls`, `length`, ...).
     pub finish_reason: String,
     /// Token usage, measured or estimated.
     pub usage: Usage,
     /// Raw upstream JSON when available.
     pub raw: Option<Value>,
+    /// Structured tool calls requested by the assistant.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// One incremental stream item.
@@ -195,6 +282,8 @@ pub struct Completion {
 pub struct StreamChunk {
     /// Text appended to the assistant message.
     pub delta: String,
+    /// Incremental tool call deltas.
+    pub tool_calls: Vec<ToolCallDelta>,
     /// Set on the terminal chunk.
     pub finish_reason: Option<String>,
     /// Usage, when the backend reports it.
@@ -206,6 +295,17 @@ impl StreamChunk {
     pub fn delta(delta: impl Into<String>) -> Self {
         Self {
             delta: delta.into(),
+            tool_calls: Vec::new(),
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
+    /// A tool-call delta batch.
+    pub fn tool_calls(tool_calls: Vec<ToolCallDelta>) -> Self {
+        Self {
+            delta: String::new(),
+            tool_calls,
             finish_reason: None,
             usage: None,
         }
@@ -215,6 +315,7 @@ impl StreamChunk {
     pub fn finish(reason: impl Into<String>, usage: Option<Usage>) -> Self {
         Self {
             delta: String::new(),
+            tool_calls: Vec::new(),
             finish_reason: Some(reason.into()),
             usage,
         }
@@ -656,6 +757,101 @@ pub fn extract_content(value: &Value) -> Option<String> {
     value.as_str().map(ToString::to_string)
 }
 
+/// Extract tool calls from an OpenAI or Anthropic complete JSON payload.
+pub fn extract_tool_calls(value: &Value) -> Vec<ToolCall> {
+    if let Some(calls) = value
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+    {
+        return calls
+            .iter()
+            .filter_map(|call| {
+                let id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
+                let function = call.get("function").unwrap_or(call);
+                let name = function.get("name").and_then(Value::as_str)?.to_string();
+                let arguments = match function.get("arguments") {
+                    Some(Value::String(raw)) => raw.clone(),
+                    Some(other) => other.to_string(),
+                    None => "{}".to_string(),
+                };
+                Some(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                })
+            })
+            .collect();
+    }
+    if let Some(blocks) = value.get("content").and_then(Value::as_array) {
+        return blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .filter_map(|block| {
+                let id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
+                let name = block.get("name").and_then(Value::as_str)?.to_string();
+                let arguments = block
+                    .get("input")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "{}".to_string());
+                Some(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                })
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Extract incremental tool-call deltas from one OpenAI SSE event payload.
+pub fn extract_tool_call_deltas(value: &Value) -> Vec<ToolCallDelta> {
+    let Some(calls) = value
+        .pointer("/choices/0/delta/tool_calls")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .enumerate()
+        .map(|(fallback_idx, item)| {
+            let index = item
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize)
+                .unwrap_or(fallback_idx);
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let function = item.get("function").unwrap_or(item);
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let arguments_delta = function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments_delta,
+            }
+        })
+        .collect()
+}
+
 /// Extract a stream delta, finish reason, and usage from one upstream event.
 pub fn extract_delta(value: &Value) -> (Option<String>, Option<String>, Option<Usage>) {
     let usage = extract_usage(value);
@@ -824,18 +1020,53 @@ pub fn truncate(text: &str, limit: usize) -> String {
     output
 }
 
-/// Collect a stream into a bounded buffer.
-pub async fn collect_stream(
+/// Aggregated result from collecting a [`ChunkStream`].
+#[derive(Debug, Clone)]
+pub struct CollectedStream {
+    /// Accumulated assistant text.
+    pub content: String,
+    /// Reassembled structured tool calls.
+    pub tool_calls: Vec<ToolCall>,
+    /// Terminal finish reason, if emitted.
+    pub finish_reason: Option<String>,
+    /// Token usage, if emitted.
+    pub usage: Option<Usage>,
+}
+
+/// Collect a stream into a bounded buffer, assembling text and tool calls.
+pub async fn collect_stream_full(
     mut stream: ChunkStream,
     max_bytes: usize,
-) -> Result<(String, Option<String>, Option<Usage>)> {
+) -> Result<CollectedStream> {
     let mut content = String::new();
     let mut finish = None;
     let mut usage = None;
+    let mut tool_calls: std::collections::BTreeMap<usize, ToolCall> =
+        std::collections::BTreeMap::new();
+    let mut total_bytes = 0usize;
+
     while let Some(item) = stream.next().await {
         let chunk = item?;
+        total_bytes = total_bytes.saturating_add(chunk.delta.len());
         content.push_str(&chunk.delta);
-        if content.len() > max_bytes {
+        for delta in chunk.tool_calls {
+            let entry = tool_calls.entry(delta.index).or_insert_with(|| ToolCall {
+                id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+                name: String::new(),
+                arguments: String::new(),
+            });
+            if let Some(id) = delta.id {
+                entry.id = id;
+            }
+            if let Some(name) = delta.name {
+                entry.name.push_str(&name);
+            }
+            if let Some(args) = delta.arguments_delta {
+                total_bytes = total_bytes.saturating_add(args.len());
+                entry.arguments.push_str(&args);
+            }
+        }
+        if total_bytes > max_bytes {
             return Err(GatewayError::Internal(
                 "backend output exceeded the configured safety limit".into(),
             ));
@@ -847,7 +1078,110 @@ pub async fn collect_stream(
             usage = chunk.usage;
         }
     }
-    Ok((content, finish, usage))
+
+    Ok(CollectedStream {
+        content,
+        tool_calls: tool_calls.into_values().collect(),
+        finish_reason: finish,
+        usage,
+    })
+}
+
+/// Collect a stream into a bounded buffer.
+pub async fn collect_stream(
+    stream: ChunkStream,
+    max_bytes: usize,
+) -> Result<(String, Option<String>, Option<Usage>)> {
+    let collected = collect_stream_full(stream, max_bytes).await?;
+    Ok((collected.content, collected.finish_reason, collected.usage))
+}
+
+/// Finalize a complete CLI/PTY subprocess output into a [`Completion`].
+pub(crate) fn finalize_subprocess_completion(
+    model: &str,
+    prompt: &str,
+    raw_text: &str,
+    output_mode: crate::config::OutputMode,
+    parse_tools: bool,
+) -> Result<Completion> {
+    let (content, tool_calls) = match output_mode {
+        crate::config::OutputMode::Text if parse_tools => {
+            tool_bridge::parse_tool_calls(raw_text.trim())
+        }
+        crate::config::OutputMode::Text => (raw_text.trim().to_string(), Vec::new()),
+        crate::config::OutputMode::Json => (
+            crate::driver::cli_pipe::parse_json_content(raw_text)?,
+            Vec::new(),
+        ),
+        crate::config::OutputMode::JsonLines => (
+            crate::driver::cli_pipe::parse_json_lines(raw_text),
+            Vec::new(),
+        ),
+    };
+    let finish_reason = if tool_calls.is_empty() {
+        "stop".to_string()
+    } else {
+        "tool_calls".to_string()
+    };
+    let usage = Usage::estimate_for_model(model, prompt, raw_text);
+    Ok(Completion {
+        content,
+        finish_reason,
+        usage,
+        raw: None,
+        tool_calls,
+    })
+}
+
+/// Emit buffered tail chunks (and optional parsed tool calls) at subprocess EOF.
+pub(crate) async fn emit_subprocess_tail(
+    sender: &tokio::sync::mpsc::Sender<Result<StreamChunk>>,
+    model: &str,
+    prompt: &str,
+    produced: &str,
+    output_mode: crate::config::OutputMode,
+    parse_tools: bool,
+) -> bool {
+    if output_mode == crate::config::OutputMode::Text && parse_tools {
+        let (clean_text, tool_calls) = tool_bridge::parse_tool_calls(produced);
+        if !clean_text.is_empty()
+            && sender
+                .send(Ok(StreamChunk::delta(clean_text)))
+                .await
+                .is_err()
+        {
+            return false;
+        }
+        if !tool_calls.is_empty() {
+            let deltas = tool_calls
+                .into_iter()
+                .enumerate()
+                .map(|(index, call)| ToolCallDelta {
+                    index,
+                    id: Some(call.id),
+                    name: Some(call.name),
+                    arguments_delta: Some(call.arguments),
+                })
+                .collect();
+            if sender
+                .send(Ok(StreamChunk::tool_calls(deltas)))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            let usage = Usage::estimate_for_model(model, prompt, produced);
+            return sender
+                .send(Ok(StreamChunk::finish("tool_calls", Some(usage))))
+                .await
+                .is_ok();
+        }
+    }
+    let usage = Usage::estimate_for_model(model, prompt, produced);
+    sender
+        .send(Ok(StreamChunk::finish("stop", Some(usage))))
+        .await
+        .is_ok()
 }
 
 /// Convert a byte-count-limited error into a readable message.
