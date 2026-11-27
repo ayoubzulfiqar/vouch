@@ -259,6 +259,7 @@ async fn run_single_sample(
         backend_session_id: None,
         delta_messages: None,
         session_capture: Arc::new(parking_lot::Mutex::new(None)),
+        trace_context: None,
         extra: serde_json::Map::new(),
     };
 
