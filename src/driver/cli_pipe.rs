@@ -24,13 +24,16 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    config::{BackendConfig, BackendKind, DefaultsConfig, OutputMode},
+    config::{AttachmentsConfig, BackendConfig, BackendKind, DefaultsConfig, OutputMode, ReadMode},
     driver::{
         AnsiStripper, ChunkStream, Driver, DriverResponse, ExecutionRequest, PermitGuard,
-        ProcessGroupGuard, ResponseFormat, StreamChunk,
-        attachments::{PromptSpillFile, TempAttachmentGuard, materialize_prompt},
-        capture_session_id, classify_cli_failure, emit_subprocess_tail, extract_content,
-        finalize_subprocess_completion, io_error, strip_ansi, truncate,
+        ProcessGroupGuard, ResponseFormat, StreamChunk, Utf8ChunkDecoder,
+        attachments::{PromptSpillFile, TempAttachmentGuard, materialize_prompt_with_config},
+        capture_session_id, classify_cli_failure, dispatch_stream_chunks, emit_subprocess_tail,
+        extract_content, finalize_subprocess_completion, finish_subprocess_text_stream, io_error,
+        strip_ansi,
+        tool_bridge::SubprocessStreamFilter,
+        truncate,
     },
     error::{GatewayError, Result},
     metrics, telemetry,
@@ -85,6 +88,7 @@ struct SpawnedCli {
 #[derive(Debug)]
 pub struct CliPipeDriver {
     config: BackendConfig,
+    attachments: AttachmentsConfig,
     semaphore: Arc<Semaphore>,
     queue_timeout: Duration,
 }
@@ -101,16 +105,24 @@ impl CliPipeDriver {
         Ok(Self {
             semaphore: Arc::new(Semaphore::new(config.max_concurrency.max(1))),
             config,
+            attachments: AttachmentsConfig::default(),
             queue_timeout,
         })
     }
 
-    fn spawn(&self, request: &ExecutionRequest) -> Result<SpawnedCli> {
+    /// Configure attachment fetching behavior (`[attachments]`).
+    pub fn with_attachments(mut self, attachments: AttachmentsConfig) -> Self {
+        self.attachments = attachments;
+        self
+    }
+
+    async fn spawn(&self, request: &ExecutionRequest) -> Result<SpawnedCli> {
         let command_path = self.config.command.as_deref().ok_or_else(|| {
             GatewayError::Config(format!("backend {} has no command", self.config.id))
         })?;
 
-        let (full_prompt, attachments) = materialize_prompt(request)?;
+        let (full_prompt, attachments) =
+            materialize_prompt_with_config(request, &self.attachments).await?;
         let spill = if !self.config.stdin
             && full_prompt.len() > self.config.max_inline_prompt_bytes.max(1)
         {
@@ -238,7 +250,7 @@ impl CliPipeDriver {
             full_prompt,
             _attachments,
             _spill,
-        } = self.spawn(&request)?;
+        } = self.spawn(&request).await?;
 
         let tracker = ActivityTracker::new();
         let stdin_task = self.write_stdin(&mut child, full_prompt.clone());
@@ -358,13 +370,14 @@ impl CliPipeDriver {
             full_prompt,
             _attachments,
             _spill,
-        } = self.spawn(&request)?;
+        } = self.spawn(&request).await?;
 
         let tracker = ActivityTracker::new();
         let stdin_task = self.write_stdin(&mut child, full_prompt.clone());
         let stderr_task = self.drain_stderr(&mut child, tracker.clone());
         let backend = self.config.id.clone();
         let output_mode = self.config.output_mode;
+        let read_mode = self.config.read_mode;
         let session_id_regex = self.config.session_id_regex.clone();
         let parse_tools = !request.tools.is_empty();
         let response_format: Option<ResponseFormat> = request.response_format.clone();
@@ -392,12 +405,14 @@ impl CliPipeDriver {
                 }
             };
             let total_deadline = tokio::time::Instant::now() + timeout;
+            let mut utf8_decoder = Utf8ChunkDecoder::new();
             let mut stripper = AnsiStripper::new();
+            let mut raw_line_carry: Vec<u8> = Vec::new();
+            let mut filter = SubprocessStreamFilter::new(parse_tools, response_format.clone());
             let mut json_buffer = String::new();
             let mut line_buffer = String::new();
             let mut produced = String::new();
             let mut buffer = [0u8; 8192];
-            let deferred_text = parse_tools || response_format.is_some();
 
             loop {
                 let effective_deadline = effective_deadline(total_deadline, idle_timeout, &tracker);
@@ -425,7 +440,21 @@ impl CliPipeDriver {
                     Ok(0) => break,
                     Ok(read) => {
                         tracker.touch();
-                        let stripped = stripper.feed(&buffer[..read]);
+                        let utf8 = match read_mode {
+                            ReadMode::Chunk => utf8_decoder.feed(&buffer[..read]),
+                            ReadMode::Line => {
+                                raw_line_carry.extend_from_slice(&buffer[..read]);
+                                if let Some(last_nl) =
+                                    raw_line_carry.iter().rposition(|&b| b == b'\n')
+                                {
+                                    let ready: Vec<u8> = raw_line_carry.drain(..=last_nl).collect();
+                                    utf8_decoder.feed(&ready)
+                                } else {
+                                    continue;
+                                }
+                            }
+                        };
+                        let stripped = stripper.feed(utf8.as_bytes());
                         if stripped.is_empty() {
                             continue;
                         }
@@ -442,9 +471,8 @@ impl CliPipeDriver {
                         produced.push_str(&stripped);
                         match output_mode {
                             OutputMode::Text => {
-                                if !deferred_text
-                                    && sender.send(Ok(StreamChunk::delta(stripped))).await.is_err()
-                                {
+                                let chunks = filter.push(&stripped);
+                                if !dispatch_stream_chunks(&sender, chunks).await {
                                     guard.terminate();
                                     let _ = child.wait().await;
                                     return;
@@ -479,6 +507,31 @@ impl CliPipeDriver {
                             .send(Err(io_error("cannot read backend stdout", error)))
                             .await;
                         return;
+                    }
+                }
+            }
+
+            // Flush any buffered bytes held for ReadMode::Line or split UTF-8 sequences at EOF.
+            let mut tail_utf8 = String::new();
+            if !raw_line_carry.is_empty() {
+                tail_utf8.push_str(&utf8_decoder.feed(&raw_line_carry));
+            }
+            tail_utf8.push_str(&utf8_decoder.finish());
+            if !tail_utf8.is_empty() {
+                let stripped_tail = stripper.feed(tail_utf8.as_bytes());
+                if !stripped_tail.is_empty() {
+                    produced.push_str(&stripped_tail);
+                    match output_mode {
+                        OutputMode::Text => {
+                            let chunks = filter.push(&stripped_tail);
+                            if !dispatch_stream_chunks(&sender, chunks).await {
+                                guard.terminate();
+                                let _ = child.wait().await;
+                                return;
+                            }
+                        }
+                        OutputMode::Json => json_buffer.push_str(&stripped_tail),
+                        OutputMode::JsonLines => line_buffer.push_str(&stripped_tail),
                     }
                 }
             }
@@ -556,16 +609,27 @@ impl CliPipeDriver {
                         }
                     }
 
-                    let _ = emit_subprocess_tail(
-                        &sender,
-                        &model,
-                        &full_prompt,
-                        &produced,
-                        output_mode,
-                        parse_tools,
-                        response_format.as_ref(),
-                    )
-                    .await;
+                    if output_mode == OutputMode::Text {
+                        let _ = finish_subprocess_text_stream(
+                            &sender,
+                            &mut filter,
+                            &model,
+                            &full_prompt,
+                            &produced,
+                        )
+                        .await;
+                    } else {
+                        let _ = emit_subprocess_tail(
+                            &sender,
+                            &model,
+                            &full_prompt,
+                            &produced,
+                            output_mode,
+                            parse_tools,
+                            response_format.as_ref(),
+                        )
+                        .await;
+                    }
                 }
                 Ok(status) => {
                     record_exit(&backend, &status);
@@ -745,6 +809,7 @@ mod tests {
             backend_session_id: Some("bsess_42".into()),
             delta_messages: None,
             session_capture: Arc::new(parking_lot::Mutex::new(None)),
+            trace_context: None,
             extra: serde_json::Map::new(),
         };
         assert_eq!(render_arg("--p={prompt}", "hello", &request), "--p=hello");
