@@ -16,7 +16,7 @@ use super::{ServiceArgs, ServiceCommand, ServiceInstallArgs, ServiceUninstallArg
 use crate::error::{GatewayError, Result};
 
 const SERVICE_NAME: &str = "vouch";
-const LAUNCHD_LABEL: &str = "io.github.ayoubzulfiqar.vouch";
+const LAUNCHD_LABEL: &str = "com.ayoubzulfiqar.vouch";
 
 /// Dispatch a service subcommand.
 pub fn run(args: &ServiceArgs) -> Result<()> {
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn launchd_label_matches_project_namespace() {
-        assert_eq!(LAUNCHD_LABEL, "io.github.ayoubzulfiqar.vouch");
+        assert_eq!(LAUNCHD_LABEL, "com.ayoubzulfiqar.vouch");
         let plist = render_launchd("/usr/local/bin/vouch", "/etc/vouch/vouch.toml");
         assert!(plist.contains(&format!("<string>{LAUNCHD_LABEL}</string>")));
     }
