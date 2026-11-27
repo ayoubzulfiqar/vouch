@@ -7,7 +7,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,9 +17,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-    config::{ModelAllowlist, TokenConfig},
+    config::{ModelAllowlist, TokenConfig, parse_rfc3339_unix_secs},
     error::{GatewayError, Result},
     metrics,
 };
@@ -56,6 +57,20 @@ fn seconds_until_utc_midnight(now: SystemTime) -> u64 {
     (SECS_PER_DAY - (secs % SECS_PER_DAY)).max(1)
 }
 
+/// RAII permit guard enforcing `[[tokens]].max_concurrent` across buffered and streamed calls.
+#[derive(Debug)]
+pub struct TokenConcurrencyGuard {
+    #[allow(dead_code)]
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl TokenConcurrencyGuard {
+    /// No-op guard for tokens without `max_concurrent` limits or anonymous local requests.
+    pub fn unlimited() -> Self {
+        Self { permit: None }
+    }
+}
+
 /// One configured credential.
 #[derive(Debug)]
 pub struct TokenPolicy {
@@ -67,12 +82,24 @@ pub struct TokenPolicy {
     hash_hex: String,
     /// Optional requests-per-minute cap.
     pub rpm: Option<u32>,
+    /// Optional tokens-per-minute sliding 60-second cap.
+    pub tpm: Option<u64>,
     /// Optional rolling UTC day BPE token cap.
     pub daily_token_budget: Option<u64>,
+    /// Optional concurrent in-flight request limit.
+    pub max_concurrent: Option<usize>,
+    /// Optional expiration UNIX epoch seconds compiled from RFC-3339 `expires_at`.
+    pub expires_at_unix_secs: Option<u64>,
+    /// Optional backend allowlist; `None` permits every backend.
+    allowed_backends: Option<Vec<String>>,
+    /// Administrative privileges for `/admin/*` endpoints.
+    pub admin: bool,
     /// Compiled model allowlist; `None` means every model.
     allowlist: Option<ModelAllowlist>,
     window: Mutex<VecDeque<Instant>>,
+    tpm_window: Mutex<VecDeque<(Instant, u64)>>,
     daily_usage: Mutex<DailyTokenCounter>,
+    concurrency: Option<Arc<Semaphore>>,
 }
 
 impl TokenPolicy {
@@ -91,18 +118,33 @@ impl TokenPolicy {
         } else {
             Some(ModelAllowlist::compile(&config.allowed_models)?)
         };
+        let expires_at_unix_secs = config
+            .expires_at
+            .as_deref()
+            .map(parse_rfc3339_unix_secs)
+            .transpose()?;
+        let concurrency = config
+            .max_concurrent
+            .map(|limit| Arc::new(Semaphore::new(limit.max(1))));
         Ok(Self {
             name,
             token_hash,
             hash_hex,
             rpm: config.rpm,
+            tpm: config.tpm,
             daily_token_budget: config.daily_token_budget,
+            max_concurrent: config.max_concurrent,
+            expires_at_unix_secs,
+            allowed_backends: config.allowed_backends.clone(),
+            admin: config.admin,
             allowlist,
             window: Mutex::new(VecDeque::new()),
+            tpm_window: Mutex::new(VecDeque::new()),
             daily_usage: Mutex::new(DailyTokenCounter {
                 utc_day: utc_day_for(SystemTime::now()),
                 tokens: 0,
             }),
+            concurrency,
         })
     }
 
@@ -112,6 +154,81 @@ impl TokenPolicy {
             .as_ref()
             .map(|allowlist| allowlist.matches(model))
             .unwrap_or(true)
+    }
+
+    /// Optional backend allowlist for routing enforcement.
+    pub fn allowed_backends(&self) -> Option<&[String]> {
+        self.allowed_backends.as_deref()
+    }
+
+    /// Whether this token is expired as of `now`.
+    fn check_expiry(&self, now: SystemTime) -> Result<()> {
+        let Some(expires_at) = self.expires_at_unix_secs else {
+            return Ok(());
+        };
+        let now_secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        if now_secs >= expires_at {
+            return Err(GatewayError::Unauthorized(format!(
+                "token {:?} has expired",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Acquire a bounded concurrency permit if `max_concurrent` is configured.
+    pub fn acquire_concurrency_permit(&self) -> Result<TokenConcurrencyGuard> {
+        let Some(sem) = &self.concurrency else {
+            return Ok(TokenConcurrencyGuard::unlimited());
+        };
+        let limit = self.max_concurrent.unwrap_or(1);
+        match sem.clone().try_acquire_owned() {
+            Ok(permit) => Ok(TokenConcurrencyGuard {
+                permit: Some(permit),
+            }),
+            Err(_) => {
+                metrics::record_token_rate_limited(&self.name);
+                Err(GatewayError::RateLimited {
+                    retry_after_secs: 1,
+                    message: format!(
+                        "token {:?} exceeded its max_concurrent limit ({limit})",
+                        self.name
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Enforce sliding 60-second tokens-per-minute quota when configured.
+    fn check_tpm(&self, now: Instant) -> Result<()> {
+        let Some(tpm) = self.tpm else {
+            return Ok(());
+        };
+        let mut window = self.tpm_window.lock();
+        while let Some((ts, _)) = window.front() {
+            if now.duration_since(*ts) >= WINDOW {
+                window.pop_front();
+            } else {
+                break;
+            }
+        }
+        let used: u64 = window.iter().map(|(_, toks)| *toks).sum();
+        if used >= tpm {
+            let retry_after_secs = window
+                .front()
+                .map(|(front, _)| WINDOW.saturating_sub(now.duration_since(*front)).as_secs())
+                .unwrap_or(1)
+                .max(1);
+            metrics::record_token_rate_limited(&self.name);
+            return Err(GatewayError::RateLimited {
+                retry_after_secs,
+                message: format!(
+                    "token {:?} exceeded its {tpm} tokens-per-minute limit ({used} used in last 60s)",
+                    self.name
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Consume daily BPE budget quota before checking RPM so rejected calls do not burn RPM.
@@ -140,18 +257,33 @@ impl TokenPolicy {
         Ok(())
     }
 
-    /// Record consumed prompt + completion BPE tokens against the current UTC day.
+    /// Record consumed prompt + completion BPE tokens against both the daily day bucket and 60s TPM window.
     pub fn record_tokens(&self, tokens: u64) {
         if tokens == 0 {
             return;
         }
-        let today = utc_day_for(SystemTime::now());
-        let mut daily = self.daily_usage.lock();
-        if daily.utc_day != today {
-            daily.utc_day = today;
-            daily.tokens = 0;
+        let now_sys = SystemTime::now();
+        let today = utc_day_for(now_sys);
+        {
+            let mut daily = self.daily_usage.lock();
+            if daily.utc_day != today {
+                daily.utc_day = today;
+                daily.tokens = 0;
+            }
+            daily.tokens = daily.tokens.saturating_add(tokens);
         }
-        daily.tokens = daily.tokens.saturating_add(tokens);
+        if self.tpm.is_some() {
+            let now = Instant::now();
+            let mut tpm = self.tpm_window.lock();
+            while let Some((ts, _)) = tpm.front() {
+                if now.duration_since(*ts) >= WINDOW {
+                    tpm.pop_front();
+                } else {
+                    break;
+                }
+            }
+            tpm.push_back((now, tokens));
+        }
     }
 
     /// Snapshot current UTC day token consumption.
@@ -179,11 +311,13 @@ impl TokenPolicy {
     }
 
     fn check_rate_limit(&self) -> Result<()> {
+        self.check_expiry(SystemTime::now())?;
         self.check_daily_budget()?;
+        let now = Instant::now();
+        self.check_tpm(now)?;
         let Some(rpm) = self.rpm else {
             return Ok(());
         };
-        let now = Instant::now();
         let mut window = self.window.lock();
         while let Some(front) = window.front() {
             if now.duration_since(*front) >= WINDOW {
@@ -222,6 +356,8 @@ pub struct Principal {
     policy: Option<Arc<TokenPolicy>>,
 }
 
+static SHARED_UNLIMITED_PERMIT: OnceLock<Arc<TokenConcurrencyGuard>> = OnceLock::new();
+
 impl Principal {
     /// Anonymous local principal.
     pub fn local() -> Self {
@@ -230,6 +366,13 @@ impl Principal {
             anonymous: true,
             policy: None,
         }
+    }
+
+    /// Shared no-op concurrency permit for anonymous or unlimited callers.
+    pub fn unlimited_permit() -> Arc<TokenConcurrencyGuard> {
+        SHARED_UNLIMITED_PERMIT
+            .get_or_init(|| Arc::new(TokenConcurrencyGuard::unlimited()))
+            .clone()
     }
 
     /// Whether this caller may use `model`.
@@ -245,7 +388,27 @@ impl Principal {
         self.allows_model(requested) || self.allows_model(resolved)
     }
 
-    /// Record completed prompt + completion BPE tokens against this caller's daily budget.
+    /// Configured backend allowlist for this caller, if any.
+    pub fn allowed_backends(&self) -> Option<Vec<String>> {
+        self.policy
+            .as_ref()
+            .and_then(|policy| policy.allowed_backends().map(|items| items.to_vec()))
+    }
+
+    /// True if this token grants administrative control access (`/admin/*`).
+    pub fn is_admin(&self) -> bool {
+        self.policy.as_ref().is_some_and(|policy| policy.admin)
+    }
+
+    /// Acquire a bounded concurrency permit if configured on this token.
+    pub fn acquire_concurrency_permit(&self) -> Result<Arc<TokenConcurrencyGuard>> {
+        match &self.policy {
+            Some(policy) => Ok(Arc::new(policy.acquire_concurrency_permit()?)),
+            None => Ok(Self::unlimited_permit()),
+        }
+    }
+
+    /// Record completed prompt + completion BPE tokens against this caller's daily and TPM budgets.
     pub fn record_tokens(&self, tokens: u64) {
         if let Some(policy) = &self.policy {
             policy.record_tokens(tokens);
@@ -330,15 +493,32 @@ impl TokenRegistry {
 
     /// Authenticate without checking a model.
     pub fn authenticate(&self, headers: &HeaderMap) -> Result<Principal> {
+        self.authenticate_with_key_hint(headers, None)
+    }
+
+    /// Authenticate checking headers first, then an optional query-string `key` override.
+    pub fn authenticate_with_key_hint(
+        &self,
+        headers: &HeaderMap,
+        key_hint: Option<&str>,
+    ) -> Result<Principal> {
         let policies = self.policies.load_full();
         if policies.is_empty() {
             return Ok(Principal::local());
         }
-        let presented = extract_credential(headers).ok_or_else(|| {
-            GatewayError::Unauthorized(
-                "missing API key: send Authorization: Bearer <token> or x-api-key".into(),
-            )
-        })?;
+        let presented = extract_credential(headers)
+            .or_else(|| {
+                key_hint
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+            })
+            .ok_or_else(|| {
+                GatewayError::Unauthorized(
+                    "missing API key: send Authorization: Bearer <token>, x-api-key, or x-goog-api-key"
+                        .into(),
+                )
+            })?;
         let presented_digest = Sha256::digest(presented.as_bytes());
         let mut presented_hash = [0u8; 32];
         presented_hash.copy_from_slice(&presented_digest);
@@ -370,7 +550,18 @@ impl TokenRegistry {
         requested: &str,
         resolved: &str,
     ) -> Result<Principal> {
-        let principal = self.authenticate(headers)?;
+        self.authorize_route_with_key_hint(headers, None, requested, resolved)
+    }
+
+    /// Authenticate using headers or query `key` override and enforce model scope.
+    pub fn authorize_route_with_key_hint(
+        &self,
+        headers: &HeaderMap,
+        key_hint: Option<&str>,
+        requested: &str,
+        resolved: &str,
+    ) -> Result<Principal> {
+        let principal = self.authenticate_with_key_hint(headers, key_hint)?;
         if !principal.allows_model_or_resolved(requested, resolved) {
             return Err(GatewayError::Forbidden(format!(
                 "token {:?} is not allowed to use model {requested:?}",
@@ -403,6 +594,7 @@ fn extract_credential(headers: &HeaderMap) -> Option<String> {
     }
     headers
         .get("x-api-key")
+        .or_else(|| headers.get("x-goog-api-key"))
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -434,16 +626,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn enforces_token_and_model_scope() {
-        let registry = TokenRegistry::new(&[TokenConfig {
-            token: "vouch-secret-token".into(),
+    fn token_cfg(token: &str) -> TokenConfig {
+        TokenConfig {
+            token: token.into(),
             name: Some("test".into()),
             rpm: None,
+            tpm: None,
             daily_token_budget: None,
-            allowed_models: vec!["coding/*".into()],
-        }])
-        .expect("registry");
+            max_concurrent: None,
+            expires_at: None,
+            allowed_models: Vec::new(),
+            allowed_backends: None,
+            admin: false,
+        }
+    }
+
+    #[test]
+    fn enforces_token_and_model_scope() {
+        let mut cfg = token_cfg("vouch-secret-token");
+        cfg.allowed_models = vec!["coding/*".into()];
+        let registry = TokenRegistry::new(&[cfg]).expect("registry");
         assert!(registry.authenticate(&HeaderMap::new()).is_err());
         assert!(
             registry
@@ -473,14 +675,9 @@ mod tests {
 
     #[test]
     fn enforces_rpm() {
-        let registry = TokenRegistry::new(&[TokenConfig {
-            token: "vouch-secret-token".into(),
-            name: Some("test".into()),
-            rpm: Some(2),
-            daily_token_budget: None,
-            allowed_models: Vec::new(),
-        }])
-        .expect("registry");
+        let mut cfg = token_cfg("vouch-secret-token");
+        cfg.rpm = Some(2);
+        let registry = TokenRegistry::new(&[cfg]).expect("registry");
         assert!(
             registry
                 .authenticate(&headers("vouch-secret-token"))
@@ -498,29 +695,32 @@ mod tests {
     }
 
     #[test]
-    fn accepts_x_api_key() {
-        let registry = TokenRegistry::new(&[TokenConfig {
-            token: "vouch-secret-token".into(),
-            name: None,
-            rpm: None,
-            daily_token_budget: None,
-            allowed_models: Vec::new(),
-        }])
-        .expect("registry");
-        let mut headers = HeaderMap::new();
-        headers.insert("x-api-key", HeaderValue::from_static("vouch-secret-token"));
-        assert!(registry.authenticate(&headers).is_ok());
+    fn accepts_x_api_key_and_goog_key() {
+        let mut cfg = token_cfg("vouch-secret-token");
+        cfg.name = None;
+        let registry = TokenRegistry::new(&[cfg]).expect("registry");
+        let mut h1 = HeaderMap::new();
+        h1.insert("x-api-key", HeaderValue::from_static("vouch-secret-token"));
+        assert!(registry.authenticate(&h1).is_ok());
+
+        let mut h2 = HeaderMap::new();
+        h2.insert(
+            "x-goog-api-key",
+            HeaderValue::from_static("vouch-secret-token"),
+        );
+        assert!(registry.authenticate(&h2).is_ok());
+        assert!(
+            registry
+                .authenticate_with_key_hint(&HeaderMap::new(), Some("vouch-secret-token"))
+                .is_ok()
+        );
     }
 
     #[test]
     fn enforces_daily_token_budget_and_preserves_across_reload() {
-        let cfg = TokenConfig {
-            token: "vouch-secret-budget".into(),
-            name: Some("budgeted".into()),
-            rpm: None,
-            daily_token_budget: Some(100),
-            allowed_models: Vec::new(),
-        };
+        let mut cfg = token_cfg("vouch-secret-budget");
+        cfg.name = Some("budgeted".into());
+        cfg.daily_token_budget = Some(100);
         let registry = TokenRegistry::new(std::slice::from_ref(&cfg)).expect("registry");
         let p = registry
             .authenticate(&headers("vouch-secret-budget"))
@@ -538,5 +738,39 @@ mod tests {
                 ..
             } if (1..=86_400).contains(&retry_after_secs)
         ));
+    }
+
+    #[test]
+    fn enforces_tpm_expiry_max_concurrent_and_admin() {
+        let mut tpm_cfg = token_cfg("vouch-tpm-token");
+        tpm_cfg.tpm = Some(50);
+        tpm_cfg.max_concurrent = Some(1);
+        tpm_cfg.allowed_backends = Some(vec!["fast".into()]);
+        tpm_cfg.admin = true;
+        let registry = TokenRegistry::new(&[tpm_cfg]).expect("registry");
+
+        let p = registry
+            .authenticate(&headers("vouch-tpm-token"))
+            .expect("auth");
+        assert!(p.is_admin());
+        assert_eq!(p.allowed_backends(), Some(vec!["fast".to_string()]));
+        let permit = p.acquire_concurrency_permit().expect("first permit");
+        assert!(p.acquire_concurrency_permit().is_err());
+        drop(permit);
+        let _permit2 = p.acquire_concurrency_permit().expect("released permit");
+
+        p.record_tokens(50);
+        let tpm_err = registry
+            .authenticate(&headers("vouch-tpm-token"))
+            .expect_err("tpm exceeded");
+        assert!(matches!(tpm_err, GatewayError::RateLimited { .. }));
+
+        let mut exp_cfg = token_cfg("vouch-expired-token");
+        exp_cfg.expires_at = Some("2020-01-01T00:00:00Z".into());
+        let exp_reg = TokenRegistry::new(&[exp_cfg]).expect("exp registry");
+        let err = exp_reg
+            .authenticate(&headers("vouch-expired-token"))
+            .expect_err("expired");
+        assert!(matches!(err, GatewayError::Unauthorized(_)));
     }
 }
