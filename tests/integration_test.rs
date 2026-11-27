@@ -496,3 +496,688 @@ async fn unknown_model_is_reported_as_openai_error() {
 
     harness.state.shutdown().await;
 }
+
+mod v1_tests {
+    use super::*;
+    use axum::{Json, Router as AxumRouter, response::IntoResponse, routing::post};
+    use tokio::net::TcpListener;
+    use vouch::{
+        auth::Principal,
+        cli::{doctor, mcp},
+    };
+
+    const TOOL_SCRIPT: &str = r#"#!/bin/sh
+PROMPT=$(cat)
+if printf '%s' "$PROMPT" | grep -q "ToolResult"; then
+  printf 'Final answer: 18C in Paris.\n'
+else
+  printf '<vouch_tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</vouch_tool_call>\n'
+fi
+"#;
+
+    const SLEEPY_SCRIPT: &str = r#"#!/bin/sh
+sleep 4
+printf 'awake\n'
+"#;
+
+    fn tool_cli_toml(command: &Path) -> String {
+        format!(
+            r#"
+[defaults]
+model = "coding/default"
+
+[[backends]]
+id = "tool_cli"
+kind = "cli"
+command = {:?}
+stdin = true
+output_mode = "text"
+timeout_secs = 10
+
+[routes]
+"coding/default" = ["tool_cli"]
+"#,
+            command.display().to_string()
+        )
+    }
+
+    #[test]
+    fn vouch_example_toml_parses_and_validates() {
+        let parsed = GatewayConfig::from_toml_str(include_str!("../vouch.example.toml"))
+            .expect("vouch.example.toml should parse and validate");
+        assert!(!parsed.routes.is_empty());
+        assert_eq!(parsed.discovery.probe_timeout_secs, 30);
+        assert!(!parsed.server.enable_ui);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doctor_honors_configurable_probe_timeout() {
+        let dir = TempDir::new().expect("tempdir");
+        let fast = script(dir.path(), "fast.sh", PLAIN_SCRIPT);
+        let slow = script(dir.path(), "slow.sh", SLEEPY_SCRIPT);
+
+        let fast_toml = format!(
+            r#"
+[discovery]
+enabled = false
+probe_ports = false
+probe_timeout_secs = 5
+
+{}
+[routes]
+"coding/default" = ["fast"]
+"#,
+            cli_backend("fast", &fast, 10, "")
+        );
+        let fast_cfg_path = dir.path().join("fast.toml");
+        fs::write(&fast_cfg_path, &fast_toml).expect("write fast config");
+        let fast_cfg = GatewayConfig::from_toml_str(&fast_toml).expect("valid fast config");
+        let fast_report = doctor::inspect(&fast_cfg_path, &fast_cfg)
+            .await
+            .expect("doctor inspect succeeds");
+        assert!(fast_report.healthy, "expected healthy fast probe report");
+        assert_eq!(fast_report.probes.len(), 1);
+        assert!(fast_report.probes[0].ok);
+
+        let slow_toml = format!(
+            r#"
+[discovery]
+enabled = false
+probe_ports = false
+probe_timeout_secs = 1
+
+{}
+[routes]
+"coding/default" = ["slow"]
+"#,
+            cli_backend("slow", &slow, 10, "")
+        );
+        let slow_cfg_path = dir.path().join("slow.toml");
+        fs::write(&slow_cfg_path, &slow_toml).expect("write slow config");
+        let slow_cfg = GatewayConfig::from_toml_str(&slow_toml).expect("valid slow config");
+        let slow_report = doctor::inspect(&slow_cfg_path, &slow_cfg)
+            .await
+            .expect("doctor inspect completes on timeout");
+        assert!(!slow_report.healthy);
+        assert_eq!(slow_report.probes.len(), 1);
+        assert!(!slow_report.probes[0].ok);
+        assert!(
+            slow_report.probes[0].detail.contains("timed out"),
+            "unexpected detail: {}",
+            slow_report.probes[0].detail
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cli_tool_calling_round_trip_openai_and_anthropic() {
+        let dir = TempDir::new().expect("tempdir");
+        let tool_bin = script(dir.path(), "tool.sh", TOOL_SCRIPT);
+        let harness = Harness::new(tool_cli_toml(&tool_bin)).await;
+
+        let openai_tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Fetch weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        }]);
+
+        // OpenAI turn 1 (non-streaming) produces structured tool_calls + tiktoken usage.
+        let r1 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "stream": false,
+                    "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                    "tools": openai_tools
+                }),
+            )
+            .await;
+        assert_eq!(r1.status(), StatusCode::OK);
+        let body1: Value = serde_json::from_str(&body_text(r1).await).expect("turn 1 JSON");
+        assert_eq!(body1["choices"][0]["finish_reason"], "tool_calls");
+        let call = &body1["choices"][0]["message"]["tool_calls"][0];
+        let call_id = call["id"].as_str().expect("generated call id").to_string();
+        assert_eq!(call["function"]["name"], "get_weather");
+        let args: Value =
+            serde_json::from_str(call["function"]["arguments"].as_str().expect("args string"))
+                .expect("valid arguments JSON");
+        assert_eq!(args["city"], "Paris");
+        let prompt_tokens = body1["usage"]["prompt_tokens"]
+            .as_u64()
+            .expect("prompt_tokens");
+        let completion_tokens = body1["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("completion_tokens");
+        assert!(prompt_tokens > 0);
+        assert!(completion_tokens > 0);
+        assert_eq!(
+            body1["usage"]["total_tokens"],
+            prompt_tokens + completion_tokens
+        );
+
+        // OpenAI turn 1 (streaming) emits tool_calls delta and finish_reason=tool_calls.
+        let r_stream = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                    "tools": openai_tools
+                }),
+            )
+            .await;
+        assert_eq!(r_stream.status(), StatusCode::OK);
+        let sse = body_text(r_stream).await;
+        assert!(
+            sse.contains("get_weather"),
+            "missing tool name in SSE: {sse}"
+        );
+        assert!(
+            sse.contains("\"finish_reason\":\"tool_calls\""),
+            "missing tool_calls finish_reason in SSE: {sse}"
+        );
+        assert!(sse.contains("data: [DONE]"));
+
+        // OpenAI turn 2 with tool result completes cleanly.
+        let r2 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "stream": false,
+                    "messages": [
+                        {"role": "user", "content": "Weather in Paris?"},
+                        {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                            }]
+                        },
+                        {"role": "tool", "tool_call_id": call_id, "name": "get_weather", "content": "18C"}
+                    ],
+                    "tools": openai_tools
+                }),
+            )
+            .await;
+        assert_eq!(r2.status(), StatusCode::OK);
+        let body2: Value = serde_json::from_str(&body_text(r2).await).expect("turn 2 JSON");
+        assert_eq!(body2["choices"][0]["finish_reason"], "stop");
+        assert!(
+            body2["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("18C")
+        );
+
+        // Anthropic /v1/messages non-streaming + streaming tool_use.
+        let anth_tools = json!([{
+            "name": "get_weather",
+            "description": "Fetch weather",
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}}
+            }
+        }]);
+        let a1 = harness
+            .post_json(
+                "/v1/messages",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "max_tokens": 128,
+                    "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                    "tools": anth_tools
+                }),
+            )
+            .await;
+        assert_eq!(a1.status(), StatusCode::OK);
+        let anth_body: Value = serde_json::from_str(&body_text(a1).await).expect("anth JSON");
+        assert_eq!(anth_body["stop_reason"], "tool_use");
+        let blocks = anth_body["content"].as_array().expect("content blocks");
+        let tool_block = blocks
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .expect("tool_use block");
+        assert_eq!(tool_block["name"], "get_weather");
+        assert_eq!(tool_block["input"]["city"], "Paris");
+
+        let a_stream = harness
+            .post_json(
+                "/v1/messages",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "max_tokens": 128,
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                    "tools": anth_tools
+                }),
+            )
+            .await;
+        assert_eq!(a_stream.status(), StatusCode::OK);
+        let anth_sse = body_text(a_stream).await;
+        assert!(
+            anth_sse.contains("\"type\":\"tool_use\""),
+            "sse: {anth_sse}"
+        );
+        assert!(anth_sse.contains("input_json_delta"), "sse: {anth_sse}");
+        assert!(
+            anth_sse.contains("\"stop_reason\":\"tool_use\""),
+            "sse: {anth_sse}"
+        );
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_proxy_tool_calling_and_usage_passthrough() {
+        async fn mock_upstream(Json(payload): Json<Value>) -> Response {
+            let has_tools = payload
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|arr| !arr.is_empty());
+            assert!(has_tools, "upstream should receive forwarded tools");
+
+            if payload.get("stream").and_then(Value::as_bool) == Some(true) {
+                let sse = concat!(
+                    "data: {\"id\":\"up-s1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_http_stream_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup_ticket\",\"arguments\":\"{\\\"id\\\":\\\"T\"}}]}}]}\n\n",
+                    "data: {\"id\":\"up-s1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"-42\\\"}\"}}]}}]}\n\n",
+                    "data: {\"id\":\"up-s1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(sse))
+                    .expect("valid SSE response");
+            }
+
+            Json(json!({
+                "id": "up-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "upstream-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_http_1",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup_ticket",
+                                "arguments": "{\"id\":\"T-42\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+            }))
+            .into_response()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral upstream port");
+        let addr = listener.local_addr().expect("upstream local addr");
+        let upstream_app = AxumRouter::new().route("/v1/chat/completions", post(mock_upstream));
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream_app).await;
+        });
+
+        let toml = format!(
+            r#"
+[defaults]
+model = "http/tools"
+
+[[backends]]
+id = "mock_http"
+kind = "http"
+base_url = "http://{addr}"
+
+[routes]
+"http/tools" = ["mock_http"]
+"#
+        );
+        let harness = Harness::new(toml).await;
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "lookup_ticket",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}}
+            }
+        }]);
+
+        let non_stream = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "http/tools",
+                    "stream": false,
+                    "messages": [{"role": "user", "content": "Check ticket T-42"}],
+                    "tools": tools
+                }),
+            )
+            .await;
+        assert_eq!(non_stream.status(), StatusCode::OK);
+        let ns_body: Value = serde_json::from_str(&body_text(non_stream).await).expect("http JSON");
+        assert_eq!(ns_body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            ns_body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "lookup_ticket"
+        );
+        assert_eq!(ns_body["usage"]["prompt_tokens"], 11);
+        assert_eq!(ns_body["usage"]["completion_tokens"], 7);
+        assert_eq!(ns_body["usage"]["total_tokens"], 18);
+
+        let streamed = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "http/tools",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "Check ticket T-42"}],
+                    "tools": tools
+                }),
+            )
+            .await;
+        assert_eq!(streamed.status(), StatusCode::OK);
+        let sse = body_text(streamed).await;
+        assert!(sse.contains("lookup_ticket"), "sse: {sse}");
+        assert!(sse.contains("call_http_stream_1"), "sse: {sse}");
+        assert!(
+            sse.contains("\"finish_reason\":\"tool_calls\""),
+            "sse: {sse}"
+        );
+
+        harness.state.shutdown().await;
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn responses_endpoint_json_streaming_and_function_calls() {
+        let dir = TempDir::new().expect("tempdir");
+        let plain = script(dir.path(), "plain.sh", PLAIN_SCRIPT);
+        let tool_bin = script(dir.path(), "tool.sh", TOOL_SCRIPT);
+        let toml = format!(
+            r#"
+[defaults]
+model = "plain/default"
+
+{}
+[[backends]]
+id = "tool_cli"
+kind = "cli"
+command = {:?}
+stdin = true
+output_mode = "text"
+timeout_secs = 10
+
+[routes]
+"plain/default" = ["plain"]
+"tools/default" = ["tool_cli"]
+"#,
+            cli_backend("plain", &plain, 5, ""),
+            tool_bin.display().to_string()
+        );
+        let harness = Harness::new(toml).await;
+
+        let resp_json = harness
+            .post_json(
+                "/v1/responses",
+                &[],
+                json!({
+                    "model": "plain/default",
+                    "instructions": "Be concise",
+                    "input": "Say hi from responses"
+                }),
+            )
+            .await;
+        assert_eq!(resp_json.status(), StatusCode::OK);
+        let payload: Value =
+            serde_json::from_str(&body_text(resp_json).await).expect("responses JSON");
+        assert_eq!(payload["object"], "response");
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["output"][0]["type"], "message");
+        assert!(
+            payload["output"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("hello")
+        );
+        assert!(payload["usage"]["input_tokens"].as_u64().unwrap_or(0) > 0);
+        assert!(payload["usage"]["output_tokens"].as_u64().unwrap_or(0) > 0);
+
+        let resp_sse = harness
+            .post_json(
+                "/v1/responses",
+                &[],
+                json!({
+                    "model": "plain/default",
+                    "stream": true,
+                    "input": [{"role": "user", "content": "Stream responses"}]
+                }),
+            )
+            .await;
+        assert_eq!(resp_sse.status(), StatusCode::OK);
+        let sse_text = body_text(resp_sse).await;
+        assert!(
+            sse_text.contains("event: response.created"),
+            "sse: {sse_text}"
+        );
+        assert!(
+            sse_text.contains("event: response.output_text.delta"),
+            "sse: {sse_text}"
+        );
+        assert!(
+            sse_text.contains("event: response.output_text.done"),
+            "sse: {sse_text}"
+        );
+        assert!(
+            sse_text.contains("event: response.completed"),
+            "sse: {sse_text}"
+        );
+
+        let resp_tool = harness
+            .post_json(
+                "/v1/responses",
+                &[],
+                json!({
+                    "model": "tools/default",
+                    "input": "Weather in Paris?",
+                    "tools": [{
+                        "type": "function",
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+                    }]
+                }),
+            )
+            .await;
+        assert_eq!(resp_tool.status(), StatusCode::OK);
+        let tool_payload: Value =
+            serde_json::from_str(&body_text(resp_tool).await).expect("responses tool JSON");
+        let fc = tool_payload["output"]
+            .as_array()
+            .expect("output array")
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("function_call output item");
+        assert_eq!(fc["name"], "get_weather");
+        assert!(fc["arguments"].as_str().unwrap_or("").contains("Paris"));
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_json_rpc_and_http_endpoint_route_correctly() {
+        let dir = TempDir::new().expect("tempdir");
+        let plain = script(dir.path(), "plain.sh", PLAIN_SCRIPT);
+        let tokens = r#"
+[[tokens]]
+name = "mcp-client"
+token = "mcp-secret-token-1"
+allowed_models = ["coding/*"]
+"#;
+        let harness = Harness::new(config(
+            &cli_backend("plain", &plain, 5, ""),
+            "\"coding/default\" = [\"plain\"]\n",
+            tokens,
+            10,
+        ))
+        .await;
+
+        let local = Principal::local();
+        let init = mcp::handle_rpc(
+            &harness.state,
+            &local,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05"}
+            }),
+        )
+        .await
+        .expect("initialize returns JSON-RPC response");
+        assert_eq!(init["result"]["serverInfo"]["name"], "vouch");
+        assert_eq!(init["result"]["serverInfo"]["version"], vouch::VERSION);
+
+        let notif = mcp::handle_rpc(
+            &harness.state,
+            &local,
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await;
+        assert!(notif.is_none());
+
+        let listed = mcp::handle_rpc(
+            &harness.state,
+            &local,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        )
+        .await
+        .expect("tools/list response");
+        let tool_names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(tool_names.contains(&"vouch_ask"));
+        assert!(tool_names.contains(&"route_coding_default"));
+
+        let called = mcp::handle_rpc(
+            &harness.state,
+            &local,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "route_coding_default",
+                    "arguments": {"prompt": "ping via mcp"}
+                }
+            }),
+        )
+        .await
+        .expect("tools/call response");
+        assert_eq!(called["result"]["isError"], false);
+        assert!(
+            called["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("hello")
+        );
+
+        // HTTP /mcp enforces bearer token authentication and returns 202 for notifications.
+        let unauth = harness
+            .post_json(
+                "/mcp",
+                &[],
+                json!({"jsonrpc": "2.0", "id": 4, "method": "ping"}),
+            )
+            .await;
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let authed_ping = harness
+            .post_json(
+                "/mcp",
+                &[("authorization", "Bearer mcp-secret-token-1")],
+                json!({"jsonrpc": "2.0", "id": 5, "method": "ping"}),
+            )
+            .await;
+        assert_eq!(authed_ping.status(), StatusCode::OK);
+
+        let authed_notif = harness
+            .post_json(
+                "/mcp",
+                &[("authorization", "Bearer mcp-secret-token-1")],
+                json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            )
+            .await;
+        assert_eq!(authed_notif.status(), StatusCode::ACCEPTED);
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ui_dashboard_respects_enable_ui_flag() {
+        let dir = TempDir::new().expect("tempdir");
+        let plain = script(dir.path(), "plain.sh", PLAIN_SCRIPT);
+
+        let disabled = Harness::new(config(
+            &cli_backend("plain", &plain, 5, ""),
+            "\"coding/default\" = [\"plain\"]\n",
+            "",
+            10,
+        ))
+        .await;
+        let r_disabled = disabled.get("/ui", &[]).await;
+        assert_eq!(r_disabled.status(), StatusCode::NOT_FOUND);
+        disabled.state.shutdown().await;
+
+        let enabled_toml = format!(
+            r#"
+[server]
+enable_ui = true
+
+{}
+[routes]
+"coding/default" = ["plain"]
+"#,
+            cli_backend("plain", &plain, 5, "")
+        );
+        let enabled = Harness::new(enabled_toml).await;
+        let r_enabled = enabled.get("/ui", &[]).await;
+        assert_eq!(r_enabled.status(), StatusCode::OK);
+        assert_eq!(
+            r_enabled
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let html = body_text(r_enabled).await;
+        assert!(html.contains("/healthz"));
+        assert!(html.contains("/metrics"));
+        enabled.state.shutdown().await;
+    }
+}
