@@ -19,9 +19,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     config::{BackendConfig, BackendKind, DefaultsConfig, OutputMode},
     driver::{
-        AnsiStripper, ChunkStream, Completion, Driver, DriverResponse, ExecutionRequest,
-        PermitGuard, ProcessGroupGuard, StreamChunk, Usage, extract_content, io_error, strip_ansi,
-        truncate,
+        AnsiStripper, ChunkStream, Driver, DriverResponse, ExecutionRequest, PermitGuard,
+        ProcessGroupGuard, StreamChunk, emit_subprocess_tail, extract_content,
+        finalize_subprocess_completion, io_error, strip_ansi, truncate,
     },
     error::{GatewayError, Result},
     metrics, telemetry,
@@ -196,18 +196,13 @@ impl CliPipeDriver {
                     )));
                 }
                 let raw = strip_ansi(&buffer);
-                let content = match self.config.output_mode {
-                    OutputMode::Text => raw.trim().to_string(),
-                    OutputMode::Json => parse_json_content(&raw)?,
-                    OutputMode::JsonLines => parse_json_lines(&raw),
-                };
-                let usage = Usage::estimate(&prompt, &content);
-                Ok(DriverResponse::Complete(Completion {
-                    content,
-                    finish_reason: "stop".into(),
-                    usage,
-                    raw: None,
-                }))
+                Ok(DriverResponse::Complete(finalize_subprocess_completion(
+                    &request.model,
+                    &prompt,
+                    &raw,
+                    self.config.output_mode,
+                    !request.tools.is_empty(),
+                )?))
             }
             Ok(Err(error)) => {
                 guard.terminate();
@@ -238,6 +233,8 @@ impl CliPipeDriver {
         let stderr_task = self.drain_stderr(&mut child);
         let backend = self.config.id.clone();
         let output_mode = self.config.output_mode;
+        let parse_tools = !request.tools.is_empty();
+        let model = request.model.clone();
         let cancel = request.cancel.clone();
         let (sender, receiver) = mpsc::channel::<Result<StreamChunk>>(32);
 
@@ -260,6 +257,7 @@ impl CliPipeDriver {
             let mut stripper = AnsiStripper::new();
             let mut json_buffer = String::new();
             let mut line_buffer = String::new();
+            let mut produced = String::new();
             let mut buffer = [0u8; 8192];
 
             loop {
@@ -285,9 +283,22 @@ impl CliPipeDriver {
                         if stripped.is_empty() {
                             continue;
                         }
+                        if produced.len() + stripped.len() > MAX_OUTPUT_BYTES {
+                            guard.terminate();
+                            let _ = child.wait().await;
+                            let _ = sender
+                                .send(Err(GatewayError::Upstream(format!(
+                                    "backend {backend} exceeded the {MAX_OUTPUT_BYTES} byte output limit"
+                                ))))
+                                .await;
+                            return;
+                        }
+                        produced.push_str(&stripped);
                         match output_mode {
                             OutputMode::Text => {
-                                if sender.send(Ok(StreamChunk::delta(stripped))).await.is_err() {
+                                if !parse_tools
+                                    && sender.send(Ok(StreamChunk::delta(stripped))).await.is_err()
+                                {
                                     guard.terminate();
                                     let _ = child.wait().await;
                                     return;
@@ -357,12 +368,15 @@ impl CliPipeDriver {
                 Ok(status) if status.success() => {
                     guard.disarm();
                     record_exit(&backend, &status);
-                    let _ = sender
-                        .send(Ok(StreamChunk::finish(
-                            "stop",
-                            Some(Usage::estimate(&prompt, "")),
-                        )))
-                        .await;
+                    let _ = emit_subprocess_tail(
+                        &sender,
+                        &model,
+                        &prompt,
+                        &produced,
+                        output_mode,
+                        parse_tools,
+                    )
+                    .await;
                 }
                 Ok(status) => {
                     record_exit(&backend, &status);
@@ -502,6 +516,8 @@ mod tests {
             workspace_mode: crate::driver::WorkspaceMode::Auto,
             workdir: None,
             cancel: tokio_util::sync::CancellationToken::new(),
+            tools: Vec::new(),
+            tool_choice: None,
             extra: serde_json::Map::new(),
         };
         assert_eq!(render_arg("--p={prompt}", "hello", &request), "--p=hello");
