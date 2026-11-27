@@ -39,13 +39,15 @@ use crate::{
     auth::Principal,
     driver::{
         ChatMessage, ChunkStream, Completion, ContentPart, DriverResponse, ExecutionRequest,
-        MessageContent, ResponseFormat, StreamChunk, ThinkingBlock, ToolCallDelta, WorkspaceMode,
-        attachments::parse_data_uri, collect_stream_full, render_prompt,
+        MessageContent, ResponseFormat, StreamChunk, ThinkingBlock, ToolCallDelta, Usage,
+        WorkspaceMode, attachments::parse_data_uri, collect_stream_full, render_prompt,
     },
     error::{GatewayError, Result},
     metrics,
-    router::{RoutedResponse, derive_session_key},
+    router::{RoutedResponse, RoutingInput, derive_session_key},
     state::AppState,
+    telemetry::{ActiveSpan, SpanKind, TraceContext},
+    usage::count_tokens,
 };
 
 /// Per-request context resolved before dispatch.
@@ -53,14 +55,20 @@ use crate::{
 pub(crate) struct RequestContext {
     /// Authenticated caller.
     pub principal: Principal,
-    /// Public model after default resolution.
+    /// Resolved canonical route name.
     pub model: String,
+    /// Requested model/alias name before rule/alias expansion.
+    pub requested_model: String,
     /// Correlation id returned to the client.
     pub request_id: String,
     /// Affinity key.
     pub session_key: String,
     /// Requested workspace isolation.
     pub workspace_mode: WorkspaceMode,
+    /// Propagated W3C trace context for spans and upstream headers.
+    pub trace_context: TraceContext,
+    /// Estimated prompt BPE tokens computed at ingress.
+    pub prompt_tokens: u64,
 }
 
 /// Build the complete axum application.
@@ -72,8 +80,12 @@ pub fn build_router(state: Arc<AppState>) -> AxumRouter {
     let mut router = AxumRouter::new()
         .route("/v1/models", get(openai::models))
         .route("/v1/chat/completions", post(openai::chat_completions))
-        .route("/v1/responses", post(responses::responses))
+        .route(
+            "/v1/responses",
+            post(responses::responses).get(responses::responses_ws),
+        )
         .route("/v1/messages", post(anthropic::messages))
+        .route("/v1/usage", get(ops::usage))
         .route("/mcp", post(crate::cli::mcp::http_mcp))
         .route("/ui", get(ui::dashboard))
         .route("/healthz", get(ops::healthz))
@@ -89,22 +101,37 @@ pub fn build_router(state: Arc<AppState>) -> AxumRouter {
     router
 }
 
-/// Authenticate the caller, resolve the model, and derive affinity.
-pub(crate) fn prepare(
+/// Authenticate caller, evaluate `[[routing_rules]]` & `[aliases]`, check
+/// token allowlist against both requested alias & resolved route, and derive
+/// affinity + W3C trace context.
+pub(crate) fn prepare_routed(
     state: &AppState,
     headers: &HeaderMap,
     requested_model: Option<&str>,
     system: Option<&str>,
-    first_user: &str,
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
 ) -> Result<RequestContext> {
-    let principal = state.tokens().authenticate(headers)?;
-    let model = state.resolve_model(requested_model)?;
-    if !principal.allows_model(&model) {
-        return Err(GatewayError::Forbidden(format!(
-            "token {:?} is not allowed to use model {model:?}",
-            principal.name
-        )));
-    }
+    let first_user = first_user_text(messages);
+    let has_images = messages_have_images(messages);
+    let model_hint = requested_model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or("");
+    let rendered = render_prompt(system, messages);
+    let prompt_tokens = count_tokens(model_hint, &rendered);
+
+    let resolved = state.resolve_route(&RoutingInput {
+        requested_model,
+        has_tools: !tools.is_empty(),
+        has_images,
+        prompt_tokens,
+        headers,
+    })?;
+    let principal =
+        state
+            .tokens()
+            .authorize_route(headers, &resolved.requested, &resolved.route)?;
 
     let request_id = header_text(headers, "x-request-id")
         .filter(|value| value.len() <= 128 && is_safe_id(value))
@@ -112,7 +139,7 @@ pub(crate) fn prepare(
         .unwrap_or_else(|| format!("vouch-{}", Uuid::new_v4().simple()));
     let explicit_session =
         header_text(headers, "x-session-id").or_else(|| header_text(headers, "x-vouch-session-id"));
-    let session_key = derive_session_key(explicit_session, system, first_user);
+    let session_key = derive_session_key(explicit_session, system, &first_user);
     let workspace_mode = match header_text(headers, "x-workspace-mode") {
         Some(value) => WorkspaceMode::parse(value).ok_or_else(|| {
             GatewayError::BadRequest(format!(
@@ -121,20 +148,104 @@ pub(crate) fn prepare(
         })?,
         None => WorkspaceMode::Auto,
     };
+    let trace_context = TraceContext::from_headers(headers);
 
     tracing::debug!(
         principal = %principal.name,
-        model = %model,
+        requested_model = %resolved.requested,
+        route = %resolved.route,
+        matched_rule = ?resolved.matched_rule,
         request_id = %request_id,
         "request authenticated"
     );
     Ok(RequestContext {
         principal,
-        model,
+        model: resolved.route,
+        requested_model: resolved.requested,
         request_id,
         session_key,
         workspace_mode,
+        trace_context,
+        prompt_tokens,
     })
+}
+
+fn messages_have_images(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|msg| match &msg.content {
+        MessageContent::Text(_) => false,
+        MessageContent::Parts(parts) => parts.iter().any(|part| {
+            matches!(
+                part,
+                ContentPart::ImageBase64 { .. } | ContentPart::ImageUrl { .. }
+            )
+        }),
+    })
+}
+
+/// Start an OTLP `ingress` span when `[telemetry].otlp_endpoint` is active.
+pub(crate) fn start_ingress_span(
+    state: &AppState,
+    context: &RequestContext,
+    endpoint: &'static str,
+) -> ActiveSpan {
+    let mut span =
+        state
+            .otel()
+            .start_span(context.trace_context.clone(), "ingress", SpanKind::Server);
+    span.set_str("vouch.route", &context.model);
+    span.set_str("vouch.requested_model", &context.requested_model);
+    span.set_str("http.route", endpoint);
+    span
+}
+
+/// Record token daily budget + usage analytics + OTLP span completion on success.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_completion_outcome(
+    state: &AppState,
+    context: &RequestContext,
+    backend: &str,
+    fallback: bool,
+    usage: Usage,
+    elapsed: Duration,
+    span: Option<ActiveSpan>,
+) {
+    let effective = if usage.total_tokens == 0 && context.prompt_tokens > 0 {
+        Usage::new(context.prompt_tokens, usage.completion_tokens)
+    } else {
+        usage
+    };
+    context.principal.record_tokens(effective.total_tokens);
+    state
+        .usage()
+        .record_success(&context.principal.name, backend, effective, elapsed);
+    if let Some(mut span) = span {
+        span.set_str("vouch.route", &context.model);
+        span.set_str("vouch.backend", backend);
+        span.set_bool("vouch.fallback", fallback);
+        span.set_int("gen_ai.usage.input_tokens", effective.prompt_tokens as i64);
+        span.set_int(
+            "gen_ai.usage.output_tokens",
+            effective.completion_tokens as i64,
+        );
+        span.finish_ok();
+    }
+}
+
+/// Record failure analytics + OTLP span error cleanly.
+pub(crate) fn record_error_outcome(
+    state: &AppState,
+    context: &RequestContext,
+    backend: Option<&str>,
+    elapsed: Duration,
+    error: &str,
+    span: Option<ActiveSpan>,
+) {
+    state
+        .usage()
+        .record_error(&context.principal.name, backend, elapsed);
+    if let Some(span) = span {
+        span.finish_err(error);
+    }
 }
 
 /// Build a normalized execution request from an adapter payload.
@@ -173,6 +284,7 @@ pub(crate) fn execution_request(
         backend_session_id: None,
         delta_messages: None,
         session_capture: Arc::new(parking_lot::Mutex::new(None)),
+        trace_context: Some(context.trace_context.clone()),
         extra,
     }
 }
