@@ -6,6 +6,7 @@
 //! lifetime of a stream so that slow consumers apply backpressure all the way
 //! to the child process or upstream connection.
 
+pub mod attachments;
 pub mod cli_pipe;
 pub mod http_proxy;
 pub mod pty_runner;
@@ -22,7 +23,7 @@ use std::{
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -31,6 +32,199 @@ use crate::{
     error::{GatewayError, Result},
     metrics, telemetry,
 };
+
+/// A single structured content element within a multimodal message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    /// Textual span with optional Anthropic prompt caching metadata.
+    Text {
+        /// Plain text content.
+        text: String,
+        /// Optional `cache_control` metadata preserved for compatible upstreams.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<Value>,
+    },
+    /// Base64-encoded image payload (`image/png`, `image/jpeg`, ...).
+    ImageBase64 {
+        /// MIME media type.
+        media_type: String,
+        /// Base64-encoded binary payload (without `data:...;base64,` prefix).
+        data: String,
+    },
+    /// Remote image URL (or non-base64 URI).
+    ImageUrl {
+        /// Target URL.
+        url: String,
+    },
+}
+
+/// Text or multimodal array message body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MessageContent {
+    /// Plain string message content.
+    Text(String),
+    /// Structured multimodal content parts.
+    Parts(Vec<ContentPart>),
+}
+
+impl Default for MessageContent {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+impl From<String> for MessageContent {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<&str> for MessageContent {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+impl MessageContent {
+    /// Flatten text parts into plain text (images omitted for hashing/summaries).
+    pub fn as_plain_text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Parts(parts) => {
+                let mut out = String::new();
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text, .. } => {
+                            if !text.is_empty() {
+                                if !out.is_empty() {
+                                    out.push('\n');
+                                }
+                                out.push_str(text);
+                            }
+                        }
+                        ContentPart::ImageBase64 { .. } => {}
+                        ContentPart::ImageUrl { url } => {
+                            if !out.is_empty() {
+                                out.push('\n');
+                            }
+                            out.push_str(&format!("[image: {url}]"));
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// True when the content contains neither non-empty text nor media parts.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Text(text) => text.is_empty(),
+            Self::Parts(parts) => parts.iter().all(|part| match part {
+                ContentPart::Text { text, .. } => text.is_empty(),
+                ContentPart::ImageBase64 { .. } | ContentPart::ImageUrl { .. } => false,
+            }),
+        }
+    }
+
+    /// True if this content carries image parts or `cache_control` metadata.
+    pub fn is_rich(&self) -> bool {
+        match self {
+            Self::Text(_) => false,
+            Self::Parts(parts) => parts.iter().any(|part| match part {
+                ContentPart::Text { cache_control, .. } => cache_control.is_some(),
+                ContentPart::ImageBase64 { .. } | ContentPart::ImageUrl { .. } => true,
+            }),
+        }
+    }
+
+    /// Serialize into OpenAI Chat Completions `"content"` value.
+    pub fn to_openai_value(&self) -> Value {
+        if !self.is_rich() {
+            return Value::String(self.as_plain_text());
+        }
+        match self {
+            Self::Text(text) => Value::String(text.clone()),
+            Self::Parts(parts) => Value::Array(
+                parts
+                    .iter()
+                    .map(|part| match part {
+                        ContentPart::Text {
+                            text,
+                            cache_control,
+                        } => {
+                            let mut obj = serde_json::Map::new();
+                            obj.insert("type".into(), json!("text"));
+                            obj.insert("text".into(), json!(text));
+                            if let Some(cc) = cache_control {
+                                obj.insert("cache_control".into(), cc.clone());
+                            }
+                            Value::Object(obj)
+                        }
+                        ContentPart::ImageBase64 { media_type, data } => json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{media_type};base64,{data}"),
+                            }
+                        }),
+                        ContentPart::ImageUrl { url } => json!({
+                            "type": "image_url",
+                            "image_url": {"url": url}
+                        }),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Normalized JSON/schema structured output request (`response_format` or `text.format`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ResponseFormat {
+    /// Valid JSON object/value output without an explicit schema.
+    JsonObject,
+    /// Strict JSON Schema constrained output.
+    JsonSchema {
+        /// Optional schema name.
+        name: Option<String>,
+        /// JSON Schema document.
+        schema: Value,
+        /// Strict mode indicator.
+        strict: bool,
+        /// Original raw JSON object preserved for HTTP passthrough.
+        raw: Value,
+    },
+}
+
+impl ResponseFormat {
+    /// JSON representation sent upstream to OpenAI-compatible HTTP daemons.
+    pub fn to_openai_json(&self) -> Value {
+        match self {
+            Self::JsonObject => json!({"type": "json_object"}),
+            Self::JsonSchema { raw, .. } => raw.clone(),
+        }
+    }
+}
+
+/// Assistant reasoning/thinking trace block (Anthropic extended thinking).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingBlock {
+    /// Plain-text thinking trace with optional cryptographic signature.
+    Thinking {
+        /// Reasoning text.
+        thinking: String,
+        /// Verification signature, if emitted by upstream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// Opaque redacted thinking payload.
+    RedactedThinking {
+        /// Encrypted/redacted data string.
+        data: String,
+    },
+}
 
 /// A tool call requested by an assistant response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,8 +258,8 @@ pub struct ToolCallDelta {
 pub struct ChatMessage {
     /// `system`, `user`, `assistant`, or `tool`.
     pub role: String,
-    /// Flattened textual content.
-    pub content: String,
+    /// Text or multimodal content parts.
+    pub content: MessageContent,
     /// Structured tool calls emitted by an `assistant` turn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
@@ -82,7 +276,18 @@ impl ChatMessage {
     pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    /// Construct a multimodal conversation turn.
+    pub fn parts(role: impl Into<String>, parts: Vec<ContentPart>) -> Self {
+        Self {
+            role: role.into(),
+            content: MessageContent::Parts(parts),
             tool_calls: Vec::new(),
             tool_call_id: None,
             name: None,
@@ -176,15 +381,39 @@ pub struct ExecutionRequest {
     pub tools: Vec<Value>,
     /// Tool selection policy (`"auto"`, `"none"`, `"required"`, or object).
     pub tool_choice: Option<Value>,
+    /// Normalized JSON / JSON Schema structured output constraint.
+    pub response_format: Option<ResponseFormat>,
+    /// Native backend session handle selected for multi-turn CLI continuation.
+    pub backend_session_id: Option<String>,
+    /// Subset of new turns rendered when resuming via `resume_args`.
+    pub delta_messages: Option<Vec<ChatMessage>>,
+    /// Slot populated with a newly captured `backend_session_id` after execution.
+    pub session_capture: Arc<parking_lot::Mutex<Option<String>>>,
     /// Protocol-specific fields forwarded to HTTP upstreams.
     pub extra: serde_json::Map<String, Value>,
 }
 
 impl ExecutionRequest {
-    /// Render a plain-text prompt for subprocess backends.
+    /// True when resuming an existing native CLI session using `resume_args`.
+    pub fn is_resuming(&self) -> bool {
+        self.delta_messages.is_some()
+    }
+
+    /// Conversation messages to render for CLI/PTY (`delta_messages` when resuming,
+    /// full `messages` on turn 1).
+    pub fn active_messages(&self) -> &[ChatMessage] {
+        self.delta_messages.as_deref().unwrap_or(&self.messages)
+    }
+
+    /// Render a plain-text prompt for subprocess backends (without temp attachments).
     pub fn rendered_prompt(&self) -> String {
-        let mut prompt = if !self.prompt.is_empty() {
-            self.prompt.clone()
+        let mut prompt = if self.is_resuming() || !self.prompt.is_empty() && !self.has_rich_parts()
+        {
+            if self.is_resuming() {
+                render_prompt(None, self.active_messages())
+            } else {
+                self.prompt.clone()
+            }
         } else {
             render_prompt(self.system.as_deref(), &self.messages)
         };
@@ -195,34 +424,44 @@ impl ExecutionRequest {
                 self.tool_choice.as_ref(),
             );
         }
+        if let Some(format) = &self.response_format {
+            tool_bridge::append_structured_output_instructions(&mut prompt, format);
+        }
         prompt
     }
 
-    /// OpenAI-shaped messages including the system turn and tool calls/results.
+    /// True if any message contains multimodal/rich parts.
+    pub fn has_rich_parts(&self) -> bool {
+        self.active_messages()
+            .iter()
+            .any(|message| message.content.is_rich())
+    }
+
+    /// OpenAI-shaped messages including the system turn, multimodal parts, and tool calls/results.
     pub fn openai_messages(&self) -> Vec<Value> {
         let mut messages = Vec::with_capacity(self.messages.len() + 1);
         if let Some(system) = &self.system
             && !system.is_empty()
         {
-            messages.push(serde_json::json!({"role": "system", "content": system}));
+            messages.push(json!({"role": "system", "content": system}));
         }
         for message in &self.messages {
             let mut item = serde_json::Map::new();
-            item.insert("role".into(), serde_json::json!(message.role));
+            item.insert("role".into(), json!(message.role));
             if message.tool_calls.is_empty() {
-                item.insert("content".into(), serde_json::json!(message.content));
+                item.insert("content".into(), message.content.to_openai_value());
             } else {
                 let content = if message.content.is_empty() {
                     Value::Null
                 } else {
-                    serde_json::json!(message.content)
+                    message.content.to_openai_value()
                 };
                 item.insert("content".into(), content);
                 let tool_calls: Vec<Value> = message
                     .tool_calls
                     .iter()
                     .map(|call| {
-                        serde_json::json!({
+                        json!({
                             "id": call.id,
                             "type": "function",
                             "function": {
@@ -235,10 +474,10 @@ impl ExecutionRequest {
                 item.insert("tool_calls".into(), Value::Array(tool_calls));
             }
             if let Some(call_id) = &message.tool_call_id {
-                item.insert("tool_call_id".into(), serde_json::json!(call_id));
+                item.insert("tool_call_id".into(), json!(call_id));
             }
             if let Some(name) = &message.name {
-                item.insert("name".into(), serde_json::json!(name));
+                item.insert("name".into(), json!(name));
             }
             messages.push(Value::Object(item));
         }
@@ -275,6 +514,8 @@ pub struct Completion {
     pub raw: Option<Value>,
     /// Structured tool calls requested by the assistant.
     pub tool_calls: Vec<ToolCall>,
+    /// Extended thinking/reasoning blocks emitted by compatible backends.
+    pub thinking: Vec<ThinkingBlock>,
 }
 
 /// One incremental stream item.
@@ -282,6 +523,12 @@ pub struct Completion {
 pub struct StreamChunk {
     /// Text appended to the assistant message.
     pub delta: String,
+    /// Incremental extended-thinking delta emitted during streaming.
+    pub thinking_delta: Option<String>,
+    /// Incremental thinking signature delta when streamed.
+    pub signature_delta: Option<String>,
+    /// Redacted thinking block emitted during streaming.
+    pub redacted_thinking: Option<String>,
     /// Incremental tool call deltas.
     pub tool_calls: Vec<ToolCallDelta>,
     /// Set on the terminal chunk.
@@ -295,6 +542,22 @@ impl StreamChunk {
     pub fn delta(delta: impl Into<String>) -> Self {
         Self {
             delta: delta.into(),
+            thinking_delta: None,
+            signature_delta: None,
+            redacted_thinking: None,
+            tool_calls: Vec::new(),
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
+    /// An incremental extended-thinking delta.
+    pub fn thinking(delta: impl Into<String>) -> Self {
+        Self {
+            delta: String::new(),
+            thinking_delta: Some(delta.into()),
+            signature_delta: None,
+            redacted_thinking: None,
             tool_calls: Vec::new(),
             finish_reason: None,
             usage: None,
@@ -305,6 +568,9 @@ impl StreamChunk {
     pub fn tool_calls(tool_calls: Vec<ToolCallDelta>) -> Self {
         Self {
             delta: String::new(),
+            thinking_delta: None,
+            signature_delta: None,
+            redacted_thinking: None,
             tool_calls,
             finish_reason: None,
             usage: None,
@@ -315,6 +581,9 @@ impl StreamChunk {
     pub fn finish(reason: impl Into<String>, usage: Option<Usage>) -> Self {
         Self {
             delta: String::new(),
+            thinking_delta: None,
+            signature_delta: None,
+            redacted_thinking: None,
             tool_calls: Vec::new(),
             finish_reason: Some(reason.into()),
             usage,
@@ -852,32 +1121,99 @@ pub fn extract_tool_call_deltas(value: &Value) -> Vec<ToolCallDelta> {
         .collect()
 }
 
-/// Extract a stream delta, finish reason, and usage from one upstream event.
-pub fn extract_delta(value: &Value) -> (Option<String>, Option<String>, Option<Usage>) {
+/// Extract extended-thinking / redacted-thinking blocks from an upstream JSON response.
+pub fn extract_thinking(value: &Value) -> Vec<ThinkingBlock> {
+    let mut blocks = Vec::new();
+    if let Some(parts) = value.get("content").and_then(Value::as_array) {
+        for part in parts {
+            match part.get("type").and_then(Value::as_str) {
+                Some("thinking") => {
+                    if let Some(thinking) = part.get("thinking").and_then(Value::as_str) {
+                        blocks.push(ThinkingBlock::Thinking {
+                            thinking: thinking.to_string(),
+                            signature: part
+                                .get("signature")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string),
+                        });
+                    }
+                }
+                Some("redacted_thinking") => {
+                    if let Some(data) = part.get("data").and_then(Value::as_str) {
+                        blocks.push(ThinkingBlock::RedactedThinking {
+                            data: data.to_string(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if blocks.is_empty()
+        && let Some(reasoning) = value
+            .pointer("/choices/0/message/reasoning_content")
+            .or_else(|| value.pointer("/choices/0/message/reasoning"))
+            .and_then(content_to_text)
+        && !reasoning.is_empty()
+    {
+        blocks.push(ThinkingBlock::Thinking {
+            thinking: reasoning,
+            signature: None,
+        });
+    }
+    blocks
+}
+
+/// Detailed incremental delta extracted from an upstream SSE event.
+#[derive(Debug, Default)]
+pub struct ExtractedDelta {
+    /// Textual assistant content delta.
+    pub content: Option<String>,
+    /// Extended thinking delta.
+    pub thinking: Option<String>,
+    /// Thinking cryptographic signature delta.
+    pub signature: Option<String>,
+    /// Redacted thinking payload.
+    pub redacted_thinking: Option<String>,
+    /// Finish reason, if present.
+    pub finish_reason: Option<String>,
+    /// Usage metrics, if present.
+    pub usage: Option<Usage>,
+}
+
+/// Extract content, thinking deltas, finish reason, and usage from an upstream event.
+pub fn extract_delta_full(value: &Value) -> ExtractedDelta {
     let usage = extract_usage(value);
     if let Some(choices) = value.get("choices").and_then(Value::as_array)
         && let Some(choice) = choices.first()
     {
-        let delta = choice
+        let content = choice
             .get("delta")
-            .and_then(|delta| {
-                delta
-                    .get("content")
-                    .and_then(content_to_text)
-                    .or_else(|| delta.get("reasoning_content").and_then(content_to_text))
-            })
+            .and_then(|delta| delta.get("content").and_then(content_to_text))
             .or_else(|| {
                 choice
                     .get("text")
                     .and_then(Value::as_str)
                     .map(ToString::to_string)
             });
-        let finish = choice
+        let thinking = choice.get("delta").and_then(|delta| {
+            delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .and_then(content_to_text)
+        });
+        let finish_reason = choice
             .get("finish_reason")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        if delta.is_some() || finish.is_some() {
-            return (delta, finish, usage);
+        if content.is_some() || thinking.is_some() || finish_reason.is_some() {
+            return ExtractedDelta {
+                content,
+                thinking,
+                finish_reason,
+                usage,
+                ..Default::default()
+            };
         }
     }
 
@@ -886,45 +1222,129 @@ pub fn extract_delta(value: &Value) -> (Option<String>, Option<String>, Option<U
         .and_then(Value::as_str)
         .unwrap_or_default();
     match event_type {
+        "content_block_start" => {
+            if let Some(cb) = value.get("content_block")
+                && cb.get("type").and_then(Value::as_str) == Some("redacted_thinking")
+                && let Some(data) = cb.get("data").and_then(Value::as_str)
+            {
+                return ExtractedDelta {
+                    redacted_thinking: Some(data.to_string()),
+                    usage,
+                    ..Default::default()
+                };
+            }
+            return ExtractedDelta {
+                usage,
+                ..Default::default()
+            };
+        }
         "content_block_delta" => {
-            let delta = value
-                .get("delta")
-                .and_then(|delta| delta.get("text"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            return (delta, None, usage);
+            if let Some(delta_obj) = value.get("delta") {
+                match delta_obj.get("type").and_then(Value::as_str) {
+                    Some("thinking_delta") => {
+                        return ExtractedDelta {
+                            thinking: delta_obj
+                                .get("thinking")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string),
+                            usage,
+                            ..Default::default()
+                        };
+                    }
+                    Some("signature_delta") => {
+                        return ExtractedDelta {
+                            signature: delta_obj
+                                .get("signature")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string),
+                            usage,
+                            ..Default::default()
+                        };
+                    }
+                    _ => {
+                        return ExtractedDelta {
+                            content: delta_obj
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string),
+                            usage,
+                            ..Default::default()
+                        };
+                    }
+                }
+            }
         }
         "message_delta" => {
-            let finish = value
+            let finish_reason = value
                 .get("delta")
                 .and_then(|delta| delta.get("stop_reason"))
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
-            return (None, finish, usage);
+            return ExtractedDelta {
+                finish_reason,
+                usage,
+                ..Default::default()
+            };
         }
-        "message_stop" | "done" => return (None, Some("stop".into()), usage),
-        "error" => return (None, None, usage),
+        "message_stop" | "done" => {
+            return ExtractedDelta {
+                finish_reason: Some("stop".into()),
+                usage,
+                ..Default::default()
+            };
+        }
+        "error" => {
+            return ExtractedDelta {
+                usage,
+                ..Default::default()
+            };
+        }
         _ => {}
     }
 
     if let Some(delta) = value.get("delta") {
         if let Some(text) = delta.as_str() {
-            return (Some(text.to_string()), None, usage);
+            return ExtractedDelta {
+                content: Some(text.to_string()),
+                usage,
+                ..Default::default()
+            };
         }
         if let Some(text) = delta
             .get("text")
             .and_then(Value::as_str)
             .or_else(|| delta.get("content").and_then(Value::as_str))
         {
-            return (Some(text.to_string()), None, usage);
+            return ExtractedDelta {
+                content: Some(text.to_string()),
+                usage,
+                ..Default::default()
+            };
         }
     }
     for key in ["content", "text", "token", "response"] {
         if let Some(text) = value.get(key).and_then(Value::as_str) {
-            return (Some(text.to_string()), None, usage);
+            return ExtractedDelta {
+                content: Some(text.to_string()),
+                usage,
+                ..Default::default()
+            };
         }
     }
-    (None, None, usage)
+    ExtractedDelta {
+        usage,
+        ..Default::default()
+    }
+}
+
+/// Extract a stream delta, finish reason, and usage from one upstream event.
+pub fn extract_delta(value: &Value) -> (Option<String>, Option<String>, Option<Usage>) {
+    let extracted = extract_delta_full(value);
+    (
+        extracted.content.or(extracted.thinking),
+        extracted.finish_reason,
+        extracted.usage,
+    )
 }
 
 /// Extract token usage from common upstream shapes.
@@ -965,6 +1385,12 @@ pub fn content_to_text(value: &Value) -> Option<String> {
         Value::Array(parts) => {
             let mut output = String::new();
             for part in parts {
+                if matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                ) {
+                    continue;
+                }
                 let text = part
                     .get("text")
                     .and_then(Value::as_str)
@@ -997,16 +1423,137 @@ pub fn content_to_text(value: &Value) -> Option<String> {
     }
 }
 
-/// Map an upstream HTTP status to a gateway error, redacting the body.
-pub fn map_upstream_status(status: u16, body: &str) -> GatewayError {
+/// Map an upstream HTTP status and headers to a gateway error, redacting the body.
+pub fn map_upstream_status_with_headers(
+    status: u16,
+    headers: Option<&reqwest::header::HeaderMap>,
+    body: &str,
+) -> GatewayError {
     let body = telemetry::redact_text(body);
     let body = truncate(&body, 800);
     match status {
-        429 => GatewayError::UpstreamRateLimited(format!("upstream returned 429: {body}")),
+        429 => {
+            let retry_after = headers
+                .and_then(|map| map.get(reqwest::header::RETRY_AFTER))
+                .and_then(|val| val.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            GatewayError::upstream_rate_limited(
+                format!("upstream returned 429: {body}"),
+                retry_after,
+            )
+        }
         400 | 422 => GatewayError::BadRequest(format!("upstream rejected request: {body}")),
-        401 | 403 => GatewayError::Upstream(format!("upstream authentication failed: {body}")),
+        401 | 403 => GatewayError::UpstreamAuthExpired(format!(
+            "upstream authentication failed ({status}): {body}"
+        )),
         404 => GatewayError::NotFound(format!("upstream resource not found: {body}")),
         _ => GatewayError::Upstream(format!("upstream returned HTTP {status}: {body}")),
+    }
+}
+
+/// Map an upstream HTTP status to a gateway error, redacting the body.
+pub fn map_upstream_status(status: u16, body: &str) -> GatewayError {
+    map_upstream_status_with_headers(status, None, body)
+}
+
+/// Classify a CLI/PTY failure (stderr/message) into auth-expiry, rate-limit,
+/// or a generic upstream failure.
+pub fn classify_cli_failure(backend: &str, exit_detail: &str, stderr: &str) -> GatewayError {
+    let combined = format!("{stderr}\n{exit_detail}").to_ascii_lowercase();
+    let snippet = truncate(&telemetry::redact_text(stderr.trim()), 500);
+    let detail_line = if snippet.is_empty() {
+        format!("backend {backend} {exit_detail}")
+    } else {
+        format!("backend {backend} {exit_detail}: {snippet}")
+    };
+
+    const AUTH_MARKERS: &[&str] = &[
+        "invalid token",
+        "token expired",
+        "expired token",
+        "please sign in",
+        "sign in required",
+        "not logged in",
+        "unauthorized",
+        "authentication failed",
+        "invalid api key",
+        "invalid_api_key",
+        "401 unauthorized",
+        "403 forbidden",
+    ];
+    if AUTH_MARKERS.iter().any(|marker| combined.contains(marker)) {
+        return GatewayError::UpstreamAuthExpired(detail_line);
+    }
+
+    const RATE_MARKERS: &[&str] = &[
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "quota exceeded",
+        "429",
+    ];
+    if RATE_MARKERS.iter().any(|marker| combined.contains(marker)) {
+        return GatewayError::upstream_rate_limited(detail_line, None);
+    }
+
+    GatewayError::Upstream(detail_line)
+}
+
+/// Buffer stream chunks until the first non-whitespace delta, tool call, or
+/// thinking trace arrives. If an error occurs while only empty/whitespace
+/// output was produced, returns `Err` so [`crate::router::Router`] can fail
+/// over transparently to the next backend.
+pub async fn prime_stream(mut stream: ChunkStream) -> Result<ChunkStream> {
+    let mut buffered = Vec::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(chunk) => {
+                let meaningful = chunk.delta.chars().any(|c| !c.is_whitespace())
+                    || chunk
+                        .thinking_delta
+                        .as_deref()
+                        .is_some_and(|t| t.chars().any(|c| !c.is_whitespace()))
+                    || chunk.redacted_thinking.is_some()
+                    || !chunk.tool_calls.is_empty()
+                    || chunk.finish_reason.is_some();
+                buffered.push(Ok(chunk));
+                if meaningful {
+                    let prefix = futures::stream::iter(buffered);
+                    return Ok(Box::pin(prefix.chain(stream)));
+                }
+            }
+            Err(error) => {
+                return Err(error);
+            }
+        }
+    }
+    Ok(Box::pin(futures::stream::iter(buffered)))
+}
+
+/// Capture an upstream native session handle using `session_id_regex`.
+pub(crate) fn capture_session_id(
+    regex_str: Option<&str>,
+    stderr: &str,
+    stdout: &str,
+    capture_slot: &parking_lot::Mutex<Option<String>>,
+) {
+    let Some(pattern) = regex_str else {
+        return;
+    };
+    let Ok(regex) = regex::Regex::new(pattern) else {
+        return;
+    };
+    let candidate = [stderr, stdout].into_iter().find_map(|haystack| {
+        regex.captures(haystack).and_then(|caps| {
+            caps.get(1)
+                .or_else(|| caps.get(0))
+                .map(|m| m.as_str().trim().to_string())
+        })
+    });
+    if let Some(id) = candidate
+        && !id.is_empty()
+    {
+        *capture_slot.lock() = Some(id);
     }
 }
 
@@ -1027,6 +1574,8 @@ pub struct CollectedStream {
     pub content: String,
     /// Reassembled structured tool calls.
     pub tool_calls: Vec<ToolCall>,
+    /// Accumulated extended thinking blocks.
+    pub thinking: Vec<ThinkingBlock>,
     /// Terminal finish reason, if emitted.
     pub finish_reason: Option<String>,
     /// Token usage, if emitted.
@@ -1039,6 +1588,9 @@ pub async fn collect_stream_full(
     max_bytes: usize,
 ) -> Result<CollectedStream> {
     let mut content = String::new();
+    let mut thinking_text = String::new();
+    let mut thinking_sig: Option<String> = None;
+    let mut thinking_blocks = Vec::new();
     let mut finish = None;
     let mut usage = None;
     let mut tool_calls: std::collections::BTreeMap<usize, ToolCall> =
@@ -1049,6 +1601,22 @@ pub async fn collect_stream_full(
         let chunk = item?;
         total_bytes = total_bytes.saturating_add(chunk.delta.len());
         content.push_str(&chunk.delta);
+        if let Some(t) = chunk.thinking_delta {
+            total_bytes = total_bytes.saturating_add(t.len());
+            thinking_text.push_str(&t);
+        }
+        if let Some(sig) = chunk.signature_delta {
+            thinking_sig.get_or_insert_with(String::new).push_str(&sig);
+        }
+        if let Some(data) = chunk.redacted_thinking {
+            if !thinking_text.is_empty() {
+                thinking_blocks.push(ThinkingBlock::Thinking {
+                    thinking: std::mem::take(&mut thinking_text),
+                    signature: thinking_sig.take(),
+                });
+            }
+            thinking_blocks.push(ThinkingBlock::RedactedThinking { data });
+        }
         for delta in chunk.tool_calls {
             let entry = tool_calls.entry(delta.index).or_insert_with(|| ToolCall {
                 id: format!("call_{}", uuid::Uuid::new_v4().simple()),
@@ -1078,10 +1646,17 @@ pub async fn collect_stream_full(
             usage = chunk.usage;
         }
     }
+    if !thinking_text.is_empty() {
+        thinking_blocks.push(ThinkingBlock::Thinking {
+            thinking: thinking_text,
+            signature: thinking_sig,
+        });
+    }
 
     Ok(CollectedStream {
         content,
         tool_calls: tool_calls.into_values().collect(),
+        thinking: thinking_blocks,
         finish_reason: finish,
         usage,
     })
@@ -1103,8 +1678,9 @@ pub(crate) fn finalize_subprocess_completion(
     raw_text: &str,
     output_mode: crate::config::OutputMode,
     parse_tools: bool,
+    response_format: Option<&ResponseFormat>,
 ) -> Result<Completion> {
-    let (content, tool_calls) = match output_mode {
+    let (mut content, tool_calls) = match output_mode {
         crate::config::OutputMode::Text if parse_tools => {
             tool_bridge::parse_tool_calls(raw_text.trim())
         }
@@ -1118,6 +1694,11 @@ pub(crate) fn finalize_subprocess_completion(
             Vec::new(),
         ),
     };
+    if tool_calls.is_empty()
+        && let Some(format) = response_format
+    {
+        content = tool_bridge::enforce_response_format(&content, format)?;
+    }
     let finish_reason = if tool_calls.is_empty() {
         "stop".to_string()
     } else {
@@ -1130,10 +1711,12 @@ pub(crate) fn finalize_subprocess_completion(
         usage,
         raw: None,
         tool_calls,
+        thinking: Vec::new(),
     })
 }
 
-/// Emit buffered tail chunks (and optional parsed tool calls) at subprocess EOF.
+/// Emit buffered tail chunks (and optional parsed tool calls / validated JSON)
+/// at subprocess EOF.
 pub(crate) async fn emit_subprocess_tail(
     sender: &tokio::sync::mpsc::Sender<Result<StreamChunk>>,
     model: &str,
@@ -1141,9 +1724,26 @@ pub(crate) async fn emit_subprocess_tail(
     produced: &str,
     output_mode: crate::config::OutputMode,
     parse_tools: bool,
+    response_format: Option<&ResponseFormat>,
 ) -> bool {
-    if output_mode == crate::config::OutputMode::Text && parse_tools {
-        let (clean_text, tool_calls) = tool_bridge::parse_tool_calls(produced);
+    if output_mode == crate::config::OutputMode::Text && (parse_tools || response_format.is_some())
+    {
+        let (mut clean_text, tool_calls) = if parse_tools {
+            tool_bridge::parse_tool_calls(produced)
+        } else {
+            (produced.trim().to_string(), Vec::new())
+        };
+        if tool_calls.is_empty()
+            && let Some(format) = response_format
+        {
+            clean_text = match tool_bridge::enforce_response_format(&clean_text, format) {
+                Ok(valid) => valid,
+                Err(error) => {
+                    let _ = sender.send(Err(error)).await;
+                    return false;
+                }
+            };
+        }
         if !clean_text.is_empty()
             && sender
                 .send(Ok(StreamChunk::delta(clean_text)))
