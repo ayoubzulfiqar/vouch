@@ -118,18 +118,21 @@ extra_headers = { "X-Vouch-Client" = "vouch" }
 # 2) Headless stdin/stdout subprocess. cli/pty backends REQUIRE `command` and
 #    MUST NOT set `base_url`. Prompt transport: set `stdin = true` OR include
 #    `{prompt}` in `args`. Substitutions: {prompt}, {model}, {session_id},
-#    {request_id}. Child also receives VOUCH_REQUEST_ID / VOUCH_SESSION_ID /
-#    VOUCH_MODEL. Each child runs in its own process group (PGID = PID).
+#    {request_id}, {backend_session_id}. Child also receives VOUCH_REQUEST_ID /
+#    VOUCH_SESSION_ID / VOUCH_MODEL (and VOUCH_BACKEND_SESSION_ID on resume).
+#    Each child runs in its own process group (PGID = PID).
 [[backends]]
 id = "codex-cli"
 kind = "cli"
 max_concurrency = 1
 timeout_secs = 300
+idle_timeout_secs = 120
 queue_timeout_ms = 1000
 isolate_workspace = true
 command = "codex"
 args = ["exec", "--model", "{model}", "--skip-git-repo-check"]
 stdin = true
+max_inline_prompt_bytes = 65536
 env = { CODEX_HOME = "/path/to/.codex" }
 # Ignored while workspace isolation is active.
 workdir = "/path/to/projects"
@@ -140,20 +143,33 @@ pty_send_eof = true
 # 3) Pseudo-terminal subprocess for CLIs that need a TTY or render a TUI.
 #    Runs in spawn_blocking with bounded channels; here the prompt is passed
 #    as an argument instead of stdin, which also satisfies prompt transport.
+#    Supports native multi-turn delta continuation via `resume_args` and
+#    interactive prompt handling via `[[backends.pty_auto_respond]]`.
 [[backends]]
 id = "interactive-pty"
 kind = "pty"
 max_concurrency = 1
 timeout_secs = 600
+idle_timeout_secs = 120
 queue_timeout_ms = 1000
 isolate_workspace = false
 command = "opencode"
 args = ["run", "{prompt}"]
+resume_args = ["run", "--session", "{backend_session_id}", "{prompt}"]
+session_id_regex = "session_id=([A-Za-z0-9_-]+)"
 stdin = false
+max_inline_prompt_bytes = 65536
 env = { TERM = "xterm-256color" }
 output_mode = "text"
 # Send EOT after the prompt when the child reads stdin. Default: true.
 pty_send_eof = true
+# PTY dimensions (`portable-pty`). Defaults: 160x48.
+pty_cols = 160
+pty_rows = 48
+
+[[backends.pty_auto_respond]]
+pattern = "Continue? [y/N]"
+response = "y"
 
 # ---------------------------------------------------------------------------
 # [routes] — public model name -> ORDERED fallback chain of backend ids.
