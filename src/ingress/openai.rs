@@ -19,7 +19,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    driver::{ChatMessage, StreamChunk, Usage, content_to_text, truncate},
+    driver::{
+        ChatMessage, StreamChunk, ToolCall, ToolCallDelta, Usage, content_to_text,
+        tool_bridge::normalize_tools, truncate,
+    },
     error::{GatewayError, Result},
     ingress::{
         CancelOnDrop, completion, execute, execution_request, first_user_text, into_chunk_stream,
@@ -43,6 +46,10 @@ pub struct OpenAiChatRequest {
     max_tokens: Option<u32>,
     #[serde(default)]
     max_completion_tokens: Option<u32>,
+    #[serde(default)]
+    tools: Vec<Value>,
+    #[serde(default)]
+    tool_choice: Option<Value>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
@@ -53,6 +60,12 @@ struct OpenAiMessage {
     role: String,
     #[serde(default)]
     content: Option<Value>,
+    #[serde(default)]
+    tool_calls: Vec<Value>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// List configured public models.
@@ -118,6 +131,7 @@ async fn chat_completions_inner(
         &first_user,
     )?;
     let max_tokens = payload.max_tokens.or(payload.max_completion_tokens);
+    let tools = normalize_tools(payload.tools);
     let cancel = CancellationToken::new();
     let request = execution_request(
         &context,
@@ -126,6 +140,8 @@ async fn chat_completions_inner(
         payload.stream,
         payload.temperature,
         max_tokens,
+        tools,
+        payload.tool_choice,
         payload.extra,
         cancel.clone(),
     );
@@ -162,6 +178,7 @@ async fn chat_completions_inner(
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(stream_timeout);
             let mut timed_out = false;
+            let mut saw_tool_calls = false;
             loop {
                 let item = tokio::select! {
                     _ = tokio::time::sleep_until(deadline) => {
@@ -184,7 +201,7 @@ async fn chat_completions_inner(
                 }
                 match item {
                     Some(Ok(chunk)) => {
-                        let StreamChunk { delta, finish_reason, usage } = chunk;
+                        let StreamChunk { delta, tool_calls, finish_reason, usage } = chunk;
                         if !delta.is_empty() {
                             let payload = json!({
                                 "id": id,
@@ -199,7 +216,28 @@ async fn chat_completions_inner(
                             });
                             yield Ok(Event::default().data(payload.to_string()));
                         }
+                        if !tool_calls.is_empty() {
+                            saw_tool_calls = true;
+                            let deltas: Vec<Value> = tool_calls.iter().map(tool_call_delta_json).collect();
+                            let payload = json!({
+                                "id": id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"tool_calls": deltas},
+                                    "finish_reason": null,
+                                }],
+                            });
+                            yield Ok(Event::default().data(payload.to_string()));
+                        }
                         if let Some(reason) = finish_reason {
+                            let effective_reason = if saw_tool_calls && reason == "stop" {
+                                "tool_calls".to_string()
+                            } else {
+                                reason
+                            };
                             let mut payload = json!({
                                 "id": id,
                                 "object": "chat.completion.chunk",
@@ -208,7 +246,7 @@ async fn chat_completions_inner(
                                 "choices": [{
                                     "index": 0,
                                     "delta": {},
-                                    "finish_reason": reason,
+                                    "finish_reason": effective_reason,
                                 }],
                             });
                             if let Some(usage) = usage
@@ -232,6 +270,7 @@ async fn chat_completions_inner(
                         break;
                     }
                     None => {
+                        let effective_reason = if saw_tool_calls { "tool_calls" } else { "stop" };
                         let payload = json!({
                             "id": id,
                             "object": "chat.completion.chunk",
@@ -240,7 +279,7 @@ async fn chat_completions_inner(
                             "choices": [{
                                 "index": 0,
                                 "delta": {},
-                                "finish_reason": "stop",
+                                "finish_reason": effective_reason,
                             }],
                         });
                         yield Ok(Event::default().data(payload.to_string()));
@@ -258,6 +297,25 @@ async fn chat_completions_inner(
 
     let completion = completion(driver_response).await?;
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+    let mut message = json!({
+        "role": "assistant",
+        "content": if completion.content.is_empty() && !completion.tool_calls.is_empty() {
+            Value::Null
+        } else {
+            json!(completion.content)
+        },
+    });
+    if !completion.tool_calls.is_empty()
+        && let Some(object) = message.as_object_mut()
+    {
+        let calls: Vec<Value> = completion.tool_calls.iter().map(tool_call_json).collect();
+        object.insert("tool_calls".into(), Value::Array(calls));
+    }
+    let finish_reason = if !completion.tool_calls.is_empty() && completion.finish_reason == "stop" {
+        "tool_calls".to_string()
+    } else {
+        completion.finish_reason
+    };
     let body = json!({
         "id": id,
         "object": "chat.completion",
@@ -265,8 +323,8 @@ async fn chat_completions_inner(
         "model": context.model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": completion.content},
-            "finish_reason": completion.finish_reason,
+            "message": message,
+            "finish_reason": finish_reason,
         }],
         "usage": usage_json(&completion.usage),
     });
@@ -291,9 +349,13 @@ fn normalize_messages(raw: Vec<OpenAiMessage>) -> (Option<String>, Vec<ChatMessa
                 system_parts.push(content);
             }
         } else {
+            let tool_calls = parse_openai_tool_calls(&message.tool_calls);
             messages.push(ChatMessage {
                 role: role.to_string(),
                 content,
+                tool_calls,
+                tool_call_id: message.tool_call_id,
+                name: message.name,
             });
         }
     }
@@ -305,7 +367,62 @@ fn normalize_messages(raw: Vec<OpenAiMessage>) -> (Option<String>, Vec<ChatMessa
     (system, messages)
 }
 
-fn usage_json(usage: &Usage) -> Value {
+fn parse_openai_tool_calls(raw: &[Value]) -> Vec<ToolCall> {
+    raw.iter()
+        .filter_map(|call| {
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+            let function = call.get("function").unwrap_or(call);
+            let name = function.get("name").and_then(Value::as_str)?.to_string();
+            let arguments = match function.get("arguments") {
+                Some(Value::String(raw)) => raw.clone(),
+                Some(other) => other.to_string(),
+                None => "{}".to_string(),
+            };
+            Some(ToolCall {
+                id,
+                name,
+                arguments,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn tool_call_json(call: &ToolCall) -> Value {
+    json!({
+        "id": call.id,
+        "type": "function",
+        "function": {
+            "name": call.name,
+            "arguments": call.arguments,
+        }
+    })
+}
+
+fn tool_call_delta_json(delta: &ToolCallDelta) -> Value {
+    let mut item = Map::new();
+    item.insert("index".into(), json!(delta.index));
+    if let Some(id) = &delta.id {
+        item.insert("id".into(), json!(id));
+        item.insert("type".into(), json!("function"));
+    }
+    let mut function = Map::new();
+    if let Some(name) = &delta.name {
+        function.insert("name".into(), json!(name));
+    }
+    if let Some(args) = &delta.arguments_delta {
+        function.insert("arguments".into(), json!(args));
+    }
+    if !function.is_empty() {
+        item.insert("function".into(), Value::Object(function));
+    }
+    Value::Object(item)
+}
+
+pub(crate) fn usage_json(usage: &Usage) -> Value {
     json!({
         "prompt_tokens": usage.prompt_tokens,
         "completion_tokens": usage.completion_tokens,
