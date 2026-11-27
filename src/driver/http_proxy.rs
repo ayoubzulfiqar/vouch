@@ -94,13 +94,27 @@ impl HttpProxyDriver {
         })
     }
 
-    fn headers(&self, stream: bool) -> Result<HeaderMap> {
+    fn headers(
+        &self,
+        stream: bool,
+        trace: Option<&crate::telemetry::TraceContext>,
+    ) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if stream {
             headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
         } else {
             headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        }
+        if let Some(trace) = trace {
+            if let Ok(val) = HeaderValue::from_str(&trace.traceparent()) {
+                headers.insert(HeaderName::from_static("traceparent"), val);
+            }
+            if let Some(ts) = trace.tracestate.as_deref()
+                && let Ok(val) = HeaderValue::from_str(ts)
+            {
+                headers.insert(HeaderName::from_static("tracestate"), val);
+            }
         }
         if let Some(key) = &self.api_key {
             let value = HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| {
@@ -177,7 +191,7 @@ impl HttpProxyDriver {
         let response = self
             .client
             .post(&self.chat_url)
-            .headers(self.headers(false)?)
+            .headers(self.headers(false, request.trace_context.as_ref())?)
             .json(&self.body(request))
             .send()
             .await?;
@@ -247,7 +261,7 @@ impl HttpProxyDriver {
         let response = self
             .client
             .post(&self.chat_url)
-            .headers(self.headers(true)?)
+            .headers(self.headers(true, request.trace_context.as_ref())?)
             .json(&self.body(&request))
             .send()
             .await?;
