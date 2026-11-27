@@ -20,8 +20,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     config::{BackendConfig, BackendKind, DefaultsConfig, OutputMode},
     driver::{
-        AnsiStripper, ChunkStream, Completion, Driver, DriverResponse, ExecutionRequest,
-        PermitGuard, ProcessGroupGuard, StreamChunk, Usage, io_error, strip_ansi,
+        AnsiStripper, ChunkStream, Driver, DriverResponse, ExecutionRequest, PermitGuard,
+        ProcessGroupGuard, StreamChunk, emit_subprocess_tail, finalize_subprocess_completion,
+        io_error, strip_ansi,
     },
     error::{GatewayError, Result},
     metrics,
@@ -299,18 +300,13 @@ impl PtyRunnerDriver {
                     )));
                 }
                 let text = strip_ansi(&raw);
-                let content = match self.config.output_mode {
-                    OutputMode::Text => text.trim().to_string(),
-                    OutputMode::Json => crate::driver::cli_pipe::parse_json_content(&text)?,
-                    OutputMode::JsonLines => crate::driver::cli_pipe::parse_json_lines(&text),
-                };
-                let usage = Usage::estimate(&prompt, &content);
-                Ok(DriverResponse::Complete(Completion {
-                    content,
-                    finish_reason: "stop".into(),
-                    usage,
-                    raw: None,
-                }))
+                Ok(DriverResponse::Complete(finalize_subprocess_completion(
+                    &request.model,
+                    &prompt,
+                    &text,
+                    self.config.output_mode,
+                    !request.tools.is_empty(),
+                )?))
             }
             Err(error) => {
                 guard.terminate();
@@ -329,6 +325,8 @@ impl PtyRunnerDriver {
         let (mut data, exit, guard) = self.spawn_session(&request).await?;
         let backend = self.config.id.clone();
         let output_mode = self.config.output_mode;
+        let parse_tools = !request.tools.is_empty();
+        let model = request.model.clone();
         let cancel = request.cancel.clone();
         let prompt = request.rendered_prompt();
         let (sender, receiver) = mpsc::channel::<Result<StreamChunk>>(32);
@@ -372,8 +370,19 @@ impl PtyRunnerDriver {
                 }
                 match output_mode {
                     OutputMode::Text => {
+                        if produced.len() + stripped.len() > MAX_OUTPUT_BYTES {
+                            guard.terminate();
+                            let _ = sender
+                                .send(Err(GatewayError::Upstream(format!(
+                                    "backend {backend} exceeded the {MAX_OUTPUT_BYTES} byte output limit"
+                                ))))
+                                .await;
+                            return;
+                        }
                         produced.push_str(&stripped);
-                        if sender.send(Ok(StreamChunk::delta(stripped))).await.is_err() {
+                        if !parse_tools
+                            && sender.send(Ok(StreamChunk::delta(stripped))).await.is_err()
+                        {
                             guard.terminate();
                             return;
                         }
@@ -442,12 +451,15 @@ impl PtyRunnerDriver {
             metrics::record_child_exit(&backend, &exit.metric_code());
             if exit.success {
                 guard.disarm();
-                let _ = sender
-                    .send(Ok(StreamChunk::finish(
-                        "stop",
-                        Some(Usage::estimate(&prompt, &produced)),
-                    )))
-                    .await;
+                let _ = emit_subprocess_tail(
+                    &sender,
+                    &model,
+                    &prompt,
+                    &produced,
+                    output_mode,
+                    parse_tools,
+                )
+                .await;
             } else {
                 guard.disarm();
                 let _ = sender
