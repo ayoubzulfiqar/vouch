@@ -1,6 +1,6 @@
 [package]
 name = "vouch"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 description = "Local authentication multiplexer and process-supervised gateway for AI orchestrators"
 license = "GPL-3.0-or-later"
@@ -12,11 +12,13 @@ arc-swap = "1.9.5"
 async-stream = "0.3.6"
 async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["macros"] }
+base64 = "0.22.1"
 bytes = "1.12.2"
 clap = { version = "4.6.10", features = ["derive"] }
 crossterm = "0.29.0"
 dashmap = "6.2.1"
 futures = "0.3.34"
+getrandom = "0.3.4"
 globset = "0.4.22"
 hex = "0.4.3"
 hyper = { version = "1.13.0", features = ["http1", "server"] }
