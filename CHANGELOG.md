@@ -2,6 +2,34 @@
 
 All notable changes to `vouch` are documented in this file.
 
+## [2.0.0] - 2026-11-27
+
+### Added
+- **Multimodal content parts across OpenAI, Anthropic, Responses & CLI drivers (`src/driver/attachments.rs`):**
+  - Replaced plain-string message content with structured `MessageContent` (`Text` | `Parts(Vec<ContentPart>)`) supporting `Text`, `ImageBase64`, and `ImageUrl`.
+  - HTTP backends forward structured multimodal arrays intact. CLI/PTY backends materialize base64 images to private `0600` temp files (`vouch_att_<uuid>.<ext>`) with RAII `Drop` cleanup and append `[Attached image file: <path>]` markers.
+- **Structured outputs (`response_format` & `text.format`):**
+  - Parses OpenAI `response_format` (`json_object` and `json_schema`) and Responses `text.format`. Forwards to HTTP upstreams, appends strict schema instructions to CLI/PTY prompts, strips accidental Markdown code fences, and validates JSON + schema structure (`502 upstream_error` on failure).
+- **Native CLI multi-turn session delta continuation:**
+  - Added `resume_args` and `session_id_regex` to CLI/PTY backend configuration. On turns 2+ sharing `X-Session-ID`, invokes `resume_args` with `{backend_session_id}` and only messages after the last assistant turn.
+- **Stateful `/v1/responses` chaining (`previous_response_id` & `store`):**
+  - Added an in-memory TTL-evicted `ResponseStore` backing `previous_response_id` history chaining (including `function_call` / `function_call_output` turns, `404` on unknown ids, and `store = false` Zero Data Retention).
+- **Dual-spec MCP `2026-07-28` server & async tasks (`src/cli/mcp.rs`):**
+  - Added stateless `server/discover`, `Mcp-Method` / `Mcp-Name` HTTP header validation, W3C Trace Context `_meta` extraction (`traceparent`, `tracestate`), `tools/list` caching metadata (`ttlMs`, `cacheScope: "private"`), and background `tasks/create`, `tasks/get`, `tasks/result`, and `tasks/cancel`.
+- **Anthropic extended thinking & prompt caching:**
+  - Parses and forwards `thinking` (`enabled` / `budget_tokens`) and `cache_control` metadata, rendering `thinking`, `redacted_thinking`, `thinking_delta`, and `signature_delta` blocks from upstream traces.
+- **Idle stall watchdog, PTY sizing & auto-respond (`src/config.rs`, `src/driver/pty_runner.rs`):**
+  - Added `idle_timeout_secs`, `pty_cols` (default `160`), `pty_rows` (default `48`), and `[[backends.pty_auto_respond]]` interactive prompt rules.
+- **Operational CLI subcommands & extended redaction:**
+  - Added `vouch token create` (`src/cli/token.rs`) generating 256-bit `vouch_live_<64_hex>` TOML blocks via OS CSPRNG.
+  - Added `vouch bench` (`src/cli/bench.rs`) for TTFT, p50/p95 latency, throughput, and fallback benchmarking.
+  - Extended log redaction (`src/telemetry.rs`) for URL query parameters (`?key=`, `?api_key=`, `?token=`) and `access_token` / `refresh_token` JSON fields.
+
+### Fixed
+- **Large prompt `ARG_MAX` (`E2BIG`) protection:** Added RAII `PromptSpillFile` (`max_inline_prompt_bytes`, default `65536`) spilling oversized non-stdin CLI/PTY prompts to `0600` temp files and cleaning up automatically on drop.
+- **Pre-content stream buffering (`prime_stream`):** Buffers leading empty/whitespace/ANSI noise chunks before committing to a streaming backend so early non-zero exits or errors transparently fail over to the next candidate.
+- **Auth-expiry vs. transient rate-limit classification:** Distinctly classifies `401`/`403` and CLI auth-expiry stderr (`UpstreamAuthExpired`), surfaces `auth_expired` in `/readyz`, `GET /ui`, and `vouch top` (`AUTH_EXPIRED`), and parses HTTP `Retry-After` headers on `429` responses to override breaker cooldown dynamically.
+
 ## [1.0.0] - 2026-11-27
 
 ### Added
