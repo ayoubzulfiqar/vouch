@@ -4,7 +4,6 @@
 use std::{
     collections::BTreeMap,
     io::{self, Stdout},
-    path::Path,
     time::{Duration, Instant},
 };
 
@@ -147,41 +146,11 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 }
 
 fn build_client(args: &TopArgs) -> Result<(reqwest::Client, String, String)> {
-    let builder = reqwest::Client::builder().timeout(Duration::from_secs(3));
-    if let Some(socket) = &args.unix_socket {
-        return build_unix_client(builder, socket);
-    }
-    let base = args.url.trim_end_matches('/').to_string();
-    let client = builder
-        .build()
-        .map_err(|error| GatewayError::Internal(format!("cannot build HTTP client: {error}")))?;
-    Ok((client, base.clone(), base))
-}
-
-#[cfg(unix)]
-fn build_unix_client(
-    builder: reqwest::ClientBuilder,
-    socket: &Path,
-) -> Result<(reqwest::Client, String, String)> {
-    let client = builder
-        .unix_socket(socket)
-        .build()
-        .map_err(|error| GatewayError::Internal(format!("cannot build Unix client: {error}")))?;
-    Ok((
-        client,
-        "http://localhost".to_string(),
-        format!("unix://{}", socket.display()),
-    ))
-}
-
-#[cfg(not(unix))]
-fn build_unix_client(
-    _builder: reqwest::ClientBuilder,
-    _socket: &Path,
-) -> Result<(reqwest::Client, String, String)> {
-    Err(GatewayError::Config(
-        "--unix-socket is only supported on Unix hosts".into(),
-    ))
+    crate::cli::build_daemon_client(
+        &args.url,
+        args.unix_socket.as_deref(),
+        Duration::from_secs(3),
+    )
 }
 
 async fn fetch_snapshot(
