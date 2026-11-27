@@ -18,19 +18,20 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    config::{BackendConfig, BackendKind, DefaultsConfig, OutputMode},
+    config::{AutoRespondRule, BackendConfig, BackendKind, DefaultsConfig, OutputMode},
     driver::{
         AnsiStripper, ChunkStream, Driver, DriverResponse, ExecutionRequest, PermitGuard,
-        ProcessGroupGuard, StreamChunk, emit_subprocess_tail, finalize_subprocess_completion,
-        io_error, strip_ansi,
+        ProcessGroupGuard, ResponseFormat, StreamChunk,
+        attachments::{PromptSpillFile, TempAttachmentGuard, materialize_prompt},
+        capture_session_id, classify_cli_failure, emit_subprocess_tail,
+        finalize_subprocess_completion, io_error, strip_ansi,
     },
     error::{GatewayError, Result},
     metrics,
 };
 
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
-const PTY_ROWS: u16 = 40;
-const PTY_COLS: u16 = 120;
+const AUTO_RESPOND_WINDOW_BYTES: usize = 4096;
 
 #[derive(Debug)]
 struct PtyExit {
@@ -50,6 +51,42 @@ impl PtyExit {
     fn metric_code(&self) -> String {
         self.signal.clone().unwrap_or_else(|| self.code.to_string())
     }
+}
+
+struct CompiledRespondRule {
+    pattern: String,
+    regex: Option<regex::Regex>,
+    response: String,
+}
+
+impl CompiledRespondRule {
+    fn compile(rules: &[AutoRespondRule]) -> Vec<Self> {
+        rules
+            .iter()
+            .map(|rule| Self {
+                pattern: rule.pattern.clone(),
+                regex: regex::Regex::new(&rule.pattern).ok(),
+                response: rule.response.clone(),
+            })
+            .collect()
+    }
+
+    fn matches(&self, window: &str) -> bool {
+        window.contains(&self.pattern)
+            || self
+                .regex
+                .as_ref()
+                .is_some_and(|regex| regex.is_match(window))
+    }
+}
+
+struct SpawnedPty {
+    data: mpsc::Receiver<Result<Vec<u8>>>,
+    exit: oneshot::Receiver<PtyExit>,
+    guard: ProcessGroupGuard,
+    full_prompt: String,
+    attachments: TempAttachmentGuard,
+    spill: Option<PromptSpillFile>,
 }
 
 /// PTY-backed driver.
@@ -78,27 +115,39 @@ impl PtyRunnerDriver {
 
     /// Spawn the PTY session and return the raw byte channel plus lifecycle
     /// handles.
-    async fn spawn_session(
-        &self,
-        request: &ExecutionRequest,
-    ) -> Result<(
-        mpsc::Receiver<Result<Vec<u8>>>,
-        oneshot::Receiver<PtyExit>,
-        ProcessGroupGuard,
-    )> {
+    async fn spawn_session(&self, request: &ExecutionRequest) -> Result<SpawnedPty> {
         let command = self.config.command.clone().ok_or_else(|| {
             GatewayError::Config(format!("backend {} has no command", self.config.id))
         })?;
-        let prompt = request.rendered_prompt();
-        let args: Vec<String> = self
-            .config
-            .args
+        let (full_prompt, attachments) = materialize_prompt(request)?;
+        let spill = if !self.config.stdin
+            && full_prompt.len() > self.config.max_inline_prompt_bytes.max(1)
+        {
+            Some(PromptSpillFile::create(&full_prompt)?)
+        } else {
+            None
+        };
+        let arg_prompt = match &spill {
+            Some(file) => file.prompt_reference(),
+            None => full_prompt.clone(),
+        };
+        let backend_session_id = request
+            .backend_session_id
+            .as_deref()
+            .unwrap_or(&request.session_key);
+        let arg_templates = if request.is_resuming() && !self.config.resume_args.is_empty() {
+            &self.config.resume_args
+        } else {
+            &self.config.args
+        };
+        let args: Vec<String> = arg_templates
             .iter()
             .map(|arg| {
-                arg.replace("{prompt}", &prompt)
+                arg.replace("{prompt}", &arg_prompt)
                     .replace("{model}", &request.model)
                     .replace("{session_id}", &request.session_key)
                     .replace("{request_id}", &request.request_id)
+                    .replace("{backend_session_id}", backend_session_id)
             })
             .collect();
         let env = self.config.env.clone();
@@ -112,17 +161,22 @@ impl PtyRunnerDriver {
         let request_id = request.request_id.clone();
         let session_key = request.session_key.clone();
         let model = request.model.clone();
+        let explicit_backend_sid = request.backend_session_id.clone();
+        let rows = self.config.pty_rows.max(1);
+        let cols = self.config.pty_cols.max(1);
+        let auto_respond = CompiledRespondRule::compile(&self.config.pty_auto_respond);
 
         let (data_sender, data_receiver) = mpsc::channel::<Result<Vec<u8>>>(32);
         let (exit_sender, exit_receiver) = oneshot::channel::<PtyExit>();
         let (setup_sender, setup_receiver) =
             oneshot::channel::<std::result::Result<ProcessGroupGuard, String>>();
 
+        let prompt_for_stdin = full_prompt.clone();
         tokio::task::spawn_blocking(move || {
             let pty_system = native_pty_system();
             let pair = match pty_system.openpty(PtySize {
-                rows: PTY_ROWS,
-                cols: PTY_COLS,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             }) {
@@ -141,6 +195,9 @@ impl PtyRunnerDriver {
             builder.env("VOUCH_REQUEST_ID", &request_id);
             builder.env("VOUCH_SESSION_ID", &session_key);
             builder.env("VOUCH_MODEL", &model);
+            if let Some(sid) = explicit_backend_sid {
+                builder.env("VOUCH_BACKEND_SESSION_ID", sid);
+            }
             if let Some(workdir) = workdir {
                 builder.cwd(workdir);
             }
@@ -177,38 +234,65 @@ impl PtyRunnerDriver {
                     return;
                 }
             };
-            if stdin {
+
+            let mut writer_opt = if stdin || !auto_respond.is_empty() {
                 match pair.master.take_writer() {
-                    Ok(mut writer) => {
-                        let _ = writer.write_all(prompt.as_bytes());
-                        if !prompt.ends_with('\n') {
-                            let _ = writer.write_all(b"\n");
-                        }
-                        if send_eof {
-                            // EOT in canonical mode asks the terminal line
-                            // discipline for EOF, which many REPLs honor.
-                            let _ = writer.write_all(b"\x04");
-                        }
-                        let _ = writer.flush();
-                        // Dropping the writer also sends EOF.
-                    }
+                    Ok(writer) => Some(writer),
                     Err(error) => {
                         let _ = data_sender.blocking_send(Err(GatewayError::Internal(format!(
                             "cannot write pty: {error}"
                         ))));
+                        None
                     }
+                }
+            } else {
+                None
+            };
+
+            if stdin && let Some(writer) = writer_opt.as_mut() {
+                let _ = writer.write_all(prompt_for_stdin.as_bytes());
+                if !prompt_for_stdin.ends_with('\n') {
+                    let _ = writer.write_all(b"\n");
+                }
+                if send_eof && auto_respond.is_empty() {
+                    // EOT in canonical mode asks the terminal line
+                    // discipline for EOF, which many REPLs honor.
+                    let _ = writer.write_all(b"\x04");
+                }
+                let _ = writer.flush();
+                if auto_respond.is_empty() {
+                    writer_opt = None;
                 }
             }
 
+            let mut respond_stripper = AnsiStripper::new();
+            let mut respond_window = String::new();
             let mut buffer = [0u8; 8192];
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(read) => {
-                        if data_sender
-                            .blocking_send(Ok(buffer[..read].to_vec()))
-                            .is_err()
+                        let slice = &buffer[..read];
+                        if !auto_respond.is_empty()
+                            && let Some(writer) = writer_opt.as_mut()
                         {
+                            let clean = respond_stripper.feed(slice);
+                            if !clean.is_empty() {
+                                respond_window.push_str(&clean);
+                                trim_rolling_window(&mut respond_window, AUTO_RESPOND_WINDOW_BYTES);
+                                if let Some(rule) =
+                                    auto_respond.iter().find(|r| r.matches(&respond_window))
+                                {
+                                    let _ = writer.write_all(rule.response.as_bytes());
+                                    if !rule.response.ends_with(['\n', '\r']) {
+                                        let _ = writer.write_all(b"\n");
+                                    }
+                                    let _ = writer.flush();
+                                    respond_window.clear();
+                                }
+                            }
+                        }
+                        if data_sender.blocking_send(Ok(slice.to_vec())).is_err() {
                             guard.terminate();
                             break;
                         }
@@ -221,6 +305,7 @@ impl PtyRunnerDriver {
                     }
                 }
             }
+            drop(writer_opt);
 
             match child.wait() {
                 Ok(status) => {
@@ -249,7 +334,14 @@ impl PtyRunnerDriver {
             .map_err(|_| GatewayError::Upstream("pty setup timed out".into()))?
             .map_err(|_| GatewayError::Upstream("pty setup task failed".into()))?
             .map_err(GatewayError::Upstream)?;
-        Ok((data_receiver, exit_receiver, guard))
+        Ok(SpawnedPty {
+            data: data_receiver,
+            exit: exit_receiver,
+            guard,
+            full_prompt,
+            attachments,
+            spill,
+        })
     }
 
     async fn complete(
@@ -259,13 +351,49 @@ impl PtyRunnerDriver {
     ) -> Result<DriverResponse> {
         let _permit = permit;
         let timeout = Duration::from_secs(self.config.timeout_secs.max(1));
-        let (mut data, exit, guard) = self.spawn_session(request).await?;
-        let prompt = request.rendered_prompt();
+        let idle_timeout = self
+            .config
+            .idle_timeout_secs
+            .map(|secs| Duration::from_secs(secs.max(1)));
+        let SpawnedPty {
+            mut data,
+            exit,
+            guard,
+            full_prompt,
+            attachments: _attachments,
+            spill: _spill,
+        } = self.spawn_session(request).await?;
 
-        let collect = async {
+        let collect: Result<(Vec<u8>, PtyExit)> = async {
             let mut raw = Vec::new();
-            while let Some(item) = data.recv().await {
+            let total_deadline = tokio::time::Instant::now() + timeout;
+            let mut last_activity = tokio::time::Instant::now();
+
+            loop {
+                let effective_deadline = match idle_timeout {
+                    Some(idle) => total_deadline.min(last_activity + idle),
+                    None => total_deadline,
+                };
+                let item = tokio::select! {
+                    _ = request.cancel.cancelled() => return Err(GatewayError::ClientDisconnected),
+                    _ = tokio::time::sleep_until(effective_deadline) => {
+                        let now = tokio::time::Instant::now();
+                        let fired = if now >= total_deadline {
+                            timeout
+                        } else {
+                            idle_timeout.unwrap_or(timeout)
+                        };
+                        return Err(GatewayError::Timeout(fired));
+                    }
+                    item = data.recv() => item,
+                };
+                let Some(item) = item else {
+                    break;
+                };
                 let bytes = item?;
+                if !bytes.is_empty() {
+                    last_activity = tokio::time::Instant::now();
+                }
                 if raw.len() + bytes.len() > MAX_OUTPUT_BYTES {
                     return Err(GatewayError::Upstream(format!(
                         "backend {} exceeded the {} byte output limit",
@@ -274,38 +402,41 @@ impl PtyRunnerDriver {
                 }
                 raw.extend_from_slice(&bytes);
             }
-            let exit = exit
-                .await
-                .map_err(|_| GatewayError::Upstream("pty exit channel closed".into()))?;
-            Ok::<_, GatewayError>((raw, exit))
-        };
 
-        let outcome = tokio::select! {
-            _ = request.cancel.cancelled() => Err(GatewayError::ClientDisconnected),
-            result = tokio::time::timeout(timeout, collect) => match result {
-                Ok(result) => result,
-                Err(_) => Err(GatewayError::Timeout(timeout)),
-            },
-        };
+            let exit = tokio::select! {
+                _ = request.cancel.cancelled() => return Err(GatewayError::ClientDisconnected),
+                _ = tokio::time::sleep_until(total_deadline) => return Err(GatewayError::Timeout(timeout)),
+                res = exit => res.map_err(|_| GatewayError::Upstream("pty exit channel closed".into()))?,
+            };
+            Ok((raw, exit))
+        }
+        .await;
 
-        match outcome {
+        match collect {
             Ok((raw, exit)) => {
                 guard.disarm();
                 metrics::record_child_exit(&self.config.id, &exit.metric_code());
-                if !exit.success {
-                    return Err(GatewayError::Upstream(format!(
-                        "backend {} exited with {}",
-                        self.config.id,
-                        exit.label()
-                    )));
-                }
                 let text = strip_ansi(&raw);
+                if !exit.success {
+                    return Err(classify_cli_failure(
+                        &self.config.id,
+                        &format!("exited with {}", exit.label()),
+                        &text,
+                    ));
+                }
+                capture_session_id(
+                    self.config.session_id_regex.as_deref(),
+                    "",
+                    &text,
+                    &request.session_capture,
+                );
                 Ok(DriverResponse::Complete(finalize_subprocess_completion(
                     &request.model,
-                    &prompt,
+                    &full_prompt,
                     &text,
                     self.config.output_mode,
                     !request.tools.is_empty(),
+                    request.response_format.as_ref(),
                 )?))
             }
             Err(error) => {
@@ -322,33 +453,62 @@ impl PtyRunnerDriver {
         permit: PermitGuard,
     ) -> Result<DriverResponse> {
         let timeout = Duration::from_secs(self.config.timeout_secs.max(1));
-        let (mut data, exit, guard) = self.spawn_session(&request).await?;
+        let idle_timeout = self
+            .config
+            .idle_timeout_secs
+            .map(|secs| Duration::from_secs(secs.max(1)));
+        let SpawnedPty {
+            mut data,
+            exit,
+            guard,
+            full_prompt,
+            attachments: _attachments,
+            spill: _spill,
+        } = self.spawn_session(&request).await?;
+
         let backend = self.config.id.clone();
         let output_mode = self.config.output_mode;
+        let session_id_regex = self.config.session_id_regex.clone();
         let parse_tools = !request.tools.is_empty();
+        let response_format: Option<ResponseFormat> = request.response_format.clone();
         let model = request.model.clone();
         let cancel = request.cancel.clone();
-        let prompt = request.rendered_prompt();
+        let session_capture = request.session_capture.clone();
         let (sender, receiver) = mpsc::channel::<Result<StreamChunk>>(32);
 
         tokio::spawn(async move {
             let _permit = permit;
-            let deadline = tokio::time::Instant::now() + timeout;
+            let _attachments = _attachments;
+            let _spill = _spill;
+
+            let total_deadline = tokio::time::Instant::now() + timeout;
+            let mut last_activity = tokio::time::Instant::now();
             let mut stripper = AnsiStripper::new();
             let mut json_buffer = String::new();
             let mut line_buffer = String::new();
             let mut produced = String::new();
+            let deferred_text = parse_tools || response_format.is_some();
 
             loop {
+                let effective_deadline = match idle_timeout {
+                    Some(idle) => total_deadline.min(last_activity + idle),
+                    None => total_deadline,
+                };
                 let item = tokio::select! {
                     _ = cancel.cancelled() => {
                         guard.terminate();
+                        let _ = sender.send(Err(GatewayError::ClientDisconnected)).await;
                         return;
                     }
-                    _ = tokio::time::sleep_until(deadline) => {
+                    _ = tokio::time::sleep_until(effective_deadline) => {
+                        let fired = if tokio::time::Instant::now() >= total_deadline {
+                            timeout
+                        } else {
+                            idle_timeout.unwrap_or(timeout)
+                        };
                         guard.terminate();
                         metrics::record_child_exit(&backend, "killed");
-                        let _ = sender.send(Err(GatewayError::Timeout(timeout))).await;
+                        let _ = sender.send(Err(GatewayError::Timeout(fired))).await;
                         return;
                     }
                     item = data.recv() => item,
@@ -364,23 +524,26 @@ impl PtyRunnerDriver {
                         return;
                     }
                 };
+                if !bytes.is_empty() {
+                    last_activity = tokio::time::Instant::now();
+                }
                 let stripped = stripper.feed(&bytes);
                 if stripped.is_empty() {
                     continue;
                 }
+                if produced.len() + stripped.len() > MAX_OUTPUT_BYTES {
+                    guard.terminate();
+                    let _ = sender
+                        .send(Err(GatewayError::Upstream(format!(
+                            "backend {backend} exceeded the {MAX_OUTPUT_BYTES} byte output limit"
+                        ))))
+                        .await;
+                    return;
+                }
+                produced.push_str(&stripped);
                 match output_mode {
                     OutputMode::Text => {
-                        if produced.len() + stripped.len() > MAX_OUTPUT_BYTES {
-                            guard.terminate();
-                            let _ = sender
-                                .send(Err(GatewayError::Upstream(format!(
-                                    "backend {backend} exceeded the {MAX_OUTPUT_BYTES} byte output limit"
-                                ))))
-                                .await;
-                            return;
-                        }
-                        produced.push_str(&stripped);
-                        if !parse_tools
+                        if !deferred_text
                             && sender.send(Ok(StreamChunk::delta(stripped))).await.is_err()
                         {
                             guard.terminate();
@@ -397,7 +560,6 @@ impl PtyRunnerDriver {
                                 continue;
                             }
                             let delta = crate::driver::cli_pipe::jsonl_line_to_delta(line);
-                            produced.push_str(&delta);
                             if !delta.is_empty()
                                 && sender.send(Ok(StreamChunk::delta(delta))).await.is_err()
                             {
@@ -409,9 +571,20 @@ impl PtyRunnerDriver {
                 }
             }
 
-            let exit = exit
-                .await
-                .map_err(|_| GatewayError::Upstream("pty exit channel closed".into()));
+            let exit = tokio::select! {
+                _ = cancel.cancelled() => {
+                    guard.terminate();
+                    let _ = sender.send(Err(GatewayError::ClientDisconnected)).await;
+                    return;
+                }
+                _ = tokio::time::sleep_until(total_deadline) => {
+                    guard.terminate();
+                    metrics::record_child_exit(&backend, "killed");
+                    let _ = sender.send(Err(GatewayError::Timeout(timeout))).await;
+                    return;
+                }
+                res = exit => res.map_err(|_| GatewayError::Upstream("pty exit channel closed".into())),
+            };
             let exit = match exit {
                 Ok(exit) => exit,
                 Err(error) => {
@@ -421,52 +594,65 @@ impl PtyRunnerDriver {
                 }
             };
 
-            if output_mode == OutputMode::Json {
-                match crate::driver::cli_pipe::parse_json_content(&json_buffer) {
-                    Ok(content) if !content.is_empty() => {
-                        produced.push_str(&content);
-                        if sender.send(Ok(StreamChunk::delta(content))).await.is_err() {
-                            guard.terminate();
-                            return;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        guard.terminate();
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-                }
-            } else if output_mode == OutputMode::JsonLines && !line_buffer.trim().is_empty() {
-                let delta = crate::driver::cli_pipe::jsonl_line_to_delta(line_buffer.trim());
-                if !delta.is_empty() {
-                    produced.push_str(&delta);
-                    if sender.send(Ok(StreamChunk::delta(delta))).await.is_err() {
-                        guard.terminate();
-                        return;
-                    }
-                }
-            }
-
             metrics::record_child_exit(&backend, &exit.metric_code());
             if exit.success {
                 guard.disarm();
+                capture_session_id(session_id_regex.as_deref(), "", &produced, &session_capture);
+
+                if output_mode == OutputMode::Json {
+                    match crate::driver::cli_pipe::parse_json_content(&json_buffer) {
+                        Ok(content) => {
+                            let content = if let Some(format) = response_format.as_ref() {
+                                match crate::driver::tool_bridge::enforce_response_format(
+                                    &content, format,
+                                ) {
+                                    Ok(valid) => valid,
+                                    Err(error) => {
+                                        let _ = sender.send(Err(error)).await;
+                                        return;
+                                    }
+                                }
+                            } else {
+                                content
+                            };
+                            if !content.is_empty()
+                                && sender.send(Ok(StreamChunk::delta(content))).await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = sender.send(Err(error)).await;
+                            return;
+                        }
+                    }
+                } else if output_mode == OutputMode::JsonLines && !line_buffer.trim().is_empty() {
+                    let delta = crate::driver::cli_pipe::jsonl_line_to_delta(line_buffer.trim());
+                    if !delta.is_empty()
+                        && sender.send(Ok(StreamChunk::delta(delta))).await.is_err()
+                    {
+                        return;
+                    }
+                }
+
                 let _ = emit_subprocess_tail(
                     &sender,
                     &model,
-                    &prompt,
+                    &full_prompt,
                     &produced,
                     output_mode,
                     parse_tools,
+                    response_format.as_ref(),
                 )
                 .await;
             } else {
                 guard.disarm();
                 let _ = sender
-                    .send(Err(GatewayError::Upstream(format!(
-                        "backend {backend} exited with {}",
-                        exit.label()
-                    ))))
+                    .send(Err(classify_cli_failure(
+                        &backend,
+                        &format!("exited with {}", exit.label()),
+                        &produced,
+                    )))
                     .await;
             }
         });
@@ -474,6 +660,17 @@ impl PtyRunnerDriver {
         let stream: ChunkStream = Box::pin(ReceiverStream::new(receiver));
         Ok(DriverResponse::Stream(stream))
     }
+}
+
+fn trim_rolling_window(window: &mut String, max_bytes: usize) {
+    if window.len() <= max_bytes {
+        return;
+    }
+    let mut start = window.len().saturating_sub(max_bytes);
+    while start < window.len() && !window.is_char_boundary(start) {
+        start += 1;
+    }
+    window.drain(..start);
 }
 
 #[async_trait]
