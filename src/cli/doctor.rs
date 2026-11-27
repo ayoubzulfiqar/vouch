@@ -188,6 +188,10 @@ async fn probe_inner(
         cancel: CancellationToken::new(),
         tools: Vec::new(),
         tool_choice: None,
+        response_format: None,
+        backend_session_id: None,
+        delta_messages: None,
+        session_capture: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         extra: serde_json::Map::new(),
     };
 
