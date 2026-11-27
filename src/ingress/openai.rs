@@ -20,13 +20,13 @@ use uuid::Uuid;
 
 use crate::{
     driver::{
-        ChatMessage, StreamChunk, ToolCall, ToolCallDelta, Usage, content_to_text,
-        tool_bridge::normalize_tools, truncate,
+        ChatMessage, MessageContent, ResponseFormat, StreamChunk, ThinkingBlock, ToolCall,
+        ToolCallDelta, Usage, tool_bridge::normalize_tools, truncate,
     },
     error::{GatewayError, Result},
     ingress::{
         CancelOnDrop, completion, execute, execution_request, first_user_text, into_chunk_stream,
-        prepare, sse_response, unix_now,
+        parse_json_content, prepare, sse_response, unix_now,
     },
     state::AppState,
 };
@@ -50,6 +50,8 @@ pub struct OpenAiChatRequest {
     tools: Vec<Value>,
     #[serde(default)]
     tool_choice: Option<Value>,
+    #[serde(default)]
+    response_format: Option<Value>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
@@ -122,7 +124,8 @@ async fn chat_completions_inner(
             "messages must contain at least one non-system turn".into(),
         ));
     }
-    let first_user = first_user_text(&messages).to_string();
+    let response_format = parse_openai_response_format(payload.response_format)?;
+    let first_user = first_user_text(&messages);
     let context = prepare(
         &state,
         &headers,
@@ -142,6 +145,7 @@ async fn chat_completions_inner(
         max_tokens,
         tools,
         payload.tool_choice,
+        response_format,
         payload.extra,
         cancel.clone(),
     );
@@ -201,7 +205,30 @@ async fn chat_completions_inner(
                 }
                 match item {
                     Some(Ok(chunk)) => {
-                        let StreamChunk { delta, tool_calls, finish_reason, usage } = chunk;
+                        let StreamChunk {
+                            delta,
+                            thinking_delta,
+                            tool_calls,
+                            finish_reason,
+                            usage,
+                            ..
+                        } = chunk;
+                        if let Some(reasoning) = thinking_delta
+                            && !reasoning.is_empty()
+                        {
+                            let payload = json!({
+                                "id": id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"reasoning_content": reasoning},
+                                    "finish_reason": null,
+                                }],
+                            });
+                            yield Ok(Event::default().data(payload.to_string()));
+                        }
                         if !delta.is_empty() {
                             let payload = json!({
                                 "id": id,
@@ -305,6 +332,22 @@ async fn chat_completions_inner(
             json!(completion.content)
         },
     });
+    if !completion.thinking.is_empty()
+        && let Some(object) = message.as_object_mut()
+    {
+        let reasoning: String = completion
+            .thinking
+            .iter()
+            .filter_map(|block| match block {
+                ThinkingBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                ThinkingBlock::RedactedThinking { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !reasoning.is_empty() {
+            object.insert("reasoning_content".into(), json!(reasoning));
+        }
+    }
     if !completion.tool_calls.is_empty()
         && let Some(object) = message.as_object_mut()
     {
@@ -333,6 +376,40 @@ async fn chat_completions_inner(
     Ok(response)
 }
 
+pub(crate) fn parse_openai_response_format(value: Option<Value>) -> Result<Option<ResponseFormat>> {
+    let Some(val) = value else {
+        return Ok(None);
+    };
+    let kind = val
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| GatewayError::BadRequest("response_format.type must be a string".into()))?;
+    match kind {
+        "text" => Ok(None),
+        "json_object" => Ok(Some(ResponseFormat::JsonObject)),
+        "json_schema" => {
+            let js = val.get("json_schema").unwrap_or(&val);
+            let schema = js.get("schema").cloned().ok_or_else(|| {
+                GatewayError::BadRequest("response_format.json_schema.schema is required".into())
+            })?;
+            let name = js
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let strict = js.get("strict").and_then(Value::as_bool).unwrap_or(false);
+            Ok(Some(ResponseFormat::JsonSchema {
+                name,
+                schema,
+                strict,
+                raw: val,
+            }))
+        }
+        other => Err(GatewayError::BadRequest(format!(
+            "unsupported response_format.type {other:?}"
+        ))),
+    }
+}
+
 fn normalize_messages(raw: Vec<OpenAiMessage>) -> (Option<String>, Vec<ChatMessage>) {
     let mut system_parts = Vec::new();
     let mut messages = Vec::with_capacity(raw.len());
@@ -342,14 +419,20 @@ fn normalize_messages(raw: Vec<OpenAiMessage>) -> (Option<String>, Vec<ChatMessa
         let content = message
             .content
             .as_ref()
-            .and_then(content_to_text)
+            .map(parse_json_content)
             .unwrap_or_default();
         if role == "system" || role == "developer" {
-            if !content.trim().is_empty() {
-                system_parts.push(content);
+            let text = content.as_plain_text();
+            if !text.trim().is_empty() {
+                system_parts.push(text);
             }
         } else {
             let tool_calls = parse_openai_tool_calls(&message.tool_calls);
+            let content = if role == "tool" {
+                MessageContent::Text(content.as_plain_text())
+            } else {
+                content
+            };
             messages.push(ChatMessage {
                 role: role.to_string(),
                 content,
