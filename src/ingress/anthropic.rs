@@ -1,10 +1,9 @@
 //! Anthropic Messages-compatible ingress.
 //!
-//! The adapter accepts `system`, `messages`, `max_tokens`, and streaming
-//! requests, translates them into the shared normalized execution request, and
-//! renders either an Anthropic `message` object or the documented SSE event
-//! sequence (`message_start`, `content_block_delta`, `message_delta`,
-//! `message_stop`).
+//! The adapter accepts `system`, `messages`, `max_tokens`, `thinking`,
+//! `cache_control`, multimodal `image` blocks, and streaming requests,
+//! translating them into the shared normalized execution request and rendering
+//! either an Anthropic `message` object or the standard SSE event sequence.
 
 use std::{collections::BTreeMap, convert::Infallible, sync::Arc, time::Duration};
 
@@ -22,12 +21,13 @@ use uuid::Uuid;
 
 use crate::{
     driver::{
-        ChatMessage, StreamChunk, ToolCall, content_to_text, tool_bridge::normalize_tools, truncate,
+        ChatMessage, ContentPart, MessageContent, StreamChunk, ThinkingBlock, ToolCall,
+        tool_bridge::normalize_tools, truncate,
     },
     error::{GatewayError, Result},
     ingress::{
         CancelOnDrop, completion, execute, execution_request, first_user_text, into_chunk_stream,
-        prepare, sse_response,
+        parse_json_content, prepare, sse_response,
     },
     state::AppState,
 };
@@ -51,6 +51,8 @@ pub struct AnthropicRequest {
     tools: Vec<Value>,
     #[serde(default)]
     tool_choice: Option<Value>,
+    #[serde(default)]
+    thinking: Option<Value>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
@@ -99,13 +101,24 @@ async fn messages_inner(
         ));
     }
 
+    let mut extra = payload.extra;
+    if let Some(thinking) = &payload.thinking {
+        validate_thinking_config(thinking)?;
+        extra.insert("thinking".into(), thinking.clone());
+    }
+    if let Some(system_val) = &payload.system
+        && system_val.is_array()
+    {
+        extra.insert("anthropic_system_blocks".into(), system_val.clone());
+    }
+
     let (system, messages) = normalize_messages(payload.system, payload.messages);
     if messages.is_empty() {
         return Err(GatewayError::BadRequest(
             "messages must contain at least one turn".into(),
         ));
     }
-    let first_user = first_user_text(&messages).to_string();
+    let first_user = first_user_text(&messages);
     let context = prepare(
         &state,
         &headers,
@@ -124,7 +137,8 @@ async fn messages_inner(
         Some(max_tokens),
         tools,
         payload.tool_choice,
-        payload.extra,
+        None,
+        extra,
         cancel.clone(),
     );
     let routed = execute(&state, request).await?;
@@ -164,6 +178,7 @@ async fn messages_inner(
             let deadline = tokio::time::Instant::now() + Duration::from_secs(stream_timeout);
             let mut timed_out = false;
             let mut next_block_index: usize = 0;
+            let mut open_thinking_index: Option<usize> = None;
             let mut open_text_index: Option<usize> = None;
             let mut tool_blocks: BTreeMap<usize, usize> = BTreeMap::new();
             let mut emitted_any_block = false;
@@ -191,8 +206,94 @@ async fn messages_inner(
                 }
                 match item {
                     Some(Ok(chunk)) => {
-                        let StreamChunk { delta, tool_calls, finish_reason, usage } = chunk;
+                        let StreamChunk {
+                            delta,
+                            thinking_delta,
+                            signature_delta,
+                            redacted_thinking,
+                            tool_calls,
+                            finish_reason,
+                            usage,
+                        } = chunk;
+
+                        if let Some(redacted) = redacted_thinking {
+                            if let Some(idx) = open_thinking_index.take() {
+                                yield Ok(Event::default()
+                                    .event("content_block_stop")
+                                    .data(json!({"type": "content_block_stop", "index": idx}).to_string()));
+                            }
+                            let idx = next_block_index;
+                            next_block_index += 1;
+                            emitted_any_block = true;
+                            yield Ok(Event::default().event("content_block_start").data(
+                                json!({
+                                    "type": "content_block_start",
+                                    "index": idx,
+                                    "content_block": {"type": "redacted_thinking", "data": redacted},
+                                })
+                                .to_string(),
+                            ));
+                            yield Ok(Event::default()
+                                .event("content_block_stop")
+                                .data(json!({"type": "content_block_stop", "index": idx}).to_string()));
+                        }
+
+                        if thinking_delta.is_some() || signature_delta.is_some() {
+                            let idx = match open_thinking_index {
+                                Some(idx) => idx,
+                                None => {
+                                    if let Some(t_idx) = open_text_index.take() {
+                                        yield Ok(Event::default()
+                                            .event("content_block_stop")
+                                            .data(json!({"type": "content_block_stop", "index": t_idx}).to_string()));
+                                    }
+                                    let idx = next_block_index;
+                                    next_block_index += 1;
+                                    open_thinking_index = Some(idx);
+                                    emitted_any_block = true;
+                                    let block_start = json!({
+                                        "type": "content_block_start",
+                                        "index": idx,
+                                        "content_block": {"type": "thinking", "thinking": ""},
+                                    });
+                                    yield Ok(Event::default()
+                                        .event("content_block_start")
+                                        .data(block_start.to_string()));
+                                    idx
+                                }
+                            };
+                            if let Some(thinking) = thinking_delta
+                                && !thinking.is_empty()
+                            {
+                                let payload = json!({
+                                    "type": "content_block_delta",
+                                    "index": idx,
+                                    "delta": {"type": "thinking_delta", "thinking": thinking},
+                                });
+                                yield Ok(Event::default()
+                                    .event("content_block_delta")
+                                    .data(payload.to_string()));
+                            }
+                            if let Some(sig) = signature_delta
+                                && !sig.is_empty()
+                            {
+                                let payload = json!({
+                                    "type": "content_block_delta",
+                                    "index": idx,
+                                    "delta": {"type": "signature_delta", "signature": sig},
+                                });
+                                yield Ok(Event::default()
+                                    .event("content_block_delta")
+                                    .data(payload.to_string()));
+                            }
+                        }
+
                         if !delta.is_empty() {
+                            if let Some(idx) = open_thinking_index.take() {
+                                yield Ok(Event::default()
+                                    .event("content_block_stop")
+                                    .data(json!({"type": "content_block_stop", "index": idx}).to_string()));
+                            }
                             let idx = match open_text_index {
                                 Some(idx) => idx,
                                 None => {
@@ -222,6 +323,11 @@ async fn messages_inner(
                         }
                         if !tool_calls.is_empty() {
                             saw_tool_calls = true;
+                            if let Some(idx) = open_thinking_index.take() {
+                                yield Ok(Event::default()
+                                    .event("content_block_stop")
+                                    .data(json!({"type": "content_block_stop", "index": idx}).to_string()));
+                            }
                             if let Some(idx) = open_text_index.take() {
                                 yield Ok(Event::default()
                                     .event("content_block_stop")
@@ -271,6 +377,11 @@ async fn messages_inner(
                             }
                         }
                         if let Some(reason) = finish_reason {
+                            if let Some(idx) = open_thinking_index.take() {
+                                yield Ok(Event::default()
+                                    .event("content_block_stop")
+                                    .data(json!({"type": "content_block_stop", "index": idx}).to_string()));
+                            }
                             if let Some(idx) = open_text_index.take() {
                                 yield Ok(Event::default()
                                     .event("content_block_stop")
@@ -319,6 +430,11 @@ async fn messages_inner(
                         break;
                     }
                     None => {
+                        if let Some(idx) = open_thinking_index.take() {
+                            yield Ok(Event::default()
+                                .event("content_block_stop")
+                                .data(json!({"type": "content_block_stop", "index": idx}).to_string()));
+                        }
                         if let Some(idx) = open_text_index.take() {
                             yield Ok(Event::default()
                                 .event("content_block_stop")
@@ -366,7 +482,31 @@ async fn messages_inner(
 
     let completion = completion(driver_response).await?;
     let mut content_blocks = Vec::new();
-    if !completion.content.is_empty() || completion.tool_calls.is_empty() {
+    for block in &completion.thinking {
+        match block {
+            ThinkingBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                let mut obj = Map::new();
+                obj.insert("type".into(), json!("thinking"));
+                obj.insert("thinking".into(), json!(thinking));
+                if let Some(sig) = signature {
+                    obj.insert("signature".into(), json!(sig));
+                }
+                content_blocks.push(Value::Object(obj));
+            }
+            ThinkingBlock::RedactedThinking { data } => {
+                content_blocks.push(json!({
+                    "type": "redacted_thinking",
+                    "data": data,
+                }));
+            }
+        }
+    }
+    if !completion.content.is_empty()
+        || (completion.tool_calls.is_empty() && completion.thinking.is_empty())
+    {
         content_blocks.push(json!({"type": "text", "text": completion.content}));
     }
     for call in &completion.tool_calls {
@@ -407,16 +547,40 @@ async fn messages_inner(
     Ok(response)
 }
 
+fn validate_thinking_config(thinking: &Value) -> Result<()> {
+    let Some(obj) = thinking.as_object() else {
+        return Err(GatewayError::BadRequest(
+            "thinking must be a JSON object".into(),
+        ));
+    };
+    match obj.get("type").and_then(Value::as_str) {
+        Some("enabled") => {
+            if let Some(budget) = obj.get("budget_tokens").and_then(Value::as_u64)
+                && budget == 0
+            {
+                return Err(GatewayError::BadRequest(
+                    "thinking.budget_tokens must be greater than zero".into(),
+                ));
+            }
+            Ok(())
+        }
+        Some("disabled") | None => Ok(()),
+        Some(other) => Err(GatewayError::BadRequest(format!(
+            "unsupported thinking.type {other:?}"
+        ))),
+    }
+}
+
 fn normalize_messages(
     system: Option<Value>,
     raw: Vec<AnthropicMessage>,
 ) -> (Option<String>, Vec<ChatMessage>) {
     let mut system_parts = Vec::new();
-    if let Some(system) = system
-        && let Some(text) = content_to_text(&system)
-        && !text.trim().is_empty()
-    {
-        system_parts.push(text);
+    if let Some(system) = system {
+        let text = parse_json_content(&system).as_plain_text();
+        if !text.trim().is_empty() {
+            system_parts.push(text);
+        }
     }
     let mut messages = Vec::with_capacity(raw.len());
     for message in raw {
@@ -430,7 +594,7 @@ fn normalize_messages(
                 )
             })
         {
-            let mut text_parts = Vec::new();
+            let mut rich_parts: Vec<ContentPart> = Vec::new();
             let mut tool_calls = Vec::new();
             for part in parts {
                 match part.get("type").and_then(Value::as_str) {
@@ -459,7 +623,7 @@ fn normalize_messages(
                             .map(ToString::to_string);
                         let result_text = part
                             .get("content")
-                            .and_then(content_to_text)
+                            .map(parse_json_content)
                             .unwrap_or_default();
                         messages.push(ChatMessage {
                             role: "tool".to_string(),
@@ -469,19 +633,27 @@ fn normalize_messages(
                             name: None,
                         });
                     }
-                    _ => {
-                        if let Some(text) = content_to_text(part)
-                            && !text.trim().is_empty()
-                        {
-                            text_parts.push(text);
+                    Some("thinking" | "redacted_thinking") => {}
+                    _ => match parse_json_content(part) {
+                        MessageContent::Parts(mut inner) => rich_parts.append(&mut inner),
+                        MessageContent::Text(t) if !t.trim().is_empty() => {
+                            rich_parts.push(ContentPart::Text {
+                                text: t,
+                                cache_control: part.get("cache_control").cloned(),
+                            });
                         }
-                    }
+                        _ => {}
+                    },
                 }
             }
-            if !text_parts.is_empty() || !tool_calls.is_empty() {
+            if !rich_parts.is_empty() || !tool_calls.is_empty() {
                 messages.push(ChatMessage {
                     role: role.to_string(),
-                    content: text_parts.join("\n"),
+                    content: if rich_parts.is_empty() {
+                        MessageContent::Text(String::new())
+                    } else {
+                        MessageContent::Parts(rich_parts)
+                    },
                     tool_calls,
                     tool_call_id: None,
                     name: None,
@@ -492,14 +664,21 @@ fn normalize_messages(
         let content = message
             .content
             .as_ref()
-            .and_then(content_to_text)
+            .map(parse_json_content)
             .unwrap_or_default();
         if role == "system" {
-            if !content.trim().is_empty() {
-                system_parts.push(content);
+            let text = content.as_plain_text();
+            if !text.trim().is_empty() {
+                system_parts.push(text);
             }
         } else {
-            messages.push(ChatMessage::text(role, content));
+            messages.push(ChatMessage {
+                role: role.to_string(),
+                content,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+            });
         }
     }
     let system = if system_parts.is_empty() {
