@@ -72,7 +72,7 @@ pub async fn run(args: &DoctorArgs) -> Result<bool> {
 }
 
 /// Build a report from an already validated configuration.
-async fn inspect(path: &std::path::Path, config: &GatewayConfig) -> Result<DoctorReport> {
+pub async fn inspect(path: &std::path::Path, config: &GatewayConfig) -> Result<DoctorReport> {
     let mut problems = Vec::new();
     let mut discovery = discover(config).await?;
 
@@ -96,9 +96,10 @@ async fn inspect(path: &std::path::Path, config: &GatewayConfig) -> Result<Docto
     discovery.auth_files.sort_by(|a, b| a.path.cmp(&b.path));
 
     let state = AppState::new(path.to_path_buf(), config.clone())?;
+    let cli_timeout = std::time::Duration::from_secs(config.discovery.probe_timeout_secs.max(1));
     let mut probes = Vec::new();
     for backend in state.router().backends() {
-        let probe = smoke_probe(&backend.config.id, &backend, &state).await;
+        let probe = smoke_probe(&backend.config.id, &backend, &state, cli_timeout).await;
         if !probe.ok {
             problems.push(format!("backend {:?}: {}", probe.backend, probe.detail));
         }
@@ -129,13 +130,14 @@ async fn smoke_probe(
     backend: &str,
     handle: &crate::router::BackendHandle,
     state: &AppState,
+    cli_timeout: std::time::Duration,
 ) -> ProbeResult {
     let kind = handle.config.kind;
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(8),
-        probe_inner(backend, handle, state),
-    )
-    .await;
+    let timeout = match kind {
+        BackendKind::Http => std::time::Duration::from_secs(5),
+        BackendKind::Cli | BackendKind::Pty => cli_timeout,
+    };
+    let result = tokio::time::timeout(timeout, probe_inner(backend, handle, state)).await;
 
     match result {
         Ok(Ok(note)) => ProbeResult {
@@ -154,7 +156,7 @@ async fn smoke_probe(
             backend: backend.to_string(),
             kind: kind_label(kind),
             ok: false,
-            detail: "smoke probe timed out after 8 seconds".into(),
+            detail: format!("smoke probe timed out after {} seconds", timeout.as_secs()),
         },
     }
 }
@@ -176,10 +178,7 @@ async fn probe_inner(
         session_key: format!("doctor-{backend}"),
         model: "doctor/probe".into(),
         system: None,
-        messages: vec![ChatMessage {
-            role: "user".into(),
-            content: "Reply with OK.".into(),
-        }],
+        messages: vec![ChatMessage::text("user", "Reply with OK.")],
         prompt: "Reply with OK.".into(),
         stream: true,
         temperature: None,
@@ -187,6 +186,8 @@ async fn probe_inner(
         workspace_mode: WorkspaceMode::None,
         workdir: None,
         cancel: CancellationToken::new(),
+        tools: Vec::new(),
+        tool_choice: None,
         extra: serde_json::Map::new(),
     };
 
