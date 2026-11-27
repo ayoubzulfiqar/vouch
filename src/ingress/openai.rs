@@ -25,10 +25,12 @@ use crate::{
     },
     error::{GatewayError, Result},
     ingress::{
-        CancelOnDrop, completion, execute, execution_request, first_user_text, into_chunk_stream,
-        parse_json_content, prepare, sse_response, unix_now,
+        CancelOnDrop, completion, execute, execution_request, into_chunk_stream,
+        parse_json_content, prepare_routed, record_completion_outcome, record_error_outcome,
+        sse_response, start_ingress_span, unix_now,
     },
     state::AppState,
+    usage::count_tokens,
 };
 
 /// OpenAI `POST /v1/chat/completions` request body.
@@ -125,16 +127,18 @@ async fn chat_completions_inner(
         ));
     }
     let response_format = parse_openai_response_format(payload.response_format)?;
-    let first_user = first_user_text(&messages);
-    let context = prepare(
+    let tools = normalize_tools(payload.tools);
+    let context = prepare_routed(
         &state,
         &headers,
         payload.model.as_deref(),
         system.as_deref(),
-        &first_user,
+        &messages,
+        &tools,
     )?;
+    let started = std::time::Instant::now();
+    let ingress_span = start_ingress_span(&state, &context, "/v1/chat/completions");
     let max_tokens = payload.max_tokens.or(payload.max_completion_tokens);
-    let tools = normalize_tools(payload.tools);
     let cancel = CancellationToken::new();
     let request = execution_request(
         &context,
@@ -149,7 +153,20 @@ async fn chat_completions_inner(
         payload.extra,
         cancel.clone(),
     );
-    let routed = execute(&state, request).await?;
+    let routed = match execute(&state, request).await {
+        Ok(routed) => routed,
+        Err(error) => {
+            record_error_outcome(
+                &state,
+                &context,
+                None,
+                started.elapsed(),
+                &error.to_string(),
+                Some(ingress_span),
+            );
+            return Err(error);
+        }
+    };
     let backend = routed.backend_id.clone();
     let fallback = routed.fallback_used;
     let driver_response = routed.response;
@@ -163,9 +180,14 @@ async fn chat_completions_inner(
         let model = context.model.clone();
         let request_id = context.request_id.clone();
         let stream_cancel = cancel.clone();
+        let stream_state = state.clone();
+        let stream_context = context.clone();
+        let stream_backend = backend.clone();
 
         let stream = async_stream::stream! {
             let _guard = CancelOnDrop(stream_cancel.clone());
+            let mut ingress_span = Some(ingress_span);
+            let mut collected_text = String::new();
             let created = unix_now();
             let role = json!({
                 "id": id,
@@ -193,6 +215,14 @@ async fn chat_completions_inner(
                 };
                 if timed_out {
                     stream_cancel.cancel();
+                    record_error_outcome(
+                        &stream_state,
+                        &stream_context,
+                        Some(&stream_backend),
+                        started.elapsed(),
+                        "stream timeout",
+                        ingress_span.take(),
+                    );
                     let error = json!({
                         "error": {
                             "message": format!("stream timed out after {stream_timeout} seconds"),
@@ -230,6 +260,7 @@ async fn chat_completions_inner(
                             yield Ok(Event::default().data(payload.to_string()));
                         }
                         if !delta.is_empty() {
+                            collected_text.push_str(&delta);
                             let payload = json!({
                                 "id": id,
                                 "object": "chat.completion.chunk",
@@ -260,6 +291,21 @@ async fn chat_completions_inner(
                             yield Ok(Event::default().data(payload.to_string()));
                         }
                         if let Some(reason) = finish_reason {
+                            let effective_usage = usage.unwrap_or_else(|| {
+                                Usage::new(
+                                    stream_context.prompt_tokens,
+                                    count_tokens(&model, &collected_text),
+                                )
+                            });
+                            record_completion_outcome(
+                                &stream_state,
+                                &stream_context,
+                                &stream_backend,
+                                fallback,
+                                effective_usage,
+                                started.elapsed(),
+                                ingress_span.take(),
+                            );
                             let effective_reason = if saw_tool_calls && reason == "stop" {
                                 "tool_calls".to_string()
                             } else {
@@ -286,6 +332,14 @@ async fn chat_completions_inner(
                         }
                     }
                     Some(Err(error)) => {
+                        record_error_outcome(
+                            &stream_state,
+                            &stream_context,
+                            Some(&stream_backend),
+                            started.elapsed(),
+                            &error.to_string(),
+                            ingress_span.take(),
+                        );
                         let payload = json!({
                             "error": {
                                 "message": error.to_string(),
@@ -297,6 +351,19 @@ async fn chat_completions_inner(
                         break;
                     }
                     None => {
+                        let effective_usage = Usage::new(
+                            stream_context.prompt_tokens,
+                            count_tokens(&model, &collected_text),
+                        );
+                        record_completion_outcome(
+                            &stream_state,
+                            &stream_context,
+                            &stream_backend,
+                            fallback,
+                            effective_usage,
+                            started.elapsed(),
+                            ingress_span.take(),
+                        );
                         let effective_reason = if saw_tool_calls { "tool_calls" } else { "stop" };
                         let payload = json!({
                             "id": id,
@@ -322,7 +389,31 @@ async fn chat_completions_inner(
         return Ok(response);
     }
 
-    let completion = completion(driver_response).await?;
+    let completion = match completion(driver_response).await {
+        Ok(c) => {
+            record_completion_outcome(
+                &state,
+                &context,
+                &backend,
+                fallback,
+                c.usage,
+                started.elapsed(),
+                Some(ingress_span),
+            );
+            c
+        }
+        Err(error) => {
+            record_error_outcome(
+                &state,
+                &context,
+                Some(&backend),
+                started.elapsed(),
+                &error.to_string(),
+                Some(ingress_span),
+            );
+            return Err(error);
+        }
+    };
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let mut message = json!({
         "role": "assistant",
