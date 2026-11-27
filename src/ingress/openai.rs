@@ -25,12 +25,12 @@ use crate::{
     },
     error::{GatewayError, Result},
     ingress::{
-        CancelOnDrop, completion, execute, execution_request, into_chunk_stream,
-        parse_json_content, prepare_routed, record_completion_outcome, record_error_outcome,
-        sse_response, start_ingress_span, unix_now,
+        CancelOnDrop, StreamUsageGuard, completion, execute_or_cached, execution_request,
+        insert_routing_headers, into_chunk_stream, parse_json_content, prepare_routed,
+        record_completion_outcome, record_error_outcome, sse_response, start_ingress_span,
+        unix_now,
     },
     state::AppState,
-    usage::count_tokens,
 };
 
 /// OpenAI `POST /v1/chat/completions` request body.
@@ -153,8 +153,8 @@ async fn chat_completions_inner(
         payload.extra,
         cancel.clone(),
     );
-    let routed = match execute(&state, request).await {
-        Ok(routed) => routed,
+    let dispatched = match execute_or_cached(&state, &context, &headers, request).await {
+        Ok(dispatched) => dispatched,
         Err(error) => {
             record_error_outcome(
                 &state,
@@ -167,9 +167,11 @@ async fn chat_completions_inner(
             return Err(error);
         }
     };
-    let backend = routed.backend_id.clone();
-    let fallback = routed.fallback_used;
-    let driver_response = routed.response;
+    let backend = dispatched.routed.backend_id;
+    let fallback = dispatched.routed.fallback_used;
+    let driver_response = dispatched.routed.response;
+    let cache_status = dispatched.cache_status;
+    let cache_miss_key = dispatched.cache_miss_key;
 
     if payload.stream {
         let config = state.config();
@@ -180,14 +182,19 @@ async fn chat_completions_inner(
         let model = context.model.clone();
         let request_id = context.request_id.clone();
         let stream_cancel = cancel.clone();
-        let stream_state = state.clone();
-        let stream_context = context.clone();
         let stream_backend = backend.clone();
+        let mut usage_guard = StreamUsageGuard::new(
+            state.clone(),
+            context,
+            stream_backend,
+            fallback,
+            started,
+            Some(ingress_span),
+            cache_miss_key,
+        );
 
         let stream = async_stream::stream! {
             let _guard = CancelOnDrop(stream_cancel.clone());
-            let mut ingress_span = Some(ingress_span);
-            let mut collected_text = String::new();
             let created = unix_now();
             let role = json!({
                 "id": id,
@@ -215,14 +222,7 @@ async fn chat_completions_inner(
                 };
                 if timed_out {
                     stream_cancel.cancel();
-                    record_error_outcome(
-                        &stream_state,
-                        &stream_context,
-                        Some(&stream_backend),
-                        started.elapsed(),
-                        "stream timeout",
-                        ingress_span.take(),
-                    );
+                    usage_guard.fail("stream timeout");
                     let error = json!({
                         "error": {
                             "message": format!("stream timed out after {stream_timeout} seconds"),
@@ -235,6 +235,7 @@ async fn chat_completions_inner(
                 }
                 match item {
                     Some(Ok(chunk)) => {
+                        usage_guard.observe_chunk(&chunk);
                         let StreamChunk {
                             delta,
                             thinking_delta,
@@ -260,7 +261,6 @@ async fn chat_completions_inner(
                             yield Ok(Event::default().data(payload.to_string()));
                         }
                         if !delta.is_empty() {
-                            collected_text.push_str(&delta);
                             let payload = json!({
                                 "id": id,
                                 "object": "chat.completion.chunk",
@@ -291,26 +291,12 @@ async fn chat_completions_inner(
                             yield Ok(Event::default().data(payload.to_string()));
                         }
                         if let Some(reason) = finish_reason {
-                            let effective_usage = usage.unwrap_or_else(|| {
-                                Usage::new(
-                                    stream_context.prompt_tokens,
-                                    count_tokens(&model, &collected_text),
-                                )
-                            });
-                            record_completion_outcome(
-                                &stream_state,
-                                &stream_context,
-                                &stream_backend,
-                                fallback,
-                                effective_usage,
-                                started.elapsed(),
-                                ingress_span.take(),
-                            );
                             let effective_reason = if saw_tool_calls && reason == "stop" {
                                 "tool_calls".to_string()
                             } else {
                                 reason
                             };
+                            let _ = usage_guard.complete(usage, &effective_reason);
                             let mut payload = json!({
                                 "id": id,
                                 "object": "chat.completion.chunk",
@@ -332,14 +318,7 @@ async fn chat_completions_inner(
                         }
                     }
                     Some(Err(error)) => {
-                        record_error_outcome(
-                            &stream_state,
-                            &stream_context,
-                            Some(&stream_backend),
-                            started.elapsed(),
-                            &error.to_string(),
-                            ingress_span.take(),
-                        );
+                        usage_guard.fail(&error.to_string());
                         let payload = json!({
                             "error": {
                                 "message": error.to_string(),
@@ -351,20 +330,8 @@ async fn chat_completions_inner(
                         break;
                     }
                     None => {
-                        let effective_usage = Usage::new(
-                            stream_context.prompt_tokens,
-                            count_tokens(&model, &collected_text),
-                        );
-                        record_completion_outcome(
-                            &stream_state,
-                            &stream_context,
-                            &stream_backend,
-                            fallback,
-                            effective_usage,
-                            started.elapsed(),
-                            ingress_span.take(),
-                        );
                         let effective_reason = if saw_tool_calls { "tool_calls" } else { "stop" };
+                        let _ = usage_guard.complete(None, effective_reason);
                         let payload = json!({
                             "id": id,
                             "object": "chat.completion.chunk",
@@ -385,7 +352,7 @@ async fn chat_completions_inner(
         };
 
         let mut response = sse_response(stream, keep_alive);
-        add_routing_headers_from_parts(&mut response, &backend, fallback, &request_id);
+        insert_routing_headers(&mut response, &backend, fallback, &request_id, cache_status);
         return Ok(response);
     }
 
@@ -400,6 +367,9 @@ async fn chat_completions_inner(
                 started.elapsed(),
                 Some(ingress_span),
             );
+            if let Some(key) = cache_miss_key {
+                state.cache().store(key, &backend, &c);
+            }
             c
         }
         Err(error) => {
@@ -463,7 +433,13 @@ async fn chat_completions_inner(
         "usage": usage_json(&completion.usage),
     });
     let mut response = (StatusCode::OK, Json(body)).into_response();
-    add_routing_headers_from_parts(&mut response, &backend, fallback, &context.request_id);
+    insert_routing_headers(
+        &mut response,
+        &backend,
+        fallback,
+        &context.request_id,
+        cache_status,
+    );
     Ok(response)
 }
 
@@ -602,19 +578,4 @@ pub(crate) fn usage_json(usage: &Usage) -> Value {
         "completion_tokens": usage.completion_tokens,
         "total_tokens": usage.total_tokens,
     })
-}
-
-fn add_routing_headers_from_parts(
-    response: &mut Response,
-    backend: &str,
-    fallback: bool,
-    request_id: &str,
-) {
-    crate::ingress::insert_header(response, "x-vouch-backend", backend);
-    crate::ingress::insert_header(
-        response,
-        "x-vouch-fallback",
-        if fallback { "true" } else { "false" },
-    );
-    crate::ingress::insert_header(response, "x-vouch-request-id", request_id);
 }
