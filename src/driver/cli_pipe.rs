@@ -146,11 +146,15 @@ impl CliPipeDriver {
             command.arg(render_arg(arg, &arg_prompt, request));
         }
         command.envs(&self.config.env);
+        command.envs(&request.profile_env);
         command.env("VOUCH_REQUEST_ID", &request.request_id);
         command.env("VOUCH_SESSION_ID", &request.session_key);
         command.env("VOUCH_MODEL", &request.model);
         if let Some(backend_session_id) = &request.backend_session_id {
             command.env("VOUCH_BACKEND_SESSION_ID", backend_session_id);
+        }
+        if let Some(profile_id) = &request.profile_id {
+            command.env("VOUCH_PROFILE_ID", profile_id);
         }
         command
             .stdin(Stdio::piped())
@@ -719,12 +723,14 @@ fn render_arg(template: &str, prompt: &str, request: &ExecutionRequest) -> Strin
         .backend_session_id
         .as_deref()
         .unwrap_or(&request.session_key);
+    let profile_id = request.profile_id.as_deref().unwrap_or("");
     template
         .replace("{prompt}", prompt)
         .replace("{model}", &request.model)
         .replace("{session_id}", &request.session_key)
         .replace("{request_id}", &request.request_id)
         .replace("{backend_session_id}", backend_session_id)
+        .replace("{profile_id}", profile_id)
 }
 
 fn command_name(config: &BackendConfig) -> &str {
@@ -810,6 +816,9 @@ mod tests {
             delta_messages: None,
             session_capture: Arc::new(parking_lot::Mutex::new(None)),
             trace_context: None,
+            profile_id: None,
+            profile_env: std::collections::BTreeMap::new(),
+            allowed_backends: None,
             extra: serde_json::Map::new(),
         };
         assert_eq!(render_arg("--p={prompt}", "hello", &request), "--p=hello");
