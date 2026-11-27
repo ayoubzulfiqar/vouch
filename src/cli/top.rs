@@ -47,6 +47,8 @@ struct ReadyzBackend {
     circuit: String,
     consecutive_failures: u32,
     open_remaining_secs: u64,
+    #[serde(default)]
+    auth_expired: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -355,13 +357,22 @@ fn render_dashboard(frame: &mut Frame<'_>, data: &DashboardData) {
                         .get(&backend.id)
                         .copied()
                         .unwrap_or(0);
-                    let health = match data.metrics.backend_health.get(&backend.id) {
-                        Some(true) => "healthy",
-                        Some(false) => "unhealthy",
-                        None if backend.circuit == "open" => "open",
-                        None => "ok",
+                    let health = if backend.auth_expired {
+                        "AUTH_EXPIRED"
+                    } else {
+                        match data.metrics.backend_health.get(&backend.id) {
+                            Some(true) => "healthy",
+                            Some(false) => "unhealthy",
+                            None if backend.circuit == "open" => "open",
+                            None => "ok",
+                        }
                     };
-                    let circuit_label = if backend.circuit == "open" {
+                    let circuit_label = if backend.auth_expired {
+                        format!(
+                            "AUTH_EXPIRED ({}s, fails={})",
+                            backend.open_remaining_secs, backend.consecutive_failures
+                        )
+                    } else if backend.circuit == "open" {
                         format!(
                             "OPEN ({}s, fails={})",
                             backend.open_remaining_secs, backend.consecutive_failures
@@ -371,10 +382,16 @@ fn render_dashboard(frame: &mut Frame<'_>, data: &DashboardData) {
                     } else {
                         format!("CLOSED (fails={})", backend.consecutive_failures)
                     };
-                    let circuit_style = match backend.circuit.as_str() {
-                        "open" => Style::default().fg(Color::Red),
-                        "half_open" => Style::default().fg(Color::Yellow),
-                        _ => Style::default().fg(Color::Green),
+                    let circuit_style = if backend.auth_expired {
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        match backend.circuit.as_str() {
+                            "open" => Style::default().fg(Color::Red),
+                            "half_open" => Style::default().fg(Color::Yellow),
+                            _ => Style::default().fg(Color::Green),
+                        }
                     };
                     Row::new(vec![
                         Cell::from(backend.id.clone()),
