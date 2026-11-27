@@ -17,6 +17,7 @@
 //! * [`state`] — the shared, thread-safe application state.
 
 pub mod auth;
+pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod driver;
