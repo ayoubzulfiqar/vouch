@@ -39,7 +39,7 @@ use crate::{
     metrics,
     router::derive_session_key,
     state::AppState,
-    telemetry,
+    telemetry::{self, SpanKind, TraceContext},
 };
 
 const MCP_PROTOCOL_LEGACY: &str = "2024-11-05";
@@ -337,7 +337,7 @@ pub async fn http_mcp(
     if let Err(err_reply) = validate_stateless_headers(&headers, &payload) {
         return (StatusCode::BAD_REQUEST, Json(err_reply)).into_response();
     }
-    match handle_rpc(&state, &principal, payload).await {
+    match handle_rpc_with_headers(&state, &principal, Some(&headers), payload).await {
         Some(reply) => (StatusCode::OK, Json(reply)).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
@@ -387,6 +387,17 @@ pub async fn handle_rpc(
     principal: &Principal,
     payload: Value,
 ) -> Option<Value> {
+    handle_rpc_with_headers(state, principal, None, payload).await
+}
+
+/// Process an MCP JSON-RPC 2.0 request with optional HTTP ingress headers
+/// (used to propagate W3C `traceparent`/`tracestate` headers as fallback to `_meta`).
+pub async fn handle_rpc_with_headers(
+    state: &Arc<AppState>,
+    principal: &Principal,
+    headers: Option<&HeaderMap>,
+    payload: Value,
+) -> Option<Value> {
     let id = payload.get("id").cloned();
     let Some(method) = payload
         .get("method")
@@ -405,14 +416,9 @@ pub async fn handle_rpc(
     let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
 
     let meta = params.get("_meta").or_else(|| payload.get("_meta"));
-    let traceparent = meta
-        .and_then(|m| m.get("traceparent"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let tracestate = meta
-        .and_then(|m| m.get("tracestate"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let trace_ctx = TraceContext::from_headers_and_meta(headers, meta);
+    let traceparent = trace_ctx.traceparent();
+    let tracestate = trace_ctx.tracestate.as_deref().unwrap_or("");
     let client_name = meta
         .and_then(|m| {
             m.get("client")
@@ -466,12 +472,12 @@ pub async fn handle_rpc(
                 if params.get("task").is_some()
                     || params.pointer("/_meta/task").and_then(Value::as_bool) == Some(true)
                 {
-                    handle_task_create(state, principal, &params)
+                    handle_task_create(state, principal, &params, trace_ctx)
                 } else {
-                    handle_tool_call(state, principal, &params).await
+                    handle_tool_call(state, principal, &params, trace_ctx).await
                 }
             }
-            "tasks/create" => handle_task_create(state, principal, &params),
+            "tasks/create" => handle_task_create(state, principal, &params, trace_ctx),
             "tasks/get" => handle_task_get(state, principal, &params),
             "tasks/result" => handle_task_result(state, principal, &params).await,
             "tasks/cancel" => handle_task_cancel(state, principal, &params),
@@ -581,6 +587,7 @@ fn prepare_tool_execution(
     principal: &Principal,
     params: &Value,
     cancel: CancellationToken,
+    trace_ctx: TraceContext,
 ) -> std::result::Result<(ExecutionRequest, WorkspaceMode), (i32, String)> {
     let tool_params = params.pointer("/request/params").unwrap_or(params);
 
@@ -601,23 +608,33 @@ fn prepare_tool_execution(
     let models = state.router().models();
     let route_map = build_route_tool_map(&models);
 
-    let model = if tool_name == "vouch_ask" {
-        let requested = args.get("model").and_then(Value::as_str);
-        state
-            .resolve_model(requested)
-            .map_err(|error| (-32602, error.to_string()))?
-    } else if let Some((_, route_name)) = route_map.into_iter().find(|(name, _)| name == tool_name)
+    let (requested_label, model) = if tool_name == "vouch_ask" {
+        let requested = args
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(ToString::to_string);
+        let resolved = state
+            .resolve_model(requested.as_deref())
+            .map_err(|error| (-32602, error.to_string()))?;
+        (requested.unwrap_or_else(|| resolved.clone()), resolved)
+    } else if let Some((_, alias_or_route)) =
+        route_map.into_iter().find(|(name, _)| name == tool_name)
     {
-        route_name
+        let resolved = state
+            .resolve_model(Some(&alias_or_route))
+            .map_err(|error| (-32602, error.to_string()))?;
+        (alias_or_route, resolved)
     } else {
         return Err((-32602, format!("unknown MCP tool: {tool_name}")));
     };
 
-    if !principal.allows_model(&model) {
+    if !principal.allows_model_or_resolved(&requested_label, &model) {
         return Err((
             -32003,
             format!(
-                "token {:?} is not allowed to use model {model:?}",
+                "token {:?} is not allowed to use model {requested_label:?}",
                 principal.name
             ),
         ));
@@ -677,6 +694,7 @@ fn prepare_tool_execution(
         backend_session_id: None,
         delta_messages: None,
         session_capture: Arc::new(parking_lot::Mutex::new(None)),
+        trace_context: Some(trace_ctx),
         extra: Map::new(),
     };
     Ok((request, workspace_mode))
@@ -686,6 +704,7 @@ async fn handle_tool_call(
     state: &AppState,
     principal: &Principal,
     params: &Value,
+    trace_ctx: TraceContext,
 ) -> std::result::Result<Value, (i32, String)> {
     let _tool_name = params
         .get("name")
@@ -697,14 +716,37 @@ async fn handle_tool_call(
         return Err((-32602, "tools/call requires object `arguments`".to_string()));
     }
 
-    let (request, workspace_mode) =
-        prepare_tool_execution(state, principal, params, CancellationToken::new())?;
+    let (request, workspace_mode) = prepare_tool_execution(
+        state,
+        principal,
+        params,
+        CancellationToken::new(),
+        trace_ctx.clone(),
+    )?;
+    let mut ingress_span = state
+        .otel()
+        .start_span(trace_ctx, "ingress", SpanKind::Server);
+    ingress_span.set_str("vouch.route", &request.model);
+    ingress_span.set_str("http.route", "/mcp");
     let started = Instant::now();
     let outcome = execute_mcp_request(state, request, workspace_mode).await;
 
     match outcome {
-        Ok((backend_id, done)) => {
-            metrics::record_request("mcp", "/mcp", 200, started.elapsed());
+        Ok((backend_id, fallback, done)) => {
+            let elapsed = started.elapsed();
+            metrics::record_request("mcp", "/mcp", 200, elapsed);
+            principal.record_tokens(done.usage.total_tokens);
+            state
+                .usage()
+                .record_success(&principal.name, &backend_id, done.usage, elapsed);
+            ingress_span.set_str("vouch.backend", &backend_id);
+            ingress_span.set_bool("vouch.fallback", fallback);
+            ingress_span.set_int("gen_ai.usage.input_tokens", done.usage.prompt_tokens as i64);
+            ingress_span.set_int(
+                "gen_ai.usage.output_tokens",
+                done.usage.completion_tokens as i64,
+            );
+            ingress_span.finish_ok();
             Ok(json!({
                 "content": [{
                     "type": "text",
@@ -722,8 +764,11 @@ async fn handle_tool_call(
             }))
         }
         Err(error) => {
-            metrics::record_request("mcp", "/mcp", error.status().as_u16(), started.elapsed());
+            let elapsed = started.elapsed();
+            metrics::record_request("mcp", "/mcp", error.status().as_u16(), elapsed);
+            state.usage().record_error(&principal.name, None, elapsed);
             let redacted = telemetry::redact_text(&error.to_string());
+            ingress_span.finish_err(&redacted);
             Ok(json!({
                 "content": [{
                     "type": "text",
@@ -739,7 +784,7 @@ async fn execute_mcp_request(
     state: &AppState,
     request: ExecutionRequest,
     workspace_mode: WorkspaceMode,
-) -> Result<(String, crate::driver::Completion)> {
+) -> Result<(String, bool, crate::driver::Completion)> {
     let timeout = Duration::from_secs(state.config().server.request_timeout_secs.max(1));
     let routed = tokio::time::timeout(
         timeout,
@@ -752,7 +797,7 @@ async fn execute_mcp_request(
     match routed {
         Ok(Ok(routed)) => {
             let done = completion(routed.response).await?;
-            Ok((routed.backend_id, done))
+            Ok((routed.backend_id, routed.fallback_used, done))
         }
         Ok(Err(error)) => Err(error),
         Err(_) => Err(GatewayError::Timeout(timeout)),
@@ -763,19 +808,42 @@ fn handle_task_create(
     state: &Arc<AppState>,
     principal: &Principal,
     params: &Value,
+    trace_ctx: TraceContext,
 ) -> std::result::Result<Value, (i32, String)> {
     let cancel = CancellationToken::new();
     let (request, workspace_mode) =
-        prepare_tool_execution(state, principal, params, cancel.clone())?;
+        prepare_tool_execution(state, principal, params, cancel.clone(), trace_ctx.clone())?;
+    let mut ingress_span = state
+        .otel()
+        .start_span(trace_ctx, "ingress", SpanKind::Server);
+    ingress_span.set_str("vouch.route", &request.model);
+    ingress_span.set_str("http.route", "/mcp#tasks");
     let (task_id, created_at, _done) = state.mcp_tasks().insert_working(&principal.name, cancel);
 
     let bg_state = state.clone();
+    let bg_principal = principal.clone();
     let bg_task_id = task_id.clone();
     tokio::spawn(async move {
         let started = Instant::now();
         match execute_mcp_request(&bg_state, request, workspace_mode).await {
-            Ok((backend_id, done)) => {
-                metrics::record_request("mcp", "/mcp#tasks", 200, started.elapsed());
+            Ok((backend_id, fallback, done)) => {
+                let elapsed = started.elapsed();
+                metrics::record_request("mcp", "/mcp#tasks", 200, elapsed);
+                bg_principal.record_tokens(done.usage.total_tokens);
+                bg_state.usage().record_success(
+                    &bg_principal.name,
+                    &backend_id,
+                    done.usage,
+                    elapsed,
+                );
+                ingress_span.set_str("vouch.backend", &backend_id);
+                ingress_span.set_bool("vouch.fallback", fallback);
+                ingress_span.set_int("gen_ai.usage.input_tokens", done.usage.prompt_tokens as i64);
+                ingress_span.set_int(
+                    "gen_ai.usage.output_tokens",
+                    done.usage.completion_tokens as i64,
+                );
+                ingress_span.finish_ok();
                 bg_state.mcp_tasks().finish_success(
                     &bg_task_id,
                     json!({
@@ -796,13 +864,13 @@ fn handle_task_create(
                 );
             }
             Err(error) => {
-                metrics::record_request(
-                    "mcp",
-                    "/mcp#tasks",
-                    error.status().as_u16(),
-                    started.elapsed(),
-                );
+                let elapsed = started.elapsed();
+                metrics::record_request("mcp", "/mcp#tasks", error.status().as_u16(), elapsed);
+                bg_state
+                    .usage()
+                    .record_error(&bg_principal.name, None, elapsed);
                 let redacted = telemetry::redact_text(&error.to_string());
+                ingress_span.finish_err(&redacted);
                 bg_state.mcp_tasks().finish_error(&bg_task_id, redacted);
             }
         }
