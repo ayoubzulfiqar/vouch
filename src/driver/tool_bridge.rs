@@ -10,7 +10,10 @@
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::driver::{ChatMessage, ToolCall};
+use crate::{
+    driver::{ChatMessage, ResponseFormat, ToolCall},
+    error::{GatewayError, Result},
+};
 
 const OPEN_TAG: &str = "<vouch_tool_call>";
 const CLOSE_TAG: &str = "</vouch_tool_call>";
@@ -53,6 +56,7 @@ pub fn normalize_tools(tools: Vec<Value>) -> Vec<Value> {
 
 /// Format conversation turns including structured tool calls and tool results.
 pub fn format_message(message: &ChatMessage, output: &mut String) {
+    let text = message.content.as_plain_text();
     if message.role == "tool" {
         let call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
         if let Some(name) = message.name.as_deref() {
@@ -60,15 +64,15 @@ pub fn format_message(message: &ChatMessage, output: &mut String) {
         } else {
             output.push_str(&format!("ToolResult (id={call_id}):\n"));
         }
-        output.push_str(message.content.trim());
+        output.push_str(text.trim());
         output.push_str("\n\n");
         return;
     }
 
     output.push_str(&capitalize_role(&message.role));
     output.push_str(":\n");
-    if !message.content.trim().is_empty() {
-        output.push_str(message.content.trim());
+    if !text.trim().is_empty() {
+        output.push_str(text.trim());
         output.push('\n');
     }
     for call in &message.tool_calls {
@@ -184,6 +188,123 @@ pub fn parse_tool_calls(raw: &str) -> (String, Vec<ToolCall>) {
     (remaining.trim().to_string(), calls)
 }
 
+/// Append strict JSON / JSON-Schema output instructions to a CLI/PTY prompt.
+pub fn append_structured_output_instructions(prompt: &mut String, format: &ResponseFormat) {
+    if !prompt.is_empty() && !prompt.ends_with("\n\n") {
+        if prompt.ends_with('\n') {
+            prompt.push('\n');
+        } else {
+            prompt.push_str("\n\n");
+        }
+    }
+    match format {
+        ResponseFormat::JsonObject => {
+            prompt.push_str(
+                "Output format requirement:\n\
+                 Respond ONLY with a single valid JSON value. Do NOT wrap the output in markdown code fences or add explanatory text.",
+            );
+        }
+        ResponseFormat::JsonSchema { name, schema, .. } => {
+            let label = name.as_deref().unwrap_or("response");
+            prompt.push_str(&format!(
+                "Output format requirement:\n\
+                 Respond ONLY with raw valid JSON matching the schema `{label}` below. \
+                 Do NOT wrap the JSON in markdown code fences (` ``` `) or add explanatory prose.\n\
+                 JSON Schema:\n{schema}",
+            ));
+        }
+    }
+}
+
+/// Strip leading and trailing Markdown code fences (such as ```` ```json ... ``` ````).
+pub fn strip_markdown_fences(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed.to_string();
+    };
+    let after_lang = match rest.find('\n') {
+        Some(idx) => {
+            let header = rest[..idx].trim();
+            if header.is_empty()
+                || header
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+            {
+                &rest[idx + 1..]
+            } else {
+                rest
+            }
+        }
+        None => rest,
+    };
+    let body = after_lang
+        .trim_end()
+        .strip_suffix("```")
+        .unwrap_or(after_lang);
+    body.trim().to_string()
+}
+
+/// Strip accidental Markdown fences and validate structured JSON/Schema output.
+pub fn enforce_response_format(raw: &str, format: &ResponseFormat) -> Result<String> {
+    let cleaned = strip_markdown_fences(raw);
+    let parsed: Value = serde_json::from_str(&cleaned).map_err(|error| {
+        GatewayError::Upstream(format!(
+            "CLI/PTY backend failed structured output JSON validation: {error}"
+        ))
+    })?;
+
+    if let ResponseFormat::JsonSchema { schema, .. } = format {
+        validate_json_schema_value(&parsed, schema, "$")?;
+    }
+    Ok(cleaned)
+}
+
+fn validate_json_schema_value(value: &Value, schema: &Value, path: &str) -> Result<()> {
+    if let Some(expected_type) = schema.get("type").and_then(Value::as_str) {
+        let ok = match expected_type {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "boolean" => value.is_boolean(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "number" => value.is_number(),
+            "null" => value.is_null(),
+            _ => true,
+        };
+        if !ok {
+            return Err(GatewayError::Upstream(format!(
+                "structured output at {path} expected JSON type {expected_type:?}"
+            )));
+        }
+    }
+
+    if let Some(obj) = value.as_object() {
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for req in required.iter().filter_map(Value::as_str) {
+                if !obj.contains_key(req) {
+                    return Err(GatewayError::Upstream(format!(
+                        "structured output at {path} missing required field {req:?}"
+                    )));
+                }
+            }
+        }
+        if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+            for (key, prop_schema) in props {
+                if let Some(child) = obj.get(key) {
+                    validate_json_schema_value(child, prop_schema, &format!("{path}.{key}"))?;
+                }
+            }
+        }
+    } else if let Some(items) = value.as_array()
+        && let Some(item_schema) = schema.get("items")
+    {
+        for (idx, item) in items.iter().enumerate() {
+            validate_json_schema_value(item, item_schema, &format!("{path}[{idx}]"))?;
+        }
+    }
+    Ok(())
+}
+
 fn parse_single_tool_call(inner: &str) -> Option<ToolCall> {
     let value: Value = serde_json::from_str(inner).ok()?;
     let name = value
@@ -251,5 +372,32 @@ mod tests {
         let (text, calls) = parse_tool_calls(raw);
         assert!(calls.is_empty());
         assert_eq!(text, raw);
+    }
+
+    #[test]
+    fn strips_fences_and_validates_structured_json_schema() {
+        let schema = json!({
+            "type": "object",
+            "required": ["city", "temp"],
+            "properties": {
+                "city": {"type": "string"},
+                "temp": {"type": "number"}
+            }
+        });
+        let format = ResponseFormat::JsonSchema {
+            name: Some("weather".into()),
+            schema: schema.clone(),
+            strict: true,
+            raw: json!({"type": "json_schema", "json_schema": {"name": "weather", "schema": schema}}),
+        };
+        let valid = "```json\n{\"city\":\"Paris\",\"temp\":18}\n```";
+        let out = enforce_response_format(valid, &format).expect("valid JSON passes");
+        assert_eq!(out, "{\"city\":\"Paris\",\"temp\":18}");
+
+        let missing_req = "{\"city\":\"Paris\"}";
+        assert!(enforce_response_format(missing_req, &format).is_err());
+
+        let invalid_json = "not json at all";
+        assert!(enforce_response_format(invalid_json, &format).is_err());
     }
 }
