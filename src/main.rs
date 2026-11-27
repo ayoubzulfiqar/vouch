@@ -17,7 +17,10 @@ use tokio::{
 use tracing::{error, info, warn};
 
 use vouch::{
-    cli::{Cli, Command, ServeArgs, ServiceCommand, doctor, mcp, print_routes, service, top},
+    cli::{
+        Cli, Command, ServeArgs, ServiceCommand, bench, doctor, mcp, print_routes, service, token,
+        top,
+    },
     config::GatewayConfig,
     error::{GatewayError, Result},
     ingress::build_router,
@@ -53,6 +56,8 @@ async fn real_main() -> Result<()> {
         },
         Command::Mcp(args) => mcp::run(&args).await,
         Command::Top(args) => top::run(&args).await,
+        Command::Token(args) => token::run(&args),
+        Command::Bench(args) => bench::run(&args).await,
     }
 }
 
