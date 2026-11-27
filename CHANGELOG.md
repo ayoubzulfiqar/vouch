@@ -2,6 +2,32 @@
 
 All notable changes to `vouch` are documented in this file.
 
+## [3.0.0] - 2026-11-27
+
+### Added
+- **WebSocket `/v1/responses` (`src/ingress/responses.rs`):**
+  - Enabled Axum WebSocket upgrades on `GET /v1/responses` with virtual-token handshake authentication, `X-Session-ID` / `X-Workspace-Mode` support, `response.create` & `response.cancel` client frames, real-time server JSON frames (`response.created`, `response.output_text.delta`, `response.function_call_arguments.delta`, `response.completed`, `error`), and immediate child PGID reaping on cancellation or socket disconnect.
+- **Model aliases & dynamic trait-based routing rules (`src/config.rs`, `src/router/mod.rs`):**
+  - Added `[aliases]` mapping friendly public names (e.g. `"gpt-4o"`) to canonical `[routes]` entries, exposing aliases in `GET /v1/models` and checking `allowed_models` against both requested alias and resolved route.
+  - Added `[[routing_rules]]` evaluated prior to static routes (`model_pattern`, `has_tools`, `has_images`, `min_prompt_tokens`, `header_equals` → `target_route`).
+- **Per-token daily BPE budgets & cumulative usage analytics (`src/auth/tokens.rs`, `src/usage.rs`, `src/cli/stats.rs`):**
+  - Added `daily_token_budget` on `[[tokens]]` enforcing rolling UTC-day prompt + completion BPE token caps (`429 rate_limit_error`, code `daily_token_budget_exceeded`, `Retry-After` until UTC midnight).
+  - Added `UsageTracker`, `GET /v1/usage`, and `vouch stats [--url ... | --unix-socket ...] [--token ...] [--json]` reporting cumulative per-token/per-backend requests, errors, token counts, and `p50`/`p95`/`p99` latency quantiles without exposing raw secrets.
+- **Durable `0600` state persistence & bounded stores (`src/persistence.rs`, `src/state.rs`):**
+  - Added `defaults.max_session_entries` (default `10000`, oldest-entry eviction) across sticky session affinity and `/v1/responses` history stores.
+  - Added `defaults.state_dir` writing atomic `0600` snapshots (`gateway_state.json`) periodically and on shutdown, reloading non-expired sessions, responses, daily token budgets, and usage stats on startup.
+- **SSRF-safe remote `image_url` materialization (`[attachments]`):**
+  - Added `fetch_remote_urls` (default `false`), `max_image_bytes` (default `10485760`), and `allow_private_ips` (default `false`), validating resolved/redirected IPs, enforcing bounded downloads, pinning DNS addresses, checking image magic bytes, and cleaning temp files via `TempAttachmentGuard`.
+- **OpenTelemetry OTLP/HTTP trace export (`[telemetry]`, `src/telemetry.rs`):**
+  - Added `otlp_endpoint`, `service_name` (default `"vouch"`), and `otlp_headers`, extracting W3C `traceparent`/`tracestate` across HTTP & MCP ingress and exporting non-blocking redacted spans (`ingress`, `router.dispatch`, `driver.exec`, `workspace.worktree`).
+- **`vouch init` scaffolder & distribution packaging (`src/cli/init.rs`, `packaging/homebrew/vouch.rb`, `Cargo.toml`):**
+  - Added `vouch init [--output vouch.toml] [--docker-bridge] [--force]` scanning host CLIs (`hermes`, `opencode`, `kilocode`, `claude`, `codex`, `gemini`) and local daemons (`:8645`, `:4096`), detecting `docker0` IPv4, generating CSPRNG tokens, and emitting a validated config.
+  - Added `[package.metadata.binstall]` in `Cargo.toml`, Homebrew formula `packaging/homebrew/vouch.rb`, and release workflow SHA-256 sync.
+
+### Fixed
+- **Real-time UTF-8 chunk streaming (`read_mode = "chunk" | "line"`):** Replaced buffered whole-turn waiting with `Utf8ChunkDecoder` carry-over across reads and immediate chunk streaming in `src/driver/cli_pipe.rs` and `src/driver/pty_runner.rs`, resetting idle watchdogs on every byte received without waiting for `\n`.
+- **Split-tag tool calls & streaming Markdown fence stripping (`src/driver/tool_bridge.rs`):** Added `StreamingToolParser` (buffering `<vouch_tool_call>` prefixes across chunk boundaries without leaking XML) and `StreamingJsonFenceStripper` (stripping ```` ```json ```` / ```` ``` ```` across chunks and validating JSON/Schema before terminal `stop`).
+
 ## [2.0.0] - 2026-11-27
 
 ### Added
