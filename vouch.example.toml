@@ -32,6 +32,8 @@ max_body_bytes = 8388608
 log_level = "info"
 # Allow permissive CORS for browser clients. Default: false (off).
 cors_permissive = false
+# Enable the embedded read-only HTML status dashboard at GET /ui. Default: false (off).
+enable_ui = false
 
 # ---------------------------------------------------------------------------
 # [defaults] — inherited by backends and by request handling.
@@ -84,6 +86,8 @@ cleanup_on_shutdown = true
 enabled = true
 # TCP-probe configured HTTP backends. Default: true.
 probe_ports = true
+# Timeout in seconds for live CLI/PTY smoke probes in `vouch doctor`. Default: 30.
+probe_timeout_secs = 30
 # Extra credential paths to report on (metadata only, never contents).
 extra_auth_paths = ["/path/to/my-agent/token.json"]
 
