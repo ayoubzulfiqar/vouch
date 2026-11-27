@@ -1,8 +1,10 @@
 //! Operator-facing command line.
 
+pub mod bench;
 pub mod doctor;
 pub mod mcp;
 pub mod service;
+pub mod token;
 pub mod top;
 
 use std::{io::Write, net::SocketAddr, path::PathBuf};
@@ -39,6 +41,10 @@ pub enum Command {
     Mcp(McpArgs),
     /// Display a live terminal dashboard polling `/healthz`, `/readyz`, and `/metrics`.
     Top(TopArgs),
+    /// Generate virtual ingress tokens (`vouch token create`).
+    Token(TokenArgs),
+    /// Benchmark configured routes end-to-end (TTFT, latency percentiles, fallbacks).
+    Bench(BenchArgs),
 }
 
 /// Arguments for `vouch serve`.
@@ -151,6 +157,61 @@ pub struct TopArgs {
     /// Refresh interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
     pub interval_ms: u64,
+}
+
+/// Arguments for `vouch token`.
+#[derive(Debug, Args)]
+pub struct TokenArgs {
+    /// Token management action.
+    #[command(subcommand)]
+    pub command: TokenCommand,
+}
+
+/// Token subcommands.
+#[derive(Debug, Subcommand)]
+pub enum TokenCommand {
+    /// Generate a cryptographically random `vouch_live_...` virtual token TOML snippet.
+    Create(TokenCreateArgs),
+}
+
+/// Arguments for `vouch token create`.
+#[derive(Debug, Args)]
+pub struct TokenCreateArgs {
+    /// Optional human-readable label included in logs and metrics.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Optional requests-per-minute sliding quota.
+    #[arg(long)]
+    pub rpm: Option<u32>,
+    /// Allowed model glob patterns (repeat `--allow` for multiple patterns).
+    #[arg(long = "allow")]
+    pub allow: Vec<String>,
+}
+
+/// Arguments for `vouch bench`.
+#[derive(Debug, Args)]
+pub struct BenchArgs {
+    /// Path to the TOML configuration.
+    #[arg(short, long, default_value = "vouch.toml")]
+    pub config: PathBuf,
+    /// Target model route to benchmark (defaults to `defaults.model` when configured).
+    #[arg(short, long)]
+    pub model: Option<String>,
+    /// Total number of requests to run.
+    #[arg(short = 'n', long, default_value_t = 5)]
+    pub requests: usize,
+    /// Maximum concurrent benchmark requests.
+    #[arg(long, default_value_t = 2)]
+    pub concurrency: usize,
+    /// Prompt text sent on each benchmark request.
+    #[arg(long, default_value = "Reply with OK.")]
+    pub prompt: String,
+    /// Benchmark streaming mode to measure true TTFT.
+    #[arg(long)]
+    pub stream: bool,
+    /// Emit machine-readable JSON summary.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Render the configured routes as text or JSON.
