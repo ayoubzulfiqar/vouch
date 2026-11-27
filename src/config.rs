@@ -44,6 +44,18 @@ pub struct GatewayConfig {
     /// Public model name to ordered backend-id fallback chain.
     #[serde(default)]
     pub routes: BTreeMap<String, Vec<String>>,
+    /// Public model aliases pointing to canonical `[routes]` entries.
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
+    /// Trait-based routing rules evaluated before static `[routes]`/`[aliases]`.
+    #[serde(default)]
+    pub routing_rules: Vec<RoutingRuleConfig>,
+    /// Remote multimodal image attachment fetching & size limits.
+    #[serde(default)]
+    pub attachments: AttachmentsConfig,
+    /// Optional OpenTelemetry OTLP/HTTP trace export configuration.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
     /// Optional virtual ingress tokens.
     #[serde(default)]
     pub tokens: Vec<TokenConfig>,
@@ -98,6 +110,69 @@ pub struct DefaultsConfig {
     /// Default time to wait for a backend permit before failing over.
     #[serde(default = "default_queue_timeout_ms")]
     pub queue_timeout_ms: u64,
+    /// Maximum number of entries retained in session affinity and `/v1/responses` stores.
+    #[serde(default = "default_max_session_entries")]
+    pub max_session_entries: usize,
+    /// Optional directory for atomic `0600` persistence of sessions, responses,
+    /// daily token budgets, and usage analytics across daemon restarts.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+}
+
+/// Remote image attachment fetching and size controls.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentsConfig {
+    /// Fetch remote `http://` and `https://` `image_url` inputs on CLI/PTY backends.
+    #[serde(default)]
+    pub fetch_remote_urls: bool,
+    /// Maximum allowed remote image payload in bytes. Default: `10_485_760` (10 MiB).
+    #[serde(default = "default_max_image_bytes")]
+    pub max_image_bytes: usize,
+    /// Allow fetching remote URLs pointing at loopback/private/link-local IPs.
+    /// Defaults to `false` to prevent SSRF.
+    #[serde(default)]
+    pub allow_private_ips: bool,
+}
+
+/// Trait-based routing rule evaluated before static `[routes]` lookup.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingRuleConfig {
+    /// Optional human-readable label for logs and telemetry.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Glob pattern matched against the requested public model or alias.
+    pub model_pattern: String,
+    /// Require tool definitions (`true`) or their absence (`false`).
+    #[serde(default)]
+    pub has_tools: Option<bool>,
+    /// Require image inputs (`true`) or their absence (`false`).
+    #[serde(default)]
+    pub has_images: Option<bool>,
+    /// Minimum estimated BPE prompt token count to match this rule.
+    #[serde(default)]
+    pub min_prompt_tokens: Option<u64>,
+    /// Required exact HTTP request header matches (`header_name -> value`).
+    #[serde(default)]
+    pub header_equals: BTreeMap<String, String>,
+    /// Target route key in `[routes]` selected when all conditions match.
+    pub target_route: String,
+}
+
+/// OpenTelemetry OTLP/HTTP trace export settings.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// Optional OTLP/HTTP JSON traces endpoint, e.g. `http://127.0.0.1:4318/v1/traces`.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    /// Service name exported in OTLP `service.name` resource attribute.
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    /// Optional extra headers sent with OTLP trace export requests.
+    #[serde(default)]
+    pub otlp_headers: BTreeMap<String, String>,
 }
 
 /// Circuit-breaker tuning shared by every backend.
@@ -224,6 +299,9 @@ pub struct BackendConfig {
     /// How stdout is interpreted.
     #[serde(default)]
     pub output_mode: OutputMode,
+    /// How CLI stdout bytes are buffered before ANSI stripping & streaming (`chunk` or `line`).
+    #[serde(default)]
+    pub read_mode: ReadMode,
     /// For PTY backends that read stdin, send EOT after the prompt.
     #[serde(default = "default_true")]
     pub pty_send_eof: bool,
@@ -302,6 +380,17 @@ pub enum OutputMode {
     JsonLines,
 }
 
+/// How raw bytes from a CLI subprocess's stdout are read into text chunks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadMode {
+    /// Stream raw UTF-8 byte chunks immediately without waiting for newlines.
+    #[default]
+    Chunk,
+    /// Legacy newline-delimited buffering (`\n`).
+    Line,
+}
+
 /// Virtual ingress credential.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -314,6 +403,9 @@ pub struct TokenConfig {
     /// Sliding-window requests-per-minute limit.
     #[serde(default)]
     pub rpm: Option<u32>,
+    /// Optional rolling UTC day prompt + completion BPE token limit.
+    #[serde(default)]
+    pub daily_token_budget: Option<u64>,
     /// Glob patterns of models this token may call. Empty means all.
     #[serde(default)]
     pub allowed_models: Vec<String>,
@@ -405,6 +497,16 @@ impl GatewayConfig {
                 "defaults.max_concurrency must be greater than zero".into(),
             ));
         }
+        if self.defaults.max_session_entries == 0 {
+            return Err(GatewayError::Config(
+                "defaults.max_session_entries must be greater than zero".into(),
+            ));
+        }
+        if self.attachments.max_image_bytes == 0 {
+            return Err(GatewayError::Config(
+                "attachments.max_image_bytes must be greater than zero".into(),
+            ));
+        }
         if self.resilience.failure_threshold == 0 {
             return Err(GatewayError::Config(
                 "resilience.failure_threshold must be greater than zero".into(),
@@ -463,11 +565,53 @@ impl GatewayConfig {
             }
         }
 
+        for (alias, target) in &self.aliases {
+            if alias.trim().is_empty() {
+                return Err(GatewayError::Config(
+                    "model alias names must not be empty".into(),
+                ));
+            }
+            if self.routes.contains_key(alias) {
+                return Err(GatewayError::Config(format!(
+                    "alias {alias:?} conflicts with an explicit [routes] entry"
+                )));
+            }
+            if !self.routes.contains_key(target) {
+                return Err(GatewayError::Config(format!(
+                    "alias {alias:?} references unknown route {target:?}"
+                )));
+            }
+        }
+
+        for (idx, rule) in self.routing_rules.iter().enumerate() {
+            if rule.model_pattern.trim().is_empty() {
+                return Err(GatewayError::Config(format!(
+                    "routing_rules[{idx}].model_pattern must not be empty"
+                )));
+            }
+            ModelAllowlist::compile(std::slice::from_ref(&rule.model_pattern))?;
+            if !self.routes.contains_key(&rule.target_route) {
+                return Err(GatewayError::Config(format!(
+                    "routing_rules[{idx}].target_route {:?} is not a configured route",
+                    rule.target_route
+                )));
+            }
+            for header_name in rule.header_equals.keys() {
+                if header_name.trim().is_empty()
+                    || axum::http::header::HeaderName::from_bytes(header_name.as_bytes()).is_err()
+                {
+                    return Err(GatewayError::Config(format!(
+                        "routing_rules[{idx}].header_equals has invalid header name {header_name:?}"
+                    )));
+                }
+            }
+        }
+
         if let Some(model) = &self.defaults.model
-            && !self.routes.contains_key(model)
+            && self.resolve_route_name(model).is_none()
         {
             return Err(GatewayError::Config(format!(
-                "defaults.model {model:?} is not a configured route"
+                "defaults.model {model:?} is not a configured route or alias"
             )));
         }
 
@@ -507,21 +651,66 @@ impl GatewayConfig {
                     "token rpm must be greater than zero when set".into(),
                 ));
             }
+            if token.daily_token_budget == Some(0) {
+                return Err(GatewayError::Config(
+                    "token daily_token_budget must be greater than zero when set".into(),
+                ));
+            }
             ModelAllowlist::compile(&token.allowed_models)?;
+        }
+
+        if self.telemetry.service_name.trim().is_empty() {
+            return Err(GatewayError::Config(
+                "telemetry.service_name must not be empty".into(),
+            ));
+        }
+        if let Some(endpoint) = &self.telemetry.otlp_endpoint {
+            let parsed = reqwest::Url::parse(endpoint).map_err(|error| {
+                GatewayError::Config(format!(
+                    "invalid telemetry.otlp_endpoint {endpoint:?}: {error}"
+                ))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                return Err(GatewayError::Config(format!(
+                    "telemetry.otlp_endpoint {endpoint:?} must be an http:// or https:// URL with a host"
+                )));
+            }
+        }
+        for header_name in self.telemetry.otlp_headers.keys() {
+            if header_name.trim().is_empty()
+                || axum::http::header::HeaderName::from_bytes(header_name.as_bytes()).is_err()
+            {
+                return Err(GatewayError::Config(format!(
+                    "telemetry.otlp_headers contains invalid header name {header_name:?}"
+                )));
+            }
         }
 
         Ok(())
     }
 
-    /// Resolve the model used when a request omits one.
+    /// Resolve a requested public model name or alias to its canonical route key.
+    pub fn resolve_route_name<'a>(&'a self, requested: &'a str) -> Option<&'a str> {
+        if self.routes.contains_key(requested) {
+            Some(requested)
+        } else {
+            self.aliases.get(requested).map(String::as_str)
+        }
+    }
+
+    /// Resolve the model used when a request omits one (expanding aliases).
     pub fn default_model(&self) -> Option<&str> {
-        self.defaults.model.as_deref().or_else(|| {
-            if self.routes.len() == 1 {
-                self.routes.keys().next().map(String::as_str)
-            } else {
-                None
-            }
-        })
+        self.defaults
+            .model
+            .as_deref()
+            .map(|name| self.resolve_route_name(name).unwrap_or(name))
+            .or_else(|| {
+                if self.routes.len() == 1 {
+                    self.routes.keys().next().map(String::as_str)
+                } else {
+                    None
+                }
+            })
     }
 
     /// Locate a backend by id.
@@ -562,6 +751,17 @@ impl GatewayConfig {
                 && !value.is_empty()
             {
                 secrets.push(value);
+            }
+        }
+        for (key, value) in &self.telemetry.otlp_headers {
+            let key = key.to_ascii_lowercase();
+            if key.contains("authorization")
+                || key.contains("api-key")
+                || key.contains("token")
+                || key.contains("secret")
+                || looks_like_secret(value)
+            {
+                secrets.push(value.clone());
             }
         }
         secrets.sort();
@@ -822,6 +1022,15 @@ fn default_pty_cols() -> u16 {
 fn default_pty_rows() -> u16 {
     48
 }
+fn default_max_session_entries() -> usize {
+    10_000
+}
+fn default_max_image_bytes() -> usize {
+    10_485_760
+}
+fn default_service_name() -> String {
+    "vouch".into()
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -846,6 +1055,28 @@ impl Default for DefaultsConfig {
             session_ttl_secs: default_session_ttl_secs(),
             max_concurrency: default_max_concurrency(),
             queue_timeout_ms: default_queue_timeout_ms(),
+            max_session_entries: default_max_session_entries(),
+            state_dir: None,
+        }
+    }
+}
+
+impl Default for AttachmentsConfig {
+    fn default() -> Self {
+        Self {
+            fetch_remote_urls: false,
+            max_image_bytes: default_max_image_bytes(),
+            allow_private_ips: false,
+        }
+    }
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            service_name: default_service_name(),
+            otlp_headers: BTreeMap::new(),
         }
     }
 }
@@ -1037,5 +1268,129 @@ response = "y"
             &minimal("resume_args = [\"--resume\", \"foo\"]").replace("stdin = true", ""),
         );
         assert!(err_resume.is_err());
+    }
+
+    #[test]
+    fn parses_v3_defaults_and_overrides() {
+        let base = GatewayConfig::from_toml_str(&minimal("")).expect("valid v2 config");
+        assert_eq!(base.defaults.max_session_entries, 10_000);
+        assert_eq!(base.defaults.state_dir, None);
+        assert_eq!(base.backends[0].read_mode, ReadMode::Chunk);
+        assert!(!base.attachments.fetch_remote_urls);
+        assert_eq!(base.attachments.max_image_bytes, 10_485_760);
+        assert!(!base.attachments.allow_private_ips);
+        assert_eq!(base.telemetry.service_name, "vouch");
+        assert_eq!(base.telemetry.otlp_endpoint, None);
+
+        let override_text = r#"
+[server]
+tcp_listen = "127.0.0.1:0"
+
+[defaults]
+model = "fast-coder"
+max_session_entries = 512
+state_dir = "/tmp/vouch-state"
+
+[attachments]
+fetch_remote_urls = true
+max_image_bytes = 2097152
+allow_private_ips = true
+
+[telemetry]
+otlp_endpoint = "http://127.0.0.1:4318/v1/traces"
+service_name = "vouch-dev"
+otlp_headers = { Authorization = "Bearer otel-secret-123" }
+
+[[backends]]
+id = "mock"
+kind = "cli"
+command = "/bin/echo"
+stdin = true
+read_mode = "line"
+
+[routes]
+"coding/default" = ["mock"]
+
+[aliases]
+"fast-coder" = "coding/default"
+
+[[routing_rules]]
+name = "tools-to-default"
+model_pattern = "fast-*"
+has_tools = true
+min_prompt_tokens = 128
+header_equals = { "x-tier" = "pro" }
+target_route = "coding/default"
+
+[[tokens]]
+token = "vouch-live-secret-token"
+daily_token_budget = 50000
+"#;
+        let custom = GatewayConfig::from_toml_str(override_text).expect("valid v3 config");
+        assert_eq!(custom.default_model(), Some("coding/default"));
+        assert_eq!(custom.defaults.max_session_entries, 512);
+        assert_eq!(
+            custom.defaults.state_dir.as_deref(),
+            Some(Path::new("/tmp/vouch-state"))
+        );
+        assert_eq!(custom.backends[0].read_mode, ReadMode::Line);
+        assert!(custom.attachments.fetch_remote_urls);
+        assert_eq!(custom.attachments.max_image_bytes, 2_097_152);
+        assert!(custom.attachments.allow_private_ips);
+        assert_eq!(custom.telemetry.service_name, "vouch-dev");
+        assert_eq!(custom.routing_rules.len(), 1);
+        assert_eq!(custom.tokens[0].daily_token_budget, Some(50_000));
+        assert!(
+            custom
+                .secrets()
+                .contains(&"Bearer otel-secret-123".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_v3_fields() {
+        let zero_entries = minimal("").replace(
+            "[[backends]]",
+            "[defaults]\nmax_session_entries = 0\n\n[[backends]]",
+        );
+        assert!(
+            GatewayConfig::from_toml_str(&zero_entries)
+                .expect_err("zero max_session_entries")
+                .to_string()
+                .contains("max_session_entries")
+        );
+
+        let zero_budget = minimal("").replace(
+            "[routes]",
+            "[[tokens]]\ntoken = \"vouch-secret-token\"\ndaily_token_budget = 0\n\n[routes]",
+        );
+        assert!(
+            GatewayConfig::from_toml_str(&zero_budget)
+                .expect_err("zero budget")
+                .to_string()
+                .contains("daily_token_budget")
+        );
+
+        let bad_alias = format!(
+            "{}\n[aliases]\n\"coding/default\" = \"coding/default\"\n",
+            minimal("")
+        );
+        assert!(GatewayConfig::from_toml_str(&bad_alias).is_err());
+
+        let unknown_alias_target =
+            format!("{}\n[aliases]\n\"fast\" = \"missing/route\"\n", minimal(""));
+        assert!(GatewayConfig::from_toml_str(&unknown_alias_target).is_err());
+
+        let bad_rule = format!(
+            "{}\n[[routing_rules]]\nmodel_pattern = \"[unclosed\"\ntarget_route = \"coding/default\"\n",
+            minimal("")
+        );
+        assert!(GatewayConfig::from_toml_str(&bad_rule).is_err());
+
+        let bad_otlp = format!(
+            "{}\n[telemetry]\notlp_endpoint = \"ftp://localhost:4318/traces\"\n",
+            minimal("")
+        );
+        assert!(GatewayConfig::from_toml_str(&bad_otlp).is_err());
     }
 }
