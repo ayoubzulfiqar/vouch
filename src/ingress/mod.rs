@@ -9,6 +9,8 @@
 pub mod anthropic;
 pub mod openai;
 pub mod ops;
+pub mod responses;
+pub mod ui;
 
 use std::{
     convert::Infallible,
@@ -37,7 +39,7 @@ use crate::{
     auth::Principal,
     driver::{
         ChatMessage, ChunkStream, Completion, DriverResponse, ExecutionRequest, StreamChunk,
-        WorkspaceMode, collect_stream, render_prompt,
+        ToolCallDelta, WorkspaceMode, collect_stream_full, render_prompt,
     },
     error::{GatewayError, Result},
     metrics,
@@ -69,7 +71,10 @@ pub fn build_router(state: Arc<AppState>) -> AxumRouter {
     let mut router = AxumRouter::new()
         .route("/v1/models", get(openai::models))
         .route("/v1/chat/completions", post(openai::chat_completions))
+        .route("/v1/responses", post(responses::responses))
         .route("/v1/messages", post(anthropic::messages))
+        .route("/mcp", post(crate::cli::mcp::http_mcp))
+        .route("/ui", get(ui::dashboard))
         .route("/healthz", get(ops::healthz))
         .route("/readyz", get(ops::readyz))
         .route("/metrics", get(ops::metrics))
@@ -140,6 +145,8 @@ pub(crate) fn execution_request(
     stream: bool,
     temperature: Option<f64>,
     max_tokens: Option<u32>,
+    tools: Vec<serde_json::Value>,
+    tool_choice: Option<serde_json::Value>,
     extra: serde_json::Map<String, serde_json::Value>,
     cancel: CancellationToken,
 ) -> ExecutionRequest {
@@ -158,6 +165,8 @@ pub(crate) fn execution_request(
         workspace_mode: context.workspace_mode,
         workdir: None,
         cancel,
+        tools,
+        tool_choice,
         extra,
     }
 }
@@ -181,12 +190,20 @@ pub(crate) async fn completion(response: DriverResponse) -> Result<Completion> {
     match response {
         DriverResponse::Complete(completion) => Ok(completion),
         DriverResponse::Stream(stream) => {
-            let (content, finish_reason, usage) = collect_stream(stream, 16 * 1024 * 1024).await?;
+            let collected = collect_stream_full(stream, 16 * 1024 * 1024).await?;
+            let default_reason = if collected.tool_calls.is_empty() {
+                "stop"
+            } else {
+                "tool_calls"
+            };
             Ok(Completion {
-                content,
-                finish_reason: finish_reason.unwrap_or_else(|| "stop".into()),
-                usage: usage.unwrap_or_default(),
+                content: collected.content,
+                finish_reason: collected
+                    .finish_reason
+                    .unwrap_or_else(|| default_reason.into()),
+                usage: collected.usage.unwrap_or_default(),
                 raw: None,
+                tool_calls: collected.tool_calls,
             })
         }
     }
@@ -196,13 +213,31 @@ pub(crate) async fn completion(response: DriverResponse) -> Result<Completion> {
 pub(crate) fn into_chunk_stream(response: DriverResponse) -> ChunkStream {
     match response {
         DriverResponse::Stream(stream) => stream,
-        DriverResponse::Complete(completion) => Box::pin(futures::stream::iter(vec![
-            Ok(StreamChunk::delta(completion.content)),
-            Ok(StreamChunk::finish(
+        DriverResponse::Complete(completion) => {
+            let mut items = Vec::new();
+            if !completion.content.is_empty() {
+                items.push(Ok(StreamChunk::delta(completion.content)));
+            }
+            if !completion.tool_calls.is_empty() {
+                let deltas = completion
+                    .tool_calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, call)| ToolCallDelta {
+                        index,
+                        id: Some(call.id),
+                        name: Some(call.name),
+                        arguments_delta: Some(call.arguments),
+                    })
+                    .collect();
+                items.push(Ok(StreamChunk::tool_calls(deltas)));
+            }
+            items.push(Ok(StreamChunk::finish(
                 completion.finish_reason,
                 Some(completion.usage),
-            )),
-        ])),
+            )));
+            Box::pin(futures::stream::iter(items))
+        }
     }
 }
 
@@ -289,6 +324,8 @@ async fn metrics_middleware(request: Request<Body>, next: Next) -> Response {
         .unwrap_or_else(|| request.uri().path().to_string());
     let protocol = if path == "/v1/messages" {
         "anthropic"
+    } else if path == "/mcp" {
+        "mcp"
     } else if path.starts_with("/v1/") {
         "openai"
     } else {
