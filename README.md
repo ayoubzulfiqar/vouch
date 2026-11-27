@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="public/vouch-wordmark.svg" alt="vouch — Local auth multiplexer &amp; supervised AI gateway" width="640" />
+</p>
+
 # vouch
 
 A local authentication multiplexer and process-supervised gateway for AI orchestrators. Point any OpenAI- or Anthropic-speaking client at `vouch` and it inherits the authenticated CLI sessions and local daemons already present on the host — `hermes`, `opencode`, `claude`, `codex`, or your own commands — instead of asking you to paste raw API keys into another tool.
