@@ -38,8 +38,9 @@ use uuid::Uuid;
 use crate::{
     auth::Principal,
     driver::{
-        ChatMessage, ChunkStream, Completion, DriverResponse, ExecutionRequest, StreamChunk,
-        ToolCallDelta, WorkspaceMode, collect_stream_full, render_prompt,
+        ChatMessage, ChunkStream, Completion, ContentPart, DriverResponse, ExecutionRequest,
+        MessageContent, ResponseFormat, StreamChunk, ThinkingBlock, ToolCallDelta, WorkspaceMode,
+        attachments::parse_data_uri, collect_stream_full, render_prompt,
     },
     error::{GatewayError, Result},
     metrics,
@@ -147,6 +148,7 @@ pub(crate) fn execution_request(
     max_tokens: Option<u32>,
     tools: Vec<serde_json::Value>,
     tool_choice: Option<serde_json::Value>,
+    response_format: Option<ResponseFormat>,
     extra: serde_json::Map<String, serde_json::Value>,
     cancel: CancellationToken,
 ) -> ExecutionRequest {
@@ -167,6 +169,10 @@ pub(crate) fn execution_request(
         cancel,
         tools,
         tool_choice,
+        response_format,
+        backend_session_id: None,
+        delta_messages: None,
+        session_capture: Arc::new(parking_lot::Mutex::new(None)),
         extra,
     }
 }
@@ -204,6 +210,7 @@ pub(crate) async fn completion(response: DriverResponse) -> Result<Completion> {
                 usage: collected.usage.unwrap_or_default(),
                 raw: None,
                 tool_calls: collected.tool_calls,
+                thinking: collected.thinking,
             })
         }
     }
@@ -215,6 +222,23 @@ pub(crate) fn into_chunk_stream(response: DriverResponse) -> ChunkStream {
         DriverResponse::Stream(stream) => stream,
         DriverResponse::Complete(completion) => {
             let mut items = Vec::new();
+            for block in completion.thinking {
+                match block {
+                    ThinkingBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => {
+                        let mut chunk = StreamChunk::thinking(thinking);
+                        chunk.signature_delta = signature;
+                        items.push(Ok(chunk));
+                    }
+                    ThinkingBlock::RedactedThinking { data } => {
+                        let mut chunk = StreamChunk::delta("");
+                        chunk.redacted_thinking = Some(data);
+                        items.push(Ok(chunk));
+                    }
+                }
+            }
             if !completion.content.is_empty() {
                 items.push(Ok(StreamChunk::delta(completion.content)));
             }
@@ -267,12 +291,124 @@ fn is_safe_id(value: &str) -> bool {
 }
 
 /// First user turn, used for prompt-derived affinity.
-pub(crate) fn first_user_text(messages: &[ChatMessage]) -> &str {
+pub(crate) fn first_user_text(messages: &[ChatMessage]) -> String {
     messages
         .iter()
         .find(|message| message.role == "user")
-        .map(|message| message.content.as_str())
-        .unwrap_or("")
+        .map(|message| message.content.as_plain_text())
+        .unwrap_or_default()
+}
+
+/// Parse OpenAI, Anthropic, or Responses JSON `"content"` / item values into
+/// [`MessageContent`], preserving base64/URL images and `cache_control` hints.
+pub(crate) fn parse_json_content(value: &serde_json::Value) -> MessageContent {
+    match value {
+        serde_json::Value::String(text) => MessageContent::Text(text.clone()),
+        serde_json::Value::Array(items) => {
+            let mut parts = Vec::new();
+            for item in items {
+                append_parsed_part(item, &mut parts);
+            }
+            collapse_parts(parts)
+        }
+        serde_json::Value::Object(_) => {
+            let mut parts = Vec::new();
+            append_parsed_part(value, &mut parts);
+            collapse_parts(parts)
+        }
+        serde_json::Value::Null => MessageContent::Text(String::new()),
+        other => MessageContent::Text(other.to_string()),
+    }
+}
+
+fn collapse_parts(parts: Vec<ContentPart>) -> MessageContent {
+    let any_rich = parts.iter().any(|part| match part {
+        ContentPart::Text { cache_control, .. } => cache_control.is_some(),
+        ContentPart::ImageBase64 { .. } | ContentPart::ImageUrl { .. } => true,
+    });
+    if !any_rich {
+        let joined: String = parts
+            .into_iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return MessageContent::Text(joined);
+    }
+    MessageContent::Parts(parts)
+}
+
+fn append_parsed_part(item: &serde_json::Value, parts: &mut Vec<ContentPart>) {
+    if let Some(text) = item.as_str() {
+        parts.push(ContentPart::Text {
+            text: text.to_string(),
+            cache_control: None,
+        });
+        return;
+    }
+    let item_type = item.get("type").and_then(serde_json::Value::as_str);
+    match item_type {
+        Some("image_url" | "input_image") => {
+            let url = item
+                .get("image_url")
+                .and_then(|v| v.as_str().or_else(|| v.get("url").and_then(|u| u.as_str())))
+                .or_else(|| item.get("url").and_then(|u| u.as_str()));
+            if let Some(url) = url {
+                if let Some((media_type, data)) = parse_data_uri(url) {
+                    parts.push(ContentPart::ImageBase64 { media_type, data });
+                } else {
+                    parts.push(ContentPart::ImageUrl {
+                        url: url.to_string(),
+                    });
+                }
+            }
+        }
+        Some("image") => {
+            if let Some(source) = item.get("source") {
+                match source.get("type").and_then(serde_json::Value::as_str) {
+                    Some("base64") => {
+                        if let Some(data) = source.get("data").and_then(serde_json::Value::as_str) {
+                            let media_type = source
+                                .get("media_type")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("image/png")
+                                .to_string();
+                            parts.push(ContentPart::ImageBase64 {
+                                media_type,
+                                data: data.to_string(),
+                            });
+                        }
+                    }
+                    Some("url") => {
+                        if let Some(url) = source.get("url").and_then(serde_json::Value::as_str) {
+                            if let Some((media_type, data)) = parse_data_uri(url) {
+                                parts.push(ContentPart::ImageBase64 { media_type, data });
+                            } else {
+                                parts.push(ContentPart::ImageUrl {
+                                    url: url.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {
+            if let Some(text) = item
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| item.get("content").and_then(serde_json::Value::as_str))
+            {
+                parts.push(ContentPart::Text {
+                    text: text.to_string(),
+                    cache_control: item.get("cache_control").cloned(),
+                });
+            }
+        }
+    }
 }
 
 /// Current Unix timestamp in seconds.
