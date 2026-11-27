@@ -4,12 +4,12 @@ A local authentication multiplexer and process-supervised gateway for AI orchest
 
 `vouch` runs under your host user account, binds only to loopback (and an optional `0600` Unix socket by default), and adds policy in the middle: routing, fallback chains, circuit breakers, sticky sessions, per-token quotas, worktree isolation, redacted logs, and process-group supervision.
 
-- OpenAI-compatible: `GET /v1/models`, `POST /v1/chat/completions` (JSON and SSE), `POST /v1/responses` (JSON and SSE)
-- Anthropic-compatible: `POST /v1/messages` (JSON and SSE)
-- Structured tool calling: `tools` / `tool_calls` / `tool_use` bridged across HTTP, CLI, and PTY backends
-- MCP ingress: `vouch mcp` (`stdio` / HTTP) and `POST /mcp` exposing every route as an MCP tool
-- Operations & UI: `GET /healthz`, `GET /readyz`, `GET /metrics`, `vouch top` TUI, and opt-in `GET /ui` (`server.enable_ui = true`)
-- Egress: pooled HTTP/SSE proxy, headless stdin/stdout subprocess, and PTY subprocess
+- OpenAI-compatible: `GET /v1/models`, `POST /v1/chat/completions` (JSON, SSE, `response_format`), stateful `POST /v1/responses` (`previous_response_id`, `store`, `text.format`)
+- Anthropic-compatible: `POST /v1/messages` (JSON, SSE, extended `thinking`, `cache_control`)
+- Multimodal & tool calling: base64/URL images (`0600` temp attachment lifecycle) and `tools` / `tool_calls` / `tool_use` bridged across HTTP, CLI, and PTY backends
+- Dual-spec MCP ingress: `vouch mcp` (`stdio` / HTTP) and `POST /mcp` (`2024-11-05` + stateless `2026-07-28`, `server/discover`, `tasks/*`)
+- Operations & CLI tooling: `GET /healthz`, `GET /readyz`, `GET /metrics`, `vouch top` TUI, `vouch token create`, `vouch bench`, and opt-in `GET /ui` (`server.enable_ui = true`)
+- Egress: pooled HTTP/SSE proxy, headless stdin/stdout subprocess, and configurable PTY subprocess (`pty_auto_respond`, `idle_timeout_secs`, native session delta resumption)
 - Reload: `SIGHUP` or config-file change atomically swaps configuration without dropping in-flight requests
 
 ---
@@ -33,6 +33,7 @@ A local authentication multiplexer and process-supervised gateway for AI orchest
    - [OpenAI chat completions](#openai-chat-completions)
    - [OpenAI responses](#openai-responses)
    - [Anthropic messages](#anthropic-messages)
+   - [Multimodal content & structured outputs](#multimodal-content--structured-outputs)
    - [Structured tool calling](#structured-tool-calling)
    - [MCP server ingress](#mcp-server-ingress)
    - [Error format](#error-format)
@@ -221,14 +222,21 @@ At least one `[[backends]]` is required and ids must be unique.
 | `api_key_env` | unset | Environment variable holding the upstream bearer key |
 | `extra_headers` | `{}` | Additional upstream headers |
 | `command` | unset | **Required for `cli`/`pty`**, forbidden for `http` |
-| `args` | `[]` | Substitutes `{prompt}`, `{model}`, `{session_id}`, `{request_id}` |
+| `args` | `[]` | Substitutes `{prompt}`, `{model}`, `{session_id}`, `{request_id}`, `{backend_session_id}` |
 | `stdin` | `false` | Pipe the prompt to stdin; required unless `args` contains `{prompt}` |
+| `max_inline_prompt_bytes` | `65536` | When `stdin = false`, prompts larger than this spill to a `0600` temp file (`E2BIG` guard) |
+| `idle_timeout_secs` | unset | Terminate CLI/PTY process group if stdout/stderr stays silent for N seconds |
 | `env` | `{}` | Extra child environment variables |
 | `workdir` | unset | Ignored while workspace isolation is active |
 | `output_mode` | `"text"` | `"text"` (ANSI-stripped), `"json"`, or `"json_lines"` |
 | `pty_send_eof` | `true` | Send EOT after the prompt for PTY readers |
+| `pty_cols` | `160` | PTY column width (`portable-pty`) |
+| `pty_rows` | `48` | PTY row height (`portable-pty`) |
+| `pty_auto_respond` | `[]` | `[{ pattern, response }]` rules to answer interactive PTY prompts automatically |
+| `resume_args` | `[]` | Argument template for continuing native multi-turn CLI/PTY sessions with delta prompts |
+| `session_id_regex` | unset | Regex extracting `{backend_session_id}` from turn-1 stdout/stderr |
 
-CLI/PTY children also receive `VOUCH_REQUEST_ID`, `VOUCH_SESSION_ID`, and `VOUCH_MODEL`.
+CLI/PTY children also receive `VOUCH_REQUEST_ID`, `VOUCH_SESSION_ID`, `VOUCH_MODEL`, and (on resumed turns) `VOUCH_BACKEND_SESSION_ID`.
 
 Prompts are templated as `arg.replace("{prompt}", prompt).replace("{model}", model)...`. For `output_mode = "json"`, stdout must be a JSON object with a `choices[0].message.content` or `content` field; `json_lines` reads newline-delimited objects and concatenates their text.
 
@@ -361,13 +369,13 @@ data: [DONE]
 
 ### OpenAI responses
 
-`POST /v1/responses` accepts `model`, `input` (string or array of message/function-call items), `instructions`, `stream`, `temperature`, `max_output_tokens`, `tools`, and `tool_choice`. At least one non-system item is required.
+`POST /v1/responses` accepts `model`, `input` (string or array of message, `input_image`, `function_call`, and `function_call_output` items), `instructions`, `previous_response_id`, `store` (default `true`; set `false` for Zero Data Retention), `stream`, `temperature`, `max_output_tokens`, `tools`, `tool_choice`, and `text.format`. Unknown or expired `previous_response_id` values return `404`.
 
-Non-streaming returns a `response` object (`status: "completed"`, `output` array containing `output_text` and/or `function_call` items, and `usage` with `input_tokens` / `output_tokens` / `total_tokens`). Streaming (`"stream": true`) emits SSE lifecycle events (`response.created`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`, `response.function_call_arguments.delta`, `response.output_text.done`, `response.completed`).
+Non-streaming returns a `response` object (`status: "completed"`, `store`, `output` array containing `output_text` and/or `function_call` items, and `usage` with `input_tokens` / `output_tokens` / `total_tokens`). Streaming (`"stream": true`) emits SSE lifecycle events (`response.created`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`, `response.function_call_arguments.delta`, `response.output_text.done`, `response.completed`).
 
 ### Anthropic messages
 
-`POST /v1/messages` requires `max_tokens > 0` and at least one message. `system` may be a string or an array of text blocks, and `tools`, `tool_choice`, `tool_use`, and `tool_result` blocks are translated cleanly across drivers.
+`POST /v1/messages` requires `max_tokens > 0` and at least one message. `system` may be a string or an array of text blocks (preserving `cache_control` metadata), and `tools`, `tool_choice`, `tool_use`, `tool_result`, multimodal `image` blocks, and `thinking` (`{"type": "enabled", "budget_tokens": N}`) are supported across drivers.
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/messages \
@@ -375,7 +383,12 @@ curl -s http://127.0.0.1:8080/v1/messages \
   -d '{"model":"coding/default","max_tokens":256,"messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Streaming emits `message_start`, `content_block_start`, `content_block_delta` (`text_delta` or `input_json_delta`), `content_block_stop`, `message_delta`, and `message_stop`. Response headers are the same as for OpenAI (`x-vouch-backend`, `x-vouch-fallback`, `x-vouch-request-id`).
+Streaming emits `message_start`, `content_block_start`, `content_block_delta` (`text_delta`, `thinking_delta`, `signature_delta`, or `input_json_delta`), `content_block_stop`, `message_delta`, and `message_stop`. Non-streaming responses render `thinking`, `redacted_thinking`, `text`, and `tool_use` content blocks. Response headers match OpenAI (`x-vouch-backend`, `x-vouch-fallback`, `x-vouch-request-id`).
+
+### Multimodal content & structured outputs
+
+- **Multimodal inputs:** OpenAI `image_url` (`data:image/...;base64,...` or `http(s)://...`), Responses `input_image`, and Anthropic `image` blocks are normalized into `MessageContent`. HTTP backends receive multimodal arrays intact; CLI/PTY backends extract base64 images to `0600` temp files (`[Attached image file: <path>]`) with automatic cleanup when the execution finishes.
+- **Structured outputs:** OpenAI `response_format` (`json_object` / `json_schema`) and Responses `text.format` forward directly to HTTP upstreams; CLI/PTY backends receive explicit schema instructions, strip accidental Markdown code fences, and validate JSON / schema constraints (`502 upstream_error` if invalid).
 
 ### Structured tool calling
 
@@ -388,11 +401,11 @@ CLI/PTY `usage` counters are computed with `tiktoken-rs` (`cl100k_base` / `o200k
 
 ### MCP server ingress
 
-`vouch` exposes configured routes as MCP (Model Context Protocol, JSON-RPC 2.0) tools over `stdio` or HTTP:
+`vouch` exposes configured routes as MCP (Model Context Protocol, JSON-RPC 2.0) tools over `stdio` or HTTP, supporting both the legacy handshake (`2024-11-05`) and the stateless `2026-07-28` specification:
 
 - `vouch mcp --config vouch.toml` runs over `stdin`/`stdout` (with all logs sent strictly to `stderr` so `stdout` stays pure JSON-RPC).
-- `vouch mcp --config vouch.toml --transport http --bind 127.0.0.1:8081` or `POST /mcp` on the main `vouch serve` daemon exposes the same JSON-RPC handler over HTTP with bearer token enforcement when `[[tokens]]` is configured.
-- Supported methods: `initialize`, `notifications/initialized`, `ping`, `tools/list` (`vouch_ask` plus one `route_<name>` tool per route), and `tools/call` routed through the standard fallback, circuit-breaker, affinity, worktree, and telemetry pipeline.
+- `vouch mcp --config vouch.toml --transport http --bind 127.0.0.1:8081` or `POST /mcp` on the main `vouch serve` daemon exposes the same JSON-RPC handler over HTTP with bearer token enforcement when `[[tokens]]` is configured, validating `Mcp-Method` and `Mcp-Name` headers when present (`-32600` on mismatch).
+- Supported methods: `initialize`, `notifications/initialized`, `server/discover` (`2026-07-28` stateless discovery), `ping`, `tools/list` (`vouch_ask` plus per-route `route_<name>` tools with `ttlMs` / `cacheScope: "private"` metadata), `tools/call`, and async `tasks/create`, `tasks/get`, `tasks/result`, and `tasks/cancel`. W3C Trace Context fields (`_meta.traceparent`, `_meta.tracestate`) propagate into tracing spans.
 
 ### Error format
 
@@ -548,11 +561,11 @@ To let a Docker Compose orchestrator (such as ARTEX, Open WebUI, or LiteLLM) rea
 `GET /healthz` — liveness:
 
 ```json
-{"status":"ok","version":"1.0.0","uptime_secs":42,"models":3,"backends":3,
+{"status":"ok","version":"2.0.0","uptime_secs":42,"models":3,"backends":3,
  "tokens_enforced":true,"workspace_enabled":false}
 ```
 
-`GET /readyz` — `200` when at least one backend circuit is not open, otherwise `503`. Body includes `ready` and per-backend `id`, `kind`, `max_concurrency`, `circuit`, `consecutive_failures`, `open_remaining_secs`.
+`GET /readyz` — `200` when at least one backend circuit is not open, otherwise `503`. Body includes `ready` and per-backend `id`, `kind`, `max_concurrency`, `circuit`, `consecutive_failures`, `open_remaining_secs`, and `auth_expired`.
 
 `GET /metrics` — Prometheus text exposition (`text/plain; version=0.0.4`):
 
@@ -573,7 +586,7 @@ To let a Docker Compose orchestrator (such as ARTEX, Open WebUI, or LiteLLM) rea
 
 `GET /ui` — returns `404` by default. Setting `[server].enable_ui = true` enables a read-only HTML dashboard that polls `/healthz`, `/readyz`, and `/metrics` from the browser with `cache-control: no-store`.
 
-Logs are structured JSON with automatic secret redaction. `RUST_LOG` overrides `server.log_level` (for example `RUST_LOG=vouch=debug`). When running `vouch mcp --transport stdio`, logs go strictly to `stderr` so `stdout` stays pure JSON-RPC.
+Logs are structured JSON with automatic secret redaction (including URL query parameters `?key=`/`?api_key=`/`?token=` and `access_token`/`refresh_token` JSON fields). `RUST_LOG` overrides `server.log_level` (for example `RUST_LOG=vouch=debug`). When running `vouch mcp --transport stdio`, logs go strictly to `stderr` so `stdout` stays pure JSON-RPC.
 
 ## CLI reference
 
@@ -582,8 +595,10 @@ Logs are structured JSON with automatic secret redaction. `RUST_LOG` overrides `
 | `vouch serve` | `-c/--config`, `--tcp-listen`, `--unix-socket` | Run the daemon in the foreground. Handles `SIGHUP` reload; drains on `SIGINT`/`SIGTERM`. |
 | `vouch routes` | `-c/--config`, `--json` | Validate config and print the model → backend fallback table; `--json` prints the raw route map. |
 | `vouch doctor` | `-c/--config`, `--json` | Check configured binaries, auth-file metadata, daemon reachability, and run one live request per backend (`probe_timeout_secs` for CLI/PTY, `5s` for HTTP). Exits `2` when a check fails. |
-| `vouch mcp` | `-c/--config`, `--transport`, `--bind` | Expose routes as MCP JSON-RPC tools over `stdio` or HTTP (`POST /mcp`). |
-| `vouch top` | `--url`, `--unix-socket`, `--interval-ms` | Live terminal UI polling `/healthz`, `/readyz`, and `/metrics`. |
+| `vouch mcp` | `-c/--config`, `--transport`, `--bind` | Expose routes as MCP JSON-RPC tools (`2024-11-05` + `2026-07-28`, async `tasks/*`) over `stdio` or HTTP (`POST /mcp`). |
+| `vouch top` | `--url`, `--unix-socket`, `--interval-ms` | Live terminal UI polling `/healthz`, `/readyz`, and `/metrics` (highlights `AUTH_EXPIRED` backends). |
+| `vouch token create` | `--name`, `--rpm`, `--allow` | Generate a 256-bit `vouch_live_...` virtual token and print a ready-to-paste `[[tokens]]` TOML block. |
+| `vouch bench` | `-c/--config`, `-m/--model`, `-n/--requests`, `--concurrency`, `--prompt`, `--stream`, `--json` | Benchmark configured routes end-to-end for TTFT, p50/p95 latency, throughput, and fallbacks. |
 | `vouch service install` | `-c/--config`, `--binary`, `--no-start` | Write and enable a user systemd unit (Linux) or launchd agent (macOS). |
 | `vouch service uninstall` | `--no-stop` | Stop, disable, and remove the user service. |
 
@@ -626,21 +641,21 @@ cargo check --all-targets --message-format short
 cargo test --test integration_test -- --nocapture
 ```
 
-The integration suite (`tests/integration_test.rs`) is self-contained: it creates mock shell executables and an in-process upstream HTTP server, drives the axum router in-process, and asserts OpenAI Chat Completions & Responses, structured tool calling (`cli` and `http`), MCP JSON-RPC ingress, SSE framing, ANSI stripping, Anthropic events, fallback failover, timeout-triggered `SIGKILL` of an entire process group, `doctor` timeouts, token/RPM enforcement, `/ui` gating, and sticky sessions. No live LLM account or external port is required.
+The integration suite (`tests/integration_test.rs`) is self-contained: it creates mock shell executables and an in-process upstream HTTP server, drives the axum router in-process, and asserts OpenAI Chat Completions & Responses (with `previous_response_id` / ZDR), multimodal images, structured JSON Schema validation, native CLI session delta resumption, structured tool calling (`cli` and `http`), dual-spec MCP `2026-07-28` + async tasks, `PromptSpillFile`, pre-content buffering failover, `auth_expired` / `429 Retry-After`, `idle_timeout_secs` watchdogs, PTY dimensions & auto-respond, Anthropic thinking/caching, `bench`, and sticky sessions. No live LLM account or external port is required.
 
 Module map:
 
 ```
 src/main.rs        CLI, tracing, listeners, signals, graceful shutdown
 src/config.rs      typed TOML schema, validation, ArcSwap snapshots
-src/error.rs       GatewayError -> OpenAI/Anthropic wire errors
+src/error.rs       GatewayError -> OpenAI/Anthropic wire errors + auth/429 classification
 src/usage.rs       tiktoken-rs BPE token counting with char/4 fallback
-src/state.rs       shared AppState
+src/state.rs       shared AppState (sessions, responses, MCP tasks)
 src/auth/          discovery + virtual tokens
-src/router/        routing, affinity, circuit breaker
-src/driver/        trait, HTTP proxy, CLI pipe, PTY, tool bridge, worktree
+src/router/        routing, affinity, native delta sessions, circuit breaker
+src/driver/        trait, HTTP proxy, CLI pipe, PTY, attachments/spill, tool bridge, worktree
 src/ingress/       OpenAI (/v1/chat/completions, /v1/responses), Anthropic, MCP, ops, /ui
-src/cli/           routes, doctor, service, mcp, top
+src/cli/           routes, doctor, service, mcp, top, token, bench
 src/telemetry.rs   JSON tracing + redaction
 src/metrics.rs     Prometheus instruments
 ```
