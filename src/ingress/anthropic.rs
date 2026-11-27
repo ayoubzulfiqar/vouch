@@ -6,7 +6,7 @@
 //! sequence (`message_start`, `content_block_delta`, `message_delta`,
 //! `message_stop`).
 
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     Json,
@@ -21,7 +21,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    driver::{ChatMessage, StreamChunk, content_to_text, truncate},
+    driver::{
+        ChatMessage, StreamChunk, ToolCall, content_to_text, tool_bridge::normalize_tools, truncate,
+    },
     error::{GatewayError, Result},
     ingress::{
         CancelOnDrop, completion, execute, execution_request, first_user_text, into_chunk_stream,
@@ -45,6 +47,10 @@ pub struct AnthropicRequest {
     stream: bool,
     #[serde(default)]
     temperature: Option<f64>,
+    #[serde(default)]
+    tools: Vec<Value>,
+    #[serde(default)]
+    tool_choice: Option<Value>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
@@ -107,6 +113,7 @@ async fn messages_inner(
         system.as_deref(),
         &first_user,
     )?;
+    let tools = normalize_tools(payload.tools);
     let cancel = CancellationToken::new();
     let request = execution_request(
         &context,
@@ -115,6 +122,8 @@ async fn messages_inner(
         payload.stream,
         payload.temperature,
         Some(max_tokens),
+        tools,
+        payload.tool_choice,
         payload.extra,
         cancel.clone(),
     );
@@ -151,15 +160,15 @@ async fn messages_inner(
             yield Ok::<Event, Infallible>(
                 Event::default().event("message_start").data(start.to_string())
             );
-            let block_start = json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""},
-            });
-            yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(stream_timeout);
             let mut timed_out = false;
+            let mut next_block_index: usize = 0;
+            let mut open_text_index: Option<usize> = None;
+            let mut tool_blocks: BTreeMap<usize, usize> = BTreeMap::new();
+            let mut emitted_any_block = false;
+            let mut saw_tool_calls = false;
+
             loop {
                 let item = tokio::select! {
                     _ = tokio::time::sleep_until(deadline) => {
@@ -182,26 +191,114 @@ async fn messages_inner(
                 }
                 match item {
                     Some(Ok(chunk)) => {
-                        let StreamChunk { delta, finish_reason, usage } = chunk;
+                        let StreamChunk { delta, tool_calls, finish_reason, usage } = chunk;
                         if !delta.is_empty() {
+                            let idx = match open_text_index {
+                                Some(idx) => idx,
+                                None => {
+                                    let idx = next_block_index;
+                                    next_block_index += 1;
+                                    open_text_index = Some(idx);
+                                    emitted_any_block = true;
+                                    let block_start = json!({
+                                        "type": "content_block_start",
+                                        "index": idx,
+                                        "content_block": {"type": "text", "text": ""},
+                                    });
+                                    yield Ok(Event::default()
+                                        .event("content_block_start")
+                                        .data(block_start.to_string()));
+                                    idx
+                                }
+                            };
                             let payload = json!({
                                 "type": "content_block_delta",
-                                "index": 0,
+                                "index": idx,
                                 "delta": {"type": "text_delta", "text": delta},
                             });
                             yield Ok(Event::default()
                                 .event("content_block_delta")
                                 .data(payload.to_string()));
                         }
+                        if !tool_calls.is_empty() {
+                            saw_tool_calls = true;
+                            if let Some(idx) = open_text_index.take() {
+                                yield Ok(Event::default()
+                                    .event("content_block_stop")
+                                    .data(json!({"type": "content_block_stop", "index": idx}).to_string()));
+                            }
+                            for tc in tool_calls {
+                                let idx = match tool_blocks.get(&tc.index).copied() {
+                                    Some(idx) => idx,
+                                    None => {
+                                        let idx = next_block_index;
+                                        next_block_index += 1;
+                                        tool_blocks.insert(tc.index, idx);
+                                        emitted_any_block = true;
+                                        let id = tc.id.unwrap_or_else(|| format!("toolu_{}", Uuid::new_v4().simple()));
+                                        let name = tc.name.unwrap_or_else(|| "tool".into());
+                                        let block_start = json!({
+                                            "type": "content_block_start",
+                                            "index": idx,
+                                            "content_block": {
+                                                "type": "tool_use",
+                                                "id": id,
+                                                "name": name,
+                                                "input": {},
+                                            },
+                                        });
+                                        yield Ok(Event::default()
+                                            .event("content_block_start")
+                                            .data(block_start.to_string()));
+                                        idx
+                                    }
+                                };
+                                if let Some(partial) = tc.arguments_delta
+                                    && !partial.is_empty()
+                                {
+                                    let payload = json!({
+                                        "type": "content_block_delta",
+                                        "index": idx,
+                                        "delta": {
+                                            "type": "input_json_delta",
+                                            "partial_json": partial,
+                                        },
+                                    });
+                                    yield Ok(Event::default()
+                                        .event("content_block_delta")
+                                        .data(payload.to_string()));
+                                }
+                            }
+                        }
                         if let Some(reason) = finish_reason {
-                            yield Ok(Event::default()
-                                .event("content_block_stop")
-                                .data(json!({"type": "content_block_stop", "index": 0}).to_string()));
+                            if let Some(idx) = open_text_index.take() {
+                                yield Ok(Event::default()
+                                    .event("content_block_stop")
+                                    .data(json!({"type": "content_block_stop", "index": idx}).to_string()));
+                            }
+                            for idx in tool_blocks.values() {
+                                yield Ok(Event::default()
+                                    .event("content_block_stop")
+                                    .data(json!({"type": "content_block_stop", "index": idx}).to_string()));
+                            }
+                            if !emitted_any_block {
+                                yield Ok(Event::default().event("content_block_start").data(
+                                    json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}).to_string()
+                                ));
+                                yield Ok(Event::default()
+                                    .event("content_block_stop")
+                                    .data(json!({"type": "content_block_stop", "index": 0}).to_string()));
+                            }
                             let output_tokens = usage.map(|usage| usage.completion_tokens).unwrap_or(0);
+                            let effective_reason = if saw_tool_calls && reason == "stop" {
+                                "tool_use"
+                            } else {
+                                anthropic_stop_reason(&reason)
+                            };
                             let delta = json!({
                                 "type": "message_delta",
                                 "delta": {
-                                    "stop_reason": anthropic_stop_reason(&reason),
+                                    "stop_reason": effective_reason,
                                     "stop_sequence": null,
                                 },
                                 "usage": {"output_tokens": output_tokens},
@@ -222,12 +319,28 @@ async fn messages_inner(
                         break;
                     }
                     None => {
-                        yield Ok(Event::default()
-                            .event("content_block_stop")
-                            .data(json!({"type": "content_block_stop", "index": 0}).to_string()));
+                        if let Some(idx) = open_text_index.take() {
+                            yield Ok(Event::default()
+                                .event("content_block_stop")
+                                .data(json!({"type": "content_block_stop", "index": idx}).to_string()));
+                        }
+                        for idx in tool_blocks.values() {
+                            yield Ok(Event::default()
+                                .event("content_block_stop")
+                                .data(json!({"type": "content_block_stop", "index": idx}).to_string()));
+                        }
+                        if !emitted_any_block {
+                            yield Ok(Event::default().event("content_block_start").data(
+                                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}).to_string()
+                            ));
+                            yield Ok(Event::default()
+                                .event("content_block_stop")
+                                .data(json!({"type": "content_block_stop", "index": 0}).to_string()));
+                        }
+                        let stop_reason = if saw_tool_calls { "tool_use" } else { "end_turn" };
                         let delta = json!({
                             "type": "message_delta",
-                            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                            "delta": {"stop_reason": stop_reason, "stop_sequence": null},
                             "usage": {"output_tokens": 0},
                         });
                         yield Ok(Event::default().event("message_delta").data(delta.to_string()));
@@ -252,13 +365,31 @@ async fn messages_inner(
     }
 
     let completion = completion(driver_response).await?;
+    let mut content_blocks = Vec::new();
+    if !completion.content.is_empty() || completion.tool_calls.is_empty() {
+        content_blocks.push(json!({"type": "text", "text": completion.content}));
+    }
+    for call in &completion.tool_calls {
+        let input: Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
+        content_blocks.push(json!({
+            "type": "tool_use",
+            "id": call.id,
+            "name": call.name,
+            "input": input,
+        }));
+    }
+    let stop_reason = if !completion.tool_calls.is_empty() && completion.finish_reason == "stop" {
+        "tool_use"
+    } else {
+        anthropic_stop_reason(&completion.finish_reason)
+    };
     let body = json!({
         "id": message_id,
         "type": "message",
         "role": "assistant",
         "model": context.model,
-        "content": [{"type": "text", "text": completion.content}],
-        "stop_reason": anthropic_stop_reason(&completion.finish_reason),
+        "content": content_blocks,
+        "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
             "input_tokens": completion.usage.prompt_tokens,
@@ -291,6 +422,73 @@ fn normalize_messages(
     for message in raw {
         let role = message.role.trim();
         let role = if role.is_empty() { "user" } else { role };
+        if let Some(Value::Array(parts)) = &message.content
+            && parts.iter().any(|part| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("tool_use" | "tool_result")
+                )
+            })
+        {
+            let mut text_parts = Vec::new();
+            let mut tool_calls = Vec::new();
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("tool_use") => {
+                        if let Some(name) = part.get("name").and_then(Value::as_str) {
+                            let id = part
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| format!("toolu_{}", Uuid::new_v4().simple()));
+                            let arguments = part
+                                .get("input")
+                                .map(Value::to_string)
+                                .unwrap_or_else(|| "{}".to_string());
+                            tool_calls.push(ToolCall {
+                                id,
+                                name: name.to_string(),
+                                arguments,
+                            });
+                        }
+                    }
+                    Some("tool_result") => {
+                        let call_id = part
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string);
+                        let result_text = part
+                            .get("content")
+                            .and_then(content_to_text)
+                            .unwrap_or_default();
+                        messages.push(ChatMessage {
+                            role: "tool".to_string(),
+                            content: result_text,
+                            tool_calls: Vec::new(),
+                            tool_call_id: call_id,
+                            name: None,
+                        });
+                    }
+                    _ => {
+                        if let Some(text) = content_to_text(part)
+                            && !text.trim().is_empty()
+                        {
+                            text_parts.push(text);
+                        }
+                    }
+                }
+            }
+            if !text_parts.is_empty() || !tool_calls.is_empty() {
+                messages.push(ChatMessage {
+                    role: role.to_string(),
+                    content: text_parts.join("\n"),
+                    tool_calls,
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
+            continue;
+        }
         let content = message
             .content
             .as_ref()
@@ -301,10 +499,7 @@ fn normalize_messages(
                 system_parts.push(content);
             }
         } else {
-            messages.push(ChatMessage {
-                role: role.to_string(),
-                content,
-            });
+            messages.push(ChatMessage::text(role, content));
         }
     }
     let system = if system_parts.is_empty() {
