@@ -118,12 +118,31 @@ pub fn record_circuit_transition(backend: &str, state: &str) {
     .increment(1);
 }
 
-/// Count a fallback from one backend to the next.
+/// Record a fallback from one backend to the next.
 pub fn record_fallback(from: &str, to: &str) {
     metrics::counter!(
         "vouch_fallbacks_total",
         "from" => from.to_string(),
         "to" => to.to_string(),
+    )
+    .increment(1);
+}
+
+/// Record a speculative hedged race win where `winner` beat `loser`.
+pub fn record_hedged_win(winner: &str, loser: &str) {
+    metrics::counter!(
+        "vouch_hedged_wins_total",
+        "winner" => winner.to_string(),
+        "loser" => loser.to_string(),
+    )
+    .increment(1);
+}
+
+/// Record a deterministic response cache lookup (`hit`, `miss`, or `bypass`).
+pub fn record_cache_request(outcome: &str) {
+    metrics::counter!(
+        "vouch_cache_requests_total",
+        "outcome" => outcome.to_string(),
     )
     .increment(1);
 }
