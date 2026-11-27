@@ -44,12 +44,27 @@ pub struct GatewayConfig {
     /// Public model name to ordered backend-id fallback chain.
     #[serde(default)]
     pub routes: BTreeMap<String, Vec<String>>,
+    /// Per-route scheduling strategy (`ordered`, `least_latency`, `hedged`).
+    #[serde(default)]
+    pub route_policies: BTreeMap<String, RoutePolicyConfig>,
     /// Public model aliases pointing to canonical `[routes]` entries.
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
     /// Trait-based routing rules evaluated before static `[routes]`/`[aliases]`.
     #[serde(default)]
     pub routing_rules: Vec<RoutingRuleConfig>,
+    /// Deterministic response cache (`[cache]`).
+    #[serde(default)]
+    pub cache: CacheConfig,
+    /// Per-route or per-backend token pricing (`[pricing.<id>]`).
+    #[serde(default)]
+    pub pricing: BTreeMap<String, PricingConfig>,
+    /// Configurable prompt templates exposed via MCP `prompts/list` & `prompts/get`.
+    #[serde(default)]
+    pub mcp_prompts: Vec<McpPromptConfig>,
+    /// External stdio/HTTP MCP servers aggregated under `<id>__<tool>`.
+    #[serde(default)]
+    pub mcp_upstreams: Vec<McpUpstreamConfig>,
     /// Remote multimodal image attachment fetching & size limits.
     #[serde(default)]
     pub attachments: AttachmentsConfig,
@@ -92,6 +107,9 @@ pub struct ServerConfig {
     /// Serve the embedded read-only operational dashboard at `GET /ui`. Defaults to `false`.
     #[serde(default)]
     pub enable_ui: bool,
+    /// Enable runtime administrative control endpoints (`/admin/*`). Defaults to `false`.
+    #[serde(default)]
+    pub enable_admin: bool,
 }
 
 /// Defaults applied when a backend or request omits a value.
@@ -117,6 +135,136 @@ pub struct DefaultsConfig {
     /// daily token budgets, and usage analytics across daemon restarts.
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
+    /// Automatic corrective schema repair attempts (`0..=2`) on non-streaming
+    /// `cli`/`pty` `response_format` JSON Schema failures. Default: `0`.
+    #[serde(default)]
+    pub schema_repair_retries: u8,
+}
+
+/// Candidate scheduling strategy under `[route_policies.<model>]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteStrategy {
+    /// Walk the configured chain in static order (after sticky affinity).
+    #[default]
+    Ordered,
+    /// Dynamically prefer the candidate with the lowest EWMA Time-To-First-Token.
+    LeastLatency,
+    /// Speculatively launch candidate #2 if candidate #1 misses `hedge_delay_ms`.
+    Hedged,
+}
+
+/// Optional route scheduling policy (`[route_policies.<model>]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutePolicyConfig {
+    /// Candidate selection / speculative racing strategy.
+    #[serde(default)]
+    pub strategy: RouteStrategy,
+    /// Delay before dispatching the hedged backup candidate when `strategy = "hedged"`.
+    #[serde(default = "default_hedge_delay_ms")]
+    pub hedge_delay_ms: u64,
+}
+
+/// Deterministic response cache (`[cache]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Enable SHA-256 deterministic response caching. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum number of cached completions before oldest-entry eviction. Default: `1000`.
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+    /// Cache entry time-to-live in seconds. Default: `3600`.
+    #[serde(default = "default_cache_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Requests above this sampling temperature bypass the cache. Default: `0.2`.
+    #[serde(default = "default_cache_max_temperature")]
+    pub max_temperature: f64,
+    /// Persist cache entries into `defaults.state_dir` when set. Default: `false`.
+    #[serde(default)]
+    pub persist: bool,
+}
+
+/// USD pricing per million tokens for `[pricing.<route_or_backend>]`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PricingConfig {
+    /// Input cost in USD per 1,000,000 prompt tokens.
+    #[serde(default)]
+    pub input_per_1m_usd: f64,
+    /// Output cost in USD per 1,000,000 completion tokens.
+    #[serde(default)]
+    pub output_per_1m_usd: f64,
+}
+
+/// Configurable prompt argument under `[[mcp_prompts]]`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpPromptArgument {
+    /// Argument placeholder key (substituted as `{{name}}`).
+    pub name: String,
+    /// Human-readable description surfaced via `prompts/list`.
+    #[serde(default)]
+    pub description: String,
+    /// Whether callers must supply this argument to `prompts/get`.
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// Prompt template exposed via MCP `prompts/list` and `prompts/get`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpPromptConfig {
+    /// Unique prompt identifier.
+    pub name: String,
+    /// Short prompt summary.
+    #[serde(default)]
+    pub description: String,
+    /// Template body supporting `{{argument_name}}` placeholders.
+    pub template: String,
+    /// Declared template arguments.
+    #[serde(default)]
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+/// Transport protocol for an aggregated upstream MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpUpstreamTransport {
+    /// JSON-RPC 2.0 over child stdin/stdout lines.
+    Stdio,
+    /// JSON-RPC 2.0 over HTTP `POST`.
+    Http,
+}
+
+/// External MCP server aggregated under `<id>__<tool>` (`[[mcp_upstreams]]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpUpstreamConfig {
+    /// Unique namespace prefix (`<id>__<tool>`).
+    pub id: String,
+    /// Transport (`stdio` or `http`).
+    pub transport: McpUpstreamTransport,
+    /// Command to spawn when `transport = "stdio"`.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Arguments passed to `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment injected into the child MCP process.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// HTTP JSON-RPC endpoint URL when `transport = "http"`.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Extra headers attached to upstream HTTP MCP requests.
+    #[serde(default)]
+    pub extra_headers: BTreeMap<String, String>,
+    /// Call timeout in seconds. Default: `30`.
+    #[serde(default = "default_mcp_upstream_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 /// Remote image attachment fetching and size controls.
@@ -332,6 +480,23 @@ pub struct BackendConfig {
     /// during turn 1 (prefers capture group 1 if present, otherwise full match).
     #[serde(default)]
     pub session_id_regex: Option<String>,
+    /// Optional per-profile credential/environment rotation pool for `cli`/`pty` backends.
+    #[serde(default)]
+    pub profiles: Vec<BackendProfileConfig>,
+}
+
+/// One credential profile in a `cli` or `pty` backend rotation pool.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendProfileConfig {
+    /// Profile identifier unique within its parent backend.
+    pub id: String,
+    /// Environment variables overlaid when this profile is selected (e.g. `HOME`).
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Selection weight for weighted round-robin rotation. Default: `1`.
+    #[serde(default = "default_profile_weight")]
+    pub weight: u32,
 }
 
 /// Interactive prompt auto-response rule for PTY backends.
@@ -406,9 +571,24 @@ pub struct TokenConfig {
     /// Optional rolling UTC day prompt + completion BPE token limit.
     #[serde(default)]
     pub daily_token_budget: Option<u64>,
+    /// Optional sliding 60-second BPE token limit (TPM).
+    #[serde(default)]
+    pub tpm: Option<u64>,
+    /// Optional maximum concurrent active requests for this token.
+    #[serde(default)]
+    pub max_concurrent: Option<usize>,
+    /// Optional RFC-3339 expiration timestamp (`YYYY-MM-DDTHH:MM:SSZ`).
+    #[serde(default)]
+    pub expires_at: Option<String>,
     /// Glob patterns of models this token may call. Empty means all.
     #[serde(default)]
     pub allowed_models: Vec<String>,
+    /// Optional backend id/glob restriction; `None` permits all backends.
+    #[serde(default)]
+    pub allowed_backends: Option<Vec<String>>,
+    /// Grant administrative control access (`/admin/*`). Defaults to `false`.
+    #[serde(default)]
+    pub admin: bool,
 }
 
 /// Compiled model allowlist.
@@ -500,6 +680,26 @@ impl GatewayConfig {
         if self.defaults.max_session_entries == 0 {
             return Err(GatewayError::Config(
                 "defaults.max_session_entries must be greater than zero".into(),
+            ));
+        }
+        if self.defaults.schema_repair_retries > 2 {
+            return Err(GatewayError::Config(
+                "defaults.schema_repair_retries must be at most 2".into(),
+            ));
+        }
+        if self.cache.max_entries == 0 {
+            return Err(GatewayError::Config(
+                "cache.max_entries must be greater than zero".into(),
+            ));
+        }
+        if self.cache.ttl_secs == 0 {
+            return Err(GatewayError::Config(
+                "cache.ttl_secs must be greater than zero".into(),
+            ));
+        }
+        if !self.cache.max_temperature.is_finite() || self.cache.max_temperature < 0.0 {
+            return Err(GatewayError::Config(
+                "cache.max_temperature must be a finite number >= 0.0".into(),
             ));
         }
         if self.attachments.max_image_bytes == 0 {
@@ -636,6 +836,141 @@ impl GatewayConfig {
             ));
         }
 
+        for (model, policy) in &self.route_policies {
+            if !self.routes.contains_key(model) {
+                return Err(GatewayError::Config(format!(
+                    "route_policies.{model:?} does not reference a configured [routes] key"
+                )));
+            }
+            if policy.hedge_delay_ms == 0 {
+                return Err(GatewayError::Config(format!(
+                    "route_policies.{model:?}.hedge_delay_ms must be greater than zero"
+                )));
+            }
+        }
+
+        for (target, pricing) in &self.pricing {
+            if target.trim().is_empty() {
+                return Err(GatewayError::Config(
+                    "pricing keys must not be empty".into(),
+                ));
+            }
+            if !pricing.input_per_1m_usd.is_finite()
+                || pricing.input_per_1m_usd < 0.0
+                || !pricing.output_per_1m_usd.is_finite()
+                || pricing.output_per_1m_usd < 0.0
+            {
+                return Err(GatewayError::Config(format!(
+                    "pricing.{target:?} rates must be finite non-negative USD values"
+                )));
+            }
+        }
+
+        let mut prompt_names = HashSet::new();
+        for prompt in &self.mcp_prompts {
+            if prompt.name.trim().is_empty() {
+                return Err(GatewayError::Config(
+                    "mcp_prompts.name must not be empty".into(),
+                ));
+            }
+            if !prompt_names.insert(prompt.name.clone()) {
+                return Err(GatewayError::Config(format!(
+                    "duplicate mcp_prompts.name {:?}",
+                    prompt.name
+                )));
+            }
+            let mut arg_names = HashSet::new();
+            for arg in &prompt.arguments {
+                if arg.name.trim().is_empty() || !arg_names.insert(arg.name.clone()) {
+                    return Err(GatewayError::Config(format!(
+                        "mcp_prompts {:?} has invalid or duplicate argument name {:?}",
+                        prompt.name, arg.name
+                    )));
+                }
+            }
+        }
+
+        let mut upstream_ids = HashSet::new();
+        for upstream in &self.mcp_upstreams {
+            if upstream.id.trim().is_empty() || upstream.id.contains("__") {
+                return Err(GatewayError::Config(format!(
+                    "mcp_upstreams.id {:?} must be non-empty and must not contain '__'",
+                    upstream.id
+                )));
+            }
+            if !upstream_ids.insert(upstream.id.clone()) {
+                return Err(GatewayError::Config(format!(
+                    "duplicate mcp_upstreams.id {:?}",
+                    upstream.id
+                )));
+            }
+            if upstream.timeout_secs == 0 {
+                return Err(GatewayError::Config(format!(
+                    "mcp_upstreams {:?}: timeout_secs must be greater than zero",
+                    upstream.id
+                )));
+            }
+            match upstream.transport {
+                McpUpstreamTransport::Stdio => {
+                    if upstream
+                        .command
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .is_empty()
+                    {
+                        return Err(GatewayError::Config(format!(
+                            "mcp_upstreams {:?}: stdio transport requires command",
+                            upstream.id
+                        )));
+                    }
+                    if upstream.base_url.is_some() {
+                        return Err(GatewayError::Config(format!(
+                            "mcp_upstreams {:?}: stdio transport forbids base_url",
+                            upstream.id
+                        )));
+                    }
+                }
+                McpUpstreamTransport::Http => {
+                    let url = upstream.base_url.as_deref().ok_or_else(|| {
+                        GatewayError::Config(format!(
+                            "mcp_upstreams {:?}: http transport requires base_url",
+                            upstream.id
+                        ))
+                    })?;
+                    let parsed = reqwest::Url::parse(url).map_err(|error| {
+                        GatewayError::Config(format!(
+                            "mcp_upstreams {:?}: invalid base_url {url:?}: {error}",
+                            upstream.id
+                        ))
+                    })?;
+                    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                        return Err(GatewayError::Config(format!(
+                            "mcp_upstreams {:?}: base_url must use http:// or https://",
+                            upstream.id
+                        )));
+                    }
+                    if upstream.command.is_some() {
+                        return Err(GatewayError::Config(format!(
+                            "mcp_upstreams {:?}: http transport forbids command",
+                            upstream.id
+                        )));
+                    }
+                    for header_name in upstream.extra_headers.keys() {
+                        if header_name.trim().is_empty()
+                            || axum::http::header::HeaderName::from_bytes(header_name.as_bytes())
+                                .is_err()
+                        {
+                            return Err(GatewayError::Config(format!(
+                                "mcp_upstreams {:?}: invalid header name {header_name:?}",
+                                upstream.id
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
         let mut tokens = HashSet::new();
         for token in &self.tokens {
             if token.token.len() < 8 {
@@ -655,6 +990,22 @@ impl GatewayConfig {
                 return Err(GatewayError::Config(
                     "token daily_token_budget must be greater than zero when set".into(),
                 ));
+            }
+            if token.tpm == Some(0) {
+                return Err(GatewayError::Config(
+                    "token tpm must be greater than zero when set".into(),
+                ));
+            }
+            if token.max_concurrent == Some(0) {
+                return Err(GatewayError::Config(
+                    "token max_concurrent must be greater than zero when set".into(),
+                ));
+            }
+            if let Some(exp) = &token.expires_at {
+                parse_rfc3339_unix_secs(exp)?;
+            }
+            if let Some(allowed_backends) = &token.allowed_backends {
+                ModelAllowlist::compile(allowed_backends)?;
             }
             ModelAllowlist::compile(&token.allowed_models)?;
         }
@@ -726,25 +1077,15 @@ impl GatewayConfig {
         }
         for backend in &self.backends {
             for (key, value) in &backend.env {
-                let key = key.to_ascii_uppercase();
-                let looks_secret = key.contains("KEY")
-                    || key.contains("TOKEN")
-                    || key.contains("SECRET")
-                    || key.contains("PASSWORD")
-                    || key.contains("AUTH");
-                if looks_secret || looks_like_secret(value) {
-                    secrets.push(value.clone());
+                collect_secret_kv(&mut secrets, key, value);
+            }
+            for profile in &backend.profiles {
+                for (key, value) in &profile.env {
+                    collect_secret_kv(&mut secrets, key, value);
                 }
             }
             for (key, value) in &backend.extra_headers {
-                let key = key.to_ascii_lowercase();
-                if key.contains("authorization")
-                    || key.contains("api-key")
-                    || key.contains("token")
-                    || looks_like_secret(value)
-                {
-                    secrets.push(value.clone());
-                }
+                collect_header_secret(&mut secrets, key, value);
             }
             if let Some(env) = &backend.api_key_env
                 && let Ok(value) = std::env::var(env)
@@ -753,21 +1094,159 @@ impl GatewayConfig {
                 secrets.push(value);
             }
         }
-        for (key, value) in &self.telemetry.otlp_headers {
-            let key = key.to_ascii_lowercase();
-            if key.contains("authorization")
-                || key.contains("api-key")
-                || key.contains("token")
-                || key.contains("secret")
-                || looks_like_secret(value)
-            {
-                secrets.push(value.clone());
+        for upstream in &self.mcp_upstreams {
+            for (key, value) in &upstream.env {
+                collect_secret_kv(&mut secrets, key, value);
             }
+            for (key, value) in &upstream.extra_headers {
+                collect_header_secret(&mut secrets, key, value);
+            }
+        }
+        for (key, value) in &self.telemetry.otlp_headers {
+            collect_header_secret(&mut secrets, key, value);
         }
         secrets.sort();
         secrets.dedup();
         secrets
     }
+}
+
+fn collect_secret_kv(secrets: &mut Vec<String>, key: &str, value: &str) {
+    let key = key.to_ascii_uppercase();
+    let looks_secret = key.contains("KEY")
+        || key.contains("TOKEN")
+        || key.contains("SECRET")
+        || key.contains("PASSWORD")
+        || key.contains("AUTH");
+    if looks_secret || looks_like_secret(value) {
+        secrets.push(value.to_string());
+    }
+}
+
+fn collect_header_secret(secrets: &mut Vec<String>, key: &str, value: &str) {
+    let key = key.to_ascii_lowercase();
+    if key.contains("authorization")
+        || key.contains("api-key")
+        || key.contains("token")
+        || key.contains("secret")
+        || looks_like_secret(value)
+    {
+        secrets.push(value.to_string());
+    }
+}
+
+/// Parse an RFC-3339 timestamp string (`YYYY-MM-DDTHH:MM:SSZ` or with offset) into UNIX seconds.
+pub fn parse_rfc3339_unix_secs(raw: &str) -> Result<u64> {
+    let s = raw.trim();
+    let sep_idx = s.find(['T', 't']).ok_or_else(|| {
+        GatewayError::Config(format!("invalid RFC-3339 timestamp {raw:?}: missing 'T'"))
+    })?;
+    let (date_str, time_and_tz) = s.split_at(sep_idx);
+    let time_and_tz = &time_and_tz[1..];
+    let mut date_parts = date_str.split('-');
+    let year: i64 = date_parts
+        .next()
+        .and_then(|v| if v.len() == 4 { v.parse().ok() } else { None })
+        .ok_or_else(|| GatewayError::Config(format!("invalid RFC-3339 date in {raw:?}")))?;
+    let month: u32 = date_parts
+        .next()
+        .and_then(|v| if v.len() == 2 { v.parse().ok() } else { None })
+        .ok_or_else(|| GatewayError::Config(format!("invalid RFC-3339 month in {raw:?}")))?;
+    let day: u32 = date_parts
+        .next()
+        .and_then(|v| if v.len() == 2 { v.parse().ok() } else { None })
+        .ok_or_else(|| GatewayError::Config(format!("invalid RFC-3339 day in {raw:?}")))?;
+    if date_parts.next().is_some() || !(1..=12).contains(&month) {
+        return Err(GatewayError::Config(format!(
+            "invalid RFC-3339 date in {raw:?}"
+        )));
+    }
+    let max_day = days_in_month(year, month);
+    if !(1..=max_day).contains(&day) {
+        return Err(GatewayError::Config(format!(
+            "invalid RFC-3339 calendar day in {raw:?}"
+        )));
+    }
+
+    let (time_str, tz_offset_secs): (&str, i64) = if let Some(bare) = time_and_tz
+        .strip_suffix('Z')
+        .or_else(|| time_and_tz.strip_suffix('z'))
+    {
+        (bare, 0)
+    } else if let Some(idx) = time_and_tz.rfind(['+', '-']) {
+        let (t, off) = time_and_tz.split_at(idx);
+        let sign = if off.starts_with('-') { -1i64 } else { 1i64 };
+        let hm = &off[1..];
+        let (oh_s, om_s) = hm
+            .split_once(':')
+            .ok_or_else(|| GatewayError::Config(format!("invalid RFC-3339 offset in {raw:?}")))?;
+        let oh: i64 = oh_s
+            .parse()
+            .map_err(|_| GatewayError::Config(format!("invalid RFC-3339 offset in {raw:?}")))?;
+        let om: i64 = om_s
+            .parse()
+            .map_err(|_| GatewayError::Config(format!("invalid RFC-3339 offset in {raw:?}")))?;
+        if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+            return Err(GatewayError::Config(format!(
+                "RFC-3339 offset out of range in {raw:?}"
+            )));
+        }
+        (t, sign * (oh * 3600 + om * 60))
+    } else {
+        return Err(GatewayError::Config(format!(
+            "invalid RFC-3339 timezone in {raw:?}"
+        )));
+    };
+
+    let main_time = time_str.split('.').next().unwrap_or(time_str);
+    let mut tp = main_time.split(':');
+    let hour: u64 = tp
+        .next()
+        .and_then(|v| if v.len() == 2 { v.parse().ok() } else { None })
+        .ok_or_else(|| GatewayError::Config(format!("invalid RFC-3339 hour in {raw:?}")))?;
+    let min: u64 = tp
+        .next()
+        .and_then(|v| if v.len() == 2 { v.parse().ok() } else { None })
+        .ok_or_else(|| GatewayError::Config(format!("invalid RFC-3339 minute in {raw:?}")))?;
+    let sec: u64 = tp
+        .next()
+        .and_then(|v| if v.len() == 2 { v.parse().ok() } else { None })
+        .ok_or_else(|| GatewayError::Config(format!("invalid RFC-3339 second in {raw:?}")))?;
+    if tp.next().is_some() || hour > 23 || min > 59 || sec > 60 {
+        return Err(GatewayError::Config(format!(
+            "invalid RFC-3339 time in {raw:?}"
+        )));
+    }
+
+    let days = days_from_civil(year, month, day);
+    let local_secs = days * 86_400 + (hour as i64) * 3600 + (min as i64) * 60 + (sec as i64);
+    let utc_secs = local_secs - tz_offset_secs;
+    u64::try_from(utc_secs).map_err(|_| {
+        GatewayError::Config(format!("RFC-3339 timestamp {raw:?} predates UNIX epoch"))
+    })
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let m = i64::from(month);
+    let d = i64::from(day);
+    let y = year - if m <= 2 { 1 } else { 0 };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 impl BackendConfig {
@@ -832,6 +1311,35 @@ impl BackendConfig {
                     self.id
                 ))
             })?;
+        }
+        if !self.profiles.is_empty() {
+            if self.kind == BackendKind::Http {
+                return Err(GatewayError::Config(format!(
+                    "backend {:?}: credential profiles are only supported on cli and pty backends",
+                    self.id
+                )));
+            }
+            let mut profile_ids = HashSet::new();
+            for profile in &self.profiles {
+                if profile.id.trim().is_empty() {
+                    return Err(GatewayError::Config(format!(
+                        "backend {:?}: profile id must not be empty",
+                        self.id
+                    )));
+                }
+                if !profile_ids.insert(profile.id.clone()) {
+                    return Err(GatewayError::Config(format!(
+                        "backend {:?}: duplicate profile id {:?}",
+                        self.id, profile.id
+                    )));
+                }
+                if profile.weight == 0 {
+                    return Err(GatewayError::Config(format!(
+                        "backend {:?} profile {:?}: weight must be greater than zero",
+                        self.id, profile.id
+                    )));
+                }
+            }
         }
 
         match self.kind {
@@ -1031,6 +1539,24 @@ fn default_max_image_bytes() -> usize {
 fn default_service_name() -> String {
     "vouch".into()
 }
+fn default_hedge_delay_ms() -> u64 {
+    2500
+}
+fn default_cache_max_entries() -> usize {
+    1000
+}
+fn default_cache_ttl_secs() -> u64 {
+    3600
+}
+fn default_cache_max_temperature() -> f64 {
+    0.2
+}
+fn default_profile_weight() -> u32 {
+    1
+}
+fn default_mcp_upstream_timeout_secs() -> u64 {
+    30
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -1044,6 +1570,7 @@ impl Default for ServerConfig {
             log_level: default_log_level(),
             cors_permissive: false,
             enable_ui: false,
+            enable_admin: false,
         }
     }
 }
@@ -1057,6 +1584,28 @@ impl Default for DefaultsConfig {
             queue_timeout_ms: default_queue_timeout_ms(),
             max_session_entries: default_max_session_entries(),
             state_dir: None,
+            schema_repair_retries: 0,
+        }
+    }
+}
+
+impl Default for RoutePolicyConfig {
+    fn default() -> Self {
+        Self {
+            strategy: RouteStrategy::Ordered,
+            hedge_delay_ms: default_hedge_delay_ms(),
+        }
+    }
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_entries: default_cache_max_entries(),
+            ttl_secs: default_cache_ttl_secs(),
+            max_temperature: default_cache_max_temperature(),
+            persist: false,
         }
     }
 }
@@ -1392,5 +1941,128 @@ daily_token_budget = 50000
             minimal("")
         );
         assert!(GatewayConfig::from_toml_str(&bad_otlp).is_err());
+    }
+
+    #[test]
+    fn parses_v4_defaults_and_overrides() {
+        let base =
+            GatewayConfig::from_toml_str(&minimal("")).expect("v3 config backwards compatible");
+        assert!(!base.server.enable_admin);
+        assert_eq!(base.defaults.schema_repair_retries, 0);
+        assert!(!base.cache.enabled);
+        assert_eq!(base.cache.max_entries, 1000);
+        assert_eq!(base.cache.ttl_secs, 3600);
+        assert!(base.route_policies.is_empty());
+        assert!(base.pricing.is_empty());
+
+        let v4_text = r#"
+[server]
+tcp_listen = "127.0.0.1:0"
+enable_admin = true
+
+[defaults]
+model = "coding/default"
+schema_repair_retries = 2
+
+[cache]
+enabled = true
+max_entries = 500
+ttl_secs = 1200
+max_temperature = 0.1
+persist = true
+
+[[backends]]
+id = "mock"
+kind = "cli"
+command = "/bin/echo"
+stdin = true
+
+[[backends.profiles]]
+id = "acct-a"
+weight = 3
+env = { HOME = "/tmp/home-a", API_TOKEN = "sk-profile-secret-123" }
+
+[[backends.profiles]]
+id = "acct-b"
+weight = 1
+env = { HOME = "/tmp/home-b" }
+
+[routes]
+"coding/default" = ["mock"]
+
+[route_policies."coding/default"]
+strategy = "hedged"
+hedge_delay_ms = 1500
+
+[pricing."coding/default"]
+input_per_1m_usd = 3.0
+output_per_1m_usd = 15.0
+
+[[mcp_prompts]]
+name = "code_review"
+description = "Review code"
+template = "Review {{lang}}: {{code}}"
+
+[[mcp_prompts.arguments]]
+name = "lang"
+required = true
+
+[[mcp_prompts.arguments]]
+name = "code"
+required = true
+
+[[mcp_upstreams]]
+id = "fs"
+transport = "stdio"
+command = "echo"
+args = ["hello"]
+
+[[tokens]]
+token = "vouch-live-admin-secret"
+name = "ops"
+rpm = 60
+tpm = 100000
+max_concurrent = 4
+expires_at = "2099-12-31T23:59:59Z"
+allowed_backends = ["mock"]
+admin = true
+"#;
+        let parsed = GatewayConfig::from_toml_str(v4_text).expect("valid v4 config");
+        assert!(parsed.server.enable_admin);
+        assert_eq!(parsed.defaults.schema_repair_retries, 2);
+        assert!(parsed.cache.enabled);
+        assert_eq!(
+            parsed.route_policies["coding/default"].strategy,
+            RouteStrategy::Hedged
+        );
+        assert_eq!(parsed.backends[0].profiles.len(), 2);
+        assert_eq!(parsed.tokens[0].tpm, Some(100_000));
+        assert!(parsed.tokens[0].admin);
+        assert!(
+            parsed
+                .secrets()
+                .contains(&"sk-profile-secret-123".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_v4_fields() {
+        let too_many_repairs = minimal("").replace(
+            "[[backends]]",
+            "[defaults]\nschema_repair_retries = 3\n\n[[backends]]",
+        );
+        assert!(GatewayConfig::from_toml_str(&too_many_repairs).is_err());
+
+        let bad_expiry = minimal("").replace(
+            "[routes]",
+            "[[tokens]]\ntoken = \"vouch-secret-token\"\nexpires_at = \"not-a-date\"\n\n[routes]",
+        );
+        assert!(GatewayConfig::from_toml_str(&bad_expiry).is_err());
+
+        let zero_tpm = minimal("").replace(
+            "[routes]",
+            "[[tokens]]\ntoken = \"vouch-secret-token\"\ntpm = 0\n\n[routes]",
+        );
+        assert!(GatewayConfig::from_toml_str(&zero_tpm).is_err());
     }
 }
