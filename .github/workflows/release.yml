@@ -80,15 +80,31 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Generate SHA256SUMS
-        working-directory: dist
-        run: sha256sum vouch-*.tar.gz > SHA256SUMS.txt
+      - name: Generate SHA256SUMS and update Homebrew formula
+        shell: bash
+        run: |
+          cd dist
+          sha256sum vouch-*.tar.gz > SHA256SUMS.txt
+          TAG="${GITHUB_REF_NAME#v}"
+          cp ../packaging/homebrew/vouch.rb vouch.rb
+          sed -i "s/version \".*\"/version \"${TAG}\"/" vouch.rb
+          for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+            SUM="$(grep "vouch-${GITHUB_REF_NAME}-${target}.tar.gz" SHA256SUMS.txt | awk '{print $1}')"
+            PLACEHOLDER="REPLACE_WITH_$(echo "${target}" | tr '[:lower:]-' '[:upper:]_')_SHA256"
+            if [ -n "${SUM}" ]; then
+              sed -i "s/${PLACEHOLDER}/${SUM}/g" vouch.rb
+            fi
+          done
+          cd ..
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
