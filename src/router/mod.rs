@@ -3,8 +3,8 @@
 //! A public model maps to an ordered chain of backend handles. The router
 //! tries the sticky backend first when the session already has affinity, then
 //! walks the chain. A backend is skipped when its circuit is open or when its
-//! concurrency permit cannot be acquired; a failure before a stream starts
-//! transparently fails over to the next candidate.
+//! concurrency permit cannot be acquired; a failure before meaningful stream
+//! output begins transparently fails over to the next candidate.
 
 pub mod circuit_breaker;
 
@@ -19,6 +19,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use futures::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -26,14 +27,15 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::{BackendConfig, BackendKind, GatewayConfig},
     driver::{
-        Driver, DriverResponse, ExecutionRequest, WorkspaceMode, cli_pipe::CliPipeDriver,
-        http_proxy::HttpProxyDriver, pty_runner::PtyRunnerDriver, workspace::WorkspaceManager,
+        ChatMessage, ChunkStream, Driver, DriverResponse, ExecutionRequest, WorkspaceMode,
+        cli_pipe::CliPipeDriver, http_proxy::HttpProxyDriver, prime_stream,
+        pty_runner::PtyRunnerDriver, workspace::WorkspaceManager,
     },
     error::{GatewayError, Result},
     metrics,
 };
 
-use self::circuit_breaker::{BreakerSettings, CircuitBreaker, CircuitState};
+use self::circuit_breaker::{BreakerSettings, CircuitBreaker, CircuitState, FailureDetails};
 
 /// Sticky backend selected for a session.
 #[derive(Debug, Clone)]
@@ -42,10 +44,22 @@ struct AffinityEntry {
     last_used: Instant,
 }
 
-/// Thread-safe sticky-session map with TTL eviction.
+/// Native multi-turn session state tracked per `(session_key, backend_id)`.
+#[derive(Debug, Clone)]
+pub struct BackendSessionState {
+    /// Captured native CLI session handle (when `session_id_regex` matched).
+    pub backend_session_id: Option<String>,
+    /// True after turn 1 completed successfully on this backend.
+    pub has_history: bool,
+    last_used: Instant,
+}
+
+/// Thread-safe sticky-session map with TTL eviction and native backend
+/// session handles for delta continuation.
 #[derive(Debug, Default)]
 pub struct SessionAffinity {
     entries: DashMap<String, AffinityEntry>,
+    backend_sessions: DashMap<(String, String), BackendSessionState>,
 }
 
 impl SessionAffinity {
@@ -77,6 +91,47 @@ impl SessionAffinity {
         );
     }
 
+    /// Look up native CLI session handle/history for `(session_key, backend_id)`.
+    pub fn get_backend_session(
+        &self,
+        session_key: &str,
+        backend_id: &str,
+        ttl: Duration,
+    ) -> Option<BackendSessionState> {
+        let composite = (session_key.to_string(), backend_id.to_string());
+        let entry = self.backend_sessions.get(&composite)?;
+        if entry.last_used.elapsed() > ttl {
+            drop(entry);
+            self.backend_sessions.remove(&composite);
+            None
+        } else {
+            Some(entry.clone())
+        }
+    }
+
+    /// Persist or refresh native CLI session handle after a successful turn.
+    pub fn record_backend_session(
+        &self,
+        session_key: &str,
+        backend_id: &str,
+        captured_id: Option<String>,
+    ) {
+        let composite = (session_key.to_string(), backend_id.to_string());
+        let mut entry =
+            self.backend_sessions
+                .entry(composite)
+                .or_insert_with(|| BackendSessionState {
+                    backend_session_id: None,
+                    has_history: false,
+                    last_used: Instant::now(),
+                });
+        entry.has_history = true;
+        entry.last_used = Instant::now();
+        if let Some(id) = captured_id {
+            entry.backend_session_id = Some(id);
+        }
+    }
+
     /// Remove expired entries.
     pub fn evict_expired(&self, ttl: Duration) {
         let expired: Vec<String> = self
@@ -87,6 +142,16 @@ impl SessionAffinity {
             .collect();
         for key in expired {
             self.entries.remove(&key);
+        }
+
+        let expired_bs: Vec<(String, String)> = self
+            .backend_sessions
+            .iter()
+            .filter(|entry| entry.last_used.elapsed() > ttl)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in expired_bs {
+            self.backend_sessions.remove(&key);
         }
     }
 
@@ -151,6 +216,16 @@ fn hash_key(input: &str) -> String {
     hex::encode(&digest[..8])
 }
 
+/// Extract only messages appended after the last assistant turn for CLI delta
+/// resumption.
+pub fn slice_delta_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    match messages.iter().rposition(|m| m.role == "assistant") {
+        Some(idx) if idx + 1 < messages.len() => messages[idx + 1..].to_vec(),
+        Some(_) => Vec::new(),
+        None => messages.to_vec(),
+    }
+}
+
 /// One backend with its driver and breaker.
 pub struct BackendHandle {
     /// Backend configuration snapshot.
@@ -194,6 +269,8 @@ pub struct BackendStatus {
     pub consecutive_failures: u32,
     /// Remaining cooldown when open.
     pub open_remaining_secs: u64,
+    /// True when the breaker opened due to upstream auth expiry / rejection.
+    pub auth_expired: bool,
 }
 
 /// One public model and its fallback chain.
@@ -362,6 +439,27 @@ impl Router {
             }
 
             let mut attempt = request.clone();
+            let attempt_capture = Arc::new(parking_lot::Mutex::new(None));
+            attempt.session_capture = attempt_capture.clone();
+
+            if backend.config.kind != BackendKind::Http
+                && !backend.config.resume_args.is_empty()
+                && let Some(prior) =
+                    self.sessions
+                        .get_backend_session(&request.session_key, &backend.config.id, ttl)
+            {
+                let can_resume = prior.has_history
+                    && (backend.config.session_id_regex.is_none()
+                        || prior.backend_session_id.is_some());
+                if can_resume {
+                    attempt.backend_session_id = prior.backend_session_id;
+                    let delta = slice_delta_messages(&attempt.messages);
+                    if !delta.is_empty() {
+                        attempt.delta_messages = Some(delta);
+                    }
+                }
+            }
+
             let isolate = match workspace_mode {
                 WorkspaceMode::Worktree => true,
                 WorkspaceMode::Auto => backend.config.isolate_workspace,
@@ -382,8 +480,39 @@ impl Router {
                 attempt.workdir = backend.config.workdir.clone();
             }
 
-            match backend.driver.execute(attempt).await {
+            let exec_result = match backend.driver.execute(attempt).await {
+                Ok(DriverResponse::Stream(stream)) => {
+                    prime_stream(stream).await.map(DriverResponse::Stream)
+                }
+                other => other,
+            };
+
+            match exec_result {
                 Ok(response) => {
+                    let final_response = match response {
+                        DriverResponse::Stream(stream) => {
+                            let sessions = self.sessions.clone();
+                            let session_key = request.session_key.clone();
+                            let backend_id = backend.config.id.clone();
+                            let capture = attempt_capture.clone();
+                            DriverResponse::Stream(wrap_stream_session_commit(
+                                stream,
+                                sessions,
+                                session_key,
+                                backend_id,
+                                capture,
+                            ))
+                        }
+                        DriverResponse::Complete(completion) => {
+                            let captured = attempt_capture.lock().take();
+                            self.sessions.record_backend_session(
+                                &request.session_key,
+                                &backend.config.id,
+                                captured,
+                            );
+                            DriverResponse::Complete(completion)
+                        }
+                    };
                     backend.breaker.record_success();
                     self.sessions.set(&request.session_key, &backend.config.id);
                     let fallback_used = index > 0;
@@ -393,15 +522,19 @@ impl Router {
                     return Ok(RoutedResponse {
                         backend_id: backend.config.id.clone(),
                         fallback_used,
-                        response,
+                        response: final_response,
                         attempts,
                     });
                 }
                 Err(error) => {
                     if error.counts_as_backend_failure() {
-                        backend.breaker.record_failure(
+                        backend.breaker.record_failure_detailed(
                             error.to_string(),
-                            matches!(error, GatewayError::UpstreamRateLimited(_)),
+                            FailureDetails {
+                                rate_limited: error.is_rate_limited(),
+                                auth_expired: error.is_auth_expired(),
+                                retry_after: error.upstream_rate_limit_retry_after(),
+                            },
                         );
                     } else {
                         backend.breaker.record_neutral();
@@ -493,6 +626,28 @@ impl Router {
     }
 }
 
+fn wrap_stream_session_commit(
+    mut inner: ChunkStream,
+    sessions: Arc<SessionAffinity>,
+    session_key: String,
+    backend_id: String,
+    capture: Arc<parking_lot::Mutex<Option<String>>>,
+) -> ChunkStream {
+    Box::pin(async_stream::stream! {
+        let mut failed = false;
+        while let Some(item) = inner.next().await {
+            if item.is_err() {
+                failed = true;
+            }
+            yield item;
+        }
+        if !failed {
+            let captured = capture.lock().take();
+            sessions.record_backend_session(&session_key, &backend_id, captured);
+        }
+    })
+}
+
 fn backend_status(backend: &BackendHandle) -> BackendStatus {
     let snapshot = backend.breaker.snapshot();
     BackendStatus {
@@ -502,6 +657,7 @@ fn backend_status(backend: &BackendHandle) -> BackendStatus {
         circuit: snapshot.state,
         consecutive_failures: snapshot.consecutive_failures,
         open_remaining_secs: snapshot.open_remaining_secs,
+        auth_expired: snapshot.auth_expired,
     }
 }
 
@@ -537,5 +693,17 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(10));
         assert_eq!(sessions.get("s", Duration::from_millis(1)), None);
+    }
+
+    #[test]
+    fn delta_slices_after_last_assistant_turn() {
+        let msgs = vec![
+            ChatMessage::text("user", "turn 1"),
+            ChatMessage::text("assistant", "reply 1"),
+            ChatMessage::text("user", "turn 2"),
+        ];
+        let delta = slice_delta_messages(&msgs);
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].content.as_plain_text(), "turn 2");
     }
 }
