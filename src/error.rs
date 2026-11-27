@@ -62,8 +62,17 @@ pub enum GatewayError {
     Upstream(String),
 
     /// An upstream daemon rate-limited the gateway.
-    #[error("upstream rate limited: {0}")]
-    UpstreamRateLimited(String),
+    #[error("upstream rate limited: {message}")]
+    UpstreamRateLimited {
+        /// Parsed `Retry-After` duration in seconds when provided.
+        retry_after_secs: Option<u64>,
+        /// Redacted upstream detail.
+        message: String,
+    },
+
+    /// An upstream backend rejected credentials or reported an expired session.
+    #[error("upstream authentication expired: {0}")]
+    UpstreamAuthExpired(String),
 
     /// A backend exceeded its deadline.
     #[error("backend timed out after {0:?}")]
@@ -83,6 +92,38 @@ pub enum GatewayError {
 }
 
 impl GatewayError {
+    /// Convenience constructor for upstream HTTP 429 or CLI rate limits.
+    pub fn upstream_rate_limited(
+        message: impl Into<String>,
+        retry_after_secs: Option<u64>,
+    ) -> Self {
+        Self::UpstreamRateLimited {
+            retry_after_secs,
+            message: message.into(),
+        }
+    }
+
+    /// Extract the parsed `Retry-After` duration when this error is an upstream 429.
+    pub fn upstream_rate_limit_retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::UpstreamRateLimited {
+                retry_after_secs: Some(secs),
+                ..
+            } => Some(Duration::from_secs((*secs).max(1))),
+            _ => None,
+        }
+    }
+
+    /// True when this error represents an expired or invalid upstream credential.
+    pub fn is_auth_expired(&self) -> bool {
+        matches!(self, Self::UpstreamAuthExpired(_))
+    }
+
+    /// True when this error represents an upstream rate limit.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, Self::UpstreamRateLimited { .. })
+    }
+
     /// HTTP status code for this error.
     pub fn status(&self) -> StatusCode {
         match self {
@@ -91,11 +132,11 @@ impl GatewayError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::RateLimited { .. } | Self::UpstreamRateLimited(_) => {
+            Self::RateLimited { .. } | Self::UpstreamRateLimited { .. } => {
                 StatusCode::TOO_MANY_REQUESTS
             }
             Self::Saturated(_) | Self::NoHealthyBackend(_) => StatusCode::SERVICE_UNAVAILABLE,
-            Self::Upstream(_) => StatusCode::BAD_GATEWAY,
+            Self::Upstream(_) | Self::UpstreamAuthExpired(_) => StatusCode::BAD_GATEWAY,
             Self::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             Self::ClientDisconnected => StatusCode::REQUEST_TIMEOUT,
         }
@@ -107,7 +148,9 @@ impl GatewayError {
             Self::RateLimited {
                 retry_after_secs, ..
             } => Some(*retry_after_secs),
-            Self::UpstreamRateLimited(_) => Some(5),
+            Self::UpstreamRateLimited {
+                retry_after_secs, ..
+            } => Some(retry_after_secs.unwrap_or(5)),
             Self::Saturated(_) | Self::NoHealthyBackend(_) => Some(2),
             _ => None,
         }
@@ -123,7 +166,8 @@ impl GatewayError {
             Self::Saturated(_)
                 | Self::NoHealthyBackend(_)
                 | Self::Upstream(_)
-                | Self::UpstreamRateLimited(_)
+                | Self::UpstreamRateLimited { .. }
+                | Self::UpstreamAuthExpired(_)
                 | Self::Timeout(_)
                 | Self::Io(_)
                 | Self::Internal(_)
@@ -137,7 +181,8 @@ impl GatewayError {
         matches!(
             self,
             Self::Upstream(_)
-                | Self::UpstreamRateLimited(_)
+                | Self::UpstreamRateLimited { .. }
+                | Self::UpstreamAuthExpired(_)
                 | Self::Timeout(_)
                 | Self::Io(_)
                 | Self::Internal(_)
@@ -148,10 +193,10 @@ impl GatewayError {
     fn openai_error_type(&self) -> &'static str {
         match self {
             Self::BadRequest(_) => "invalid_request_error",
-            Self::Unauthorized(_) => "authentication_error",
+            Self::Unauthorized(_) | Self::UpstreamAuthExpired(_) => "authentication_error",
             Self::Forbidden(_) => "permission_error",
             Self::NotFound(_) => "not_found_error",
-            Self::RateLimited { .. } | Self::UpstreamRateLimited(_) => "rate_limit_error",
+            Self::RateLimited { .. } | Self::UpstreamRateLimited { .. } => "rate_limit_error",
             Self::Saturated(_) | Self::NoHealthyBackend(_) => "service_unavailable_error",
             Self::Config(_) | Self::Internal(_) | Self::Io(_) => "server_error",
             Self::Upstream(_) | Self::Timeout(_) | Self::ClientDisconnected => "api_error",
@@ -167,7 +212,8 @@ impl GatewayError {
             Self::Forbidden(_) => "model_not_allowed",
             Self::NotFound(_) => "model_not_found",
             Self::RateLimited { .. } => "rate_limit_exceeded",
-            Self::UpstreamRateLimited(_) => "upstream_rate_limited",
+            Self::UpstreamRateLimited { .. } => "upstream_rate_limited",
+            Self::UpstreamAuthExpired(_) => "upstream_auth_expired",
             Self::Saturated(_) => "backend_saturated",
             Self::NoHealthyBackend(_) => "no_healthy_backend",
             Self::Upstream(_) => "upstream_error",
@@ -181,10 +227,10 @@ impl GatewayError {
     fn anthropic_error_type(&self) -> &'static str {
         match self {
             Self::BadRequest(_) => "invalid_request_error",
-            Self::Unauthorized(_) => "authentication_error",
+            Self::Unauthorized(_) | Self::UpstreamAuthExpired(_) => "authentication_error",
             Self::Forbidden(_) => "permission_error",
             Self::NotFound(_) => "not_found_error",
-            Self::RateLimited { .. } | Self::UpstreamRateLimited(_) => "rate_limit_error",
+            Self::RateLimited { .. } | Self::UpstreamRateLimited { .. } => "rate_limit_error",
             Self::Saturated(_) | Self::NoHealthyBackend(_) => "overloaded_error",
             Self::Upstream(_) | Self::Timeout(_) => "api_error",
             Self::ClientDisconnected => "api_error",
