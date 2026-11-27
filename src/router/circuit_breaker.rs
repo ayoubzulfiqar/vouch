@@ -148,6 +148,12 @@ impl CircuitBreaker {
         *self.settings.lock() = settings;
     }
 
+    /// Manually reset this circuit breaker directly back to `Closed`, clearing
+    /// consecutive failures and `auth_expired`. Used by `POST /admin/circuits/{backend}/reset`.
+    pub fn reset(&self) {
+        self.record_success();
+    }
+
     /// Ask whether a request may proceed.
     ///
     /// A `true` return for a half-open breaker consumes one probe slot. Callers
