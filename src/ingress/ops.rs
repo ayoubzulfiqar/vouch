@@ -52,3 +52,13 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     )
         .into_response()
 }
+
+/// Cumulative per-token and per-backend usage and latency analytics (`GET /v1/usage`).
+pub async fn usage(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(error) = state.tokens().authenticate(&headers) {
+        return error.into_openai_response();
+    }
+    let budgets = state.tokens().budget_statuses();
+    let report = state.usage().report(state.uptime_secs(), &budgets);
+    Json(report).into_response()
+}
