@@ -21,17 +21,16 @@ use uuid::Uuid;
 
 use crate::{
     driver::{
-        ChatMessage, ContentPart, MessageContent, StreamChunk, ThinkingBlock, ToolCall, Usage,
+        ChatMessage, ContentPart, MessageContent, StreamChunk, ThinkingBlock, ToolCall,
         tool_bridge::normalize_tools, truncate,
     },
     error::{GatewayError, Result},
     ingress::{
-        CancelOnDrop, completion, execute, execution_request, into_chunk_stream,
-        parse_json_content, prepare_routed, record_completion_outcome, record_error_outcome,
-        sse_response, start_ingress_span,
+        CancelOnDrop, StreamUsageGuard, completion, execute_or_cached, execution_request,
+        insert_routing_headers, into_chunk_stream, parse_json_content, prepare_routed,
+        record_completion_outcome, record_error_outcome, sse_response, start_ingress_span,
     },
     state::AppState,
-    usage::count_tokens,
 };
 
 /// Anthropic `POST /v1/messages` request body.
@@ -145,8 +144,8 @@ async fn messages_inner(
         extra,
         cancel.clone(),
     );
-    let routed = match execute(&state, request).await {
-        Ok(routed) => routed,
+    let dispatched = match execute_or_cached(&state, &context, &headers, request).await {
+        Ok(d) => d,
         Err(error) => {
             record_error_outcome(
                 &state,
@@ -159,9 +158,11 @@ async fn messages_inner(
             return Err(error);
         }
     };
-    let backend = routed.backend_id.clone();
-    let fallback = routed.fallback_used;
-    let driver_response = routed.response;
+    let backend = dispatched.routed.backend_id;
+    let fallback = dispatched.routed.fallback_used;
+    let driver_response = dispatched.routed.response;
+    let cache_status = dispatched.cache_status;
+    let cache_miss_key = dispatched.cache_miss_key;
     let message_id = format!("msg_{}", Uuid::new_v4().simple());
 
     if payload.stream {
@@ -172,14 +173,19 @@ async fn messages_inner(
         let model = context.model.clone();
         let request_id = context.request_id.clone();
         let stream_cancel = cancel.clone();
-        let stream_state = state.clone();
-        let stream_context = context.clone();
         let stream_backend = backend.clone();
+        let mut usage_guard = StreamUsageGuard::new(
+            state.clone(),
+            context,
+            stream_backend,
+            fallback,
+            started,
+            Some(ingress_span),
+            cache_miss_key,
+        );
 
         let stream = async_stream::stream! {
             let _guard = CancelOnDrop(stream_cancel.clone());
-            let mut ingress_span = Some(ingress_span);
-            let mut collected_text = String::new();
             let start = json!({
                 "type": "message_start",
                 "message": {
@@ -216,14 +222,7 @@ async fn messages_inner(
                 };
                 if timed_out {
                     stream_cancel.cancel();
-                    record_error_outcome(
-                        &stream_state,
-                        &stream_context,
-                        Some(&stream_backend),
-                        started.elapsed(),
-                        "stream timeout",
-                        ingress_span.take(),
-                    );
+                    usage_guard.fail("stream timeout");
                     let error = json!({
                         "type": "error",
                         "error": {
@@ -236,6 +235,7 @@ async fn messages_inner(
                 }
                 match item {
                     Some(Ok(chunk)) => {
+                        usage_guard.observe_chunk(&chunk);
                         let StreamChunk {
                             delta,
                             thinking_delta,
@@ -342,7 +342,6 @@ async fn messages_inner(
                                     idx
                                 }
                             };
-                            collected_text.push_str(&delta);
                             let payload = json!({
                                 "type": "content_block_delta",
                                 "index": idx,
@@ -431,29 +430,15 @@ async fn messages_inner(
                                     .event("content_block_stop")
                                     .data(json!({"type": "content_block_stop", "index": 0}).to_string()));
                             }
-                            let effective_usage = usage.unwrap_or_else(|| {
-                                Usage::new(
-                                    stream_context.prompt_tokens,
-                                    count_tokens(&model, &collected_text),
-                                )
-                            });
-                            record_completion_outcome(
-                                &stream_state,
-                                &stream_context,
-                                &stream_backend,
-                                fallback,
-                                effective_usage,
-                                started.elapsed(),
-                                ingress_span.take(),
-                            );
-                            let output_tokens = usage
-                                .map(|usage| usage.completion_tokens)
-                                .unwrap_or(effective_usage.completion_tokens);
                             let effective_reason = if saw_tool_calls && reason == "stop" {
                                 "tool_use"
                             } else {
                                 anthropic_stop_reason(&reason)
                             };
+                            let effective_usage = usage_guard.complete(usage, effective_reason);
+                            let output_tokens = usage
+                                .map(|u| u.completion_tokens)
+                                .unwrap_or(effective_usage.completion_tokens);
                             let delta = json!({
                                 "type": "message_delta",
                                 "delta": {
@@ -470,14 +455,7 @@ async fn messages_inner(
                         }
                     }
                     Some(Err(error)) => {
-                        record_error_outcome(
-                            &stream_state,
-                            &stream_context,
-                            Some(&stream_backend),
-                            started.elapsed(),
-                            &error.to_string(),
-                            ingress_span.take(),
-                        );
+                        usage_guard.fail(&error.to_string());
                         let payload = json!({
                             "type": "error",
                             "error": {"type": "api_error", "message": error.to_string()},
@@ -486,19 +464,6 @@ async fn messages_inner(
                         break;
                     }
                     None => {
-                        let effective_usage = Usage::new(
-                            stream_context.prompt_tokens,
-                            count_tokens(&model, &collected_text),
-                        );
-                        record_completion_outcome(
-                            &stream_state,
-                            &stream_context,
-                            &stream_backend,
-                            fallback,
-                            effective_usage,
-                            started.elapsed(),
-                            ingress_span.take(),
-                        );
                         if let Some(idx) = open_thinking_index.take() {
                             yield Ok(Event::default()
                                 .event("content_block_stop")
@@ -523,10 +488,11 @@ async fn messages_inner(
                                 .data(json!({"type": "content_block_stop", "index": 0}).to_string()));
                         }
                         let stop_reason = if saw_tool_calls { "tool_use" } else { "end_turn" };
+                        let effective_usage = usage_guard.complete(None, stop_reason);
                         let delta = json!({
                             "type": "message_delta",
                             "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-                            "usage": {"output_tokens": 0},
+                            "usage": {"output_tokens": effective_usage.completion_tokens},
                         });
                         yield Ok(Event::default().event("message_delta").data(delta.to_string()));
                         yield Ok(Event::default()
@@ -539,13 +505,7 @@ async fn messages_inner(
         };
 
         let mut response = sse_response(stream, keep_alive);
-        crate::ingress::insert_header(&mut response, "x-vouch-backend", &backend);
-        crate::ingress::insert_header(
-            &mut response,
-            "x-vouch-fallback",
-            if fallback { "true" } else { "false" },
-        );
-        crate::ingress::insert_header(&mut response, "x-vouch-request-id", &request_id);
+        insert_routing_headers(&mut response, &backend, fallback, &request_id, cache_status);
         return Ok(response);
     }
 
@@ -560,6 +520,9 @@ async fn messages_inner(
                 started.elapsed(),
                 Some(ingress_span),
             );
+            if let Some(key) = cache_miss_key {
+                state.cache().store(key, &backend, &c);
+            }
             c
         }
         Err(error) => {
@@ -630,13 +593,13 @@ async fn messages_inner(
         },
     });
     let mut response = (StatusCode::OK, Json(body)).into_response();
-    crate::ingress::insert_header(&mut response, "x-vouch-backend", &backend);
-    crate::ingress::insert_header(
+    insert_routing_headers(
         &mut response,
-        "x-vouch-fallback",
-        if fallback { "true" } else { "false" },
+        &backend,
+        fallback,
+        &context.request_id,
+        cache_status,
     );
-    crate::ingress::insert_header(&mut response, "x-vouch-request-id", &context.request_id);
     Ok(response)
 }
 
