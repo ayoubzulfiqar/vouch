@@ -1181,3 +1181,976 @@ enable_ui = true
         enabled.state.shutdown().await;
     }
 }
+
+mod v2_tests {
+    use super::*;
+    use axum::{Json, Router as AxumRouter, response::IntoResponse, routing::post};
+    use tokio::net::TcpListener;
+    use vouch::cli::bench;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_spill_file_avoids_arg_max_and_cleans_up() {
+        let dir = TempDir::new().expect("tempdir");
+        let spill_script = script(
+            dir.path(),
+            "spill_reader.sh",
+            r#"#!/bin/sh
+ARG="$1"
+FILE_PATH=$(printf '%s' "$ARG" | sed -n 's/.*located in file: //p')
+if [ -z "$FILE_PATH" ] || [ ! -f "$FILE_PATH" ]; then
+  echo "missing_spill_file arg=$ARG"
+  exit 1
+fi
+BYTES=$(wc -c < "$FILE_PATH" | tr -d ' ')
+echo "SPILLED_PATH=$FILE_PATH BYTES=$BYTES"
+"#,
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "coding/default"
+
+[[backends]]
+id = "spill_cli"
+kind = "cli"
+command = {:?}
+args = ["{{prompt}}"]
+stdin = false
+max_inline_prompt_bytes = 64
+timeout_secs = 10
+
+[routes]
+"coding/default" = ["spill_cli"]
+"#,
+            spill_script.display().to_string()
+        );
+        let harness = Harness::new(toml).await;
+        let long_msg = "A".repeat(256);
+        let resp = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "stream": false,
+                    "messages": [{"role": "user", "content": long_msg}]
+                }),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let payload: Value = serde_json::from_str(&body_text(resp).await).expect("JSON");
+        let text = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content");
+        assert!(text.contains("SPILLED_PATH="), "content: {text}");
+        let spilled_path = text
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("SPILLED_PATH="))
+            .expect("path token");
+        assert!(
+            !Path::new(spilled_path).exists(),
+            "spill file {spilled_path} should be deleted after drop"
+        );
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pre_content_whitespace_buffering_and_auth_expired_failover() {
+        let dir = TempDir::new().expect("tempdir");
+        let expired = script(
+            dir.path(),
+            "expired.sh",
+            r#"#!/bin/sh
+printf '\033[33m   \n\t\033[0m'
+printf 'Authentication error: please sign in to continue.\n' >&2
+exit 1
+"#,
+        );
+        let healthy = script(
+            dir.path(),
+            "healthy.sh",
+            r#"#!/bin/sh
+printf 'recovered answer\n'
+"#,
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "coding/default"
+
+{}
+{}
+[routes]
+"coding/default" = ["expired", "healthy"]
+"#,
+            cli_backend("expired", &expired, 10, ""),
+            cli_backend("healthy", &healthy, 10, "")
+        );
+        let harness = Harness::new(toml).await;
+
+        let streamed = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                chat_body("coding/default", true),
+            )
+            .await;
+        assert_eq!(streamed.status(), StatusCode::OK);
+        assert_eq!(
+            streamed
+                .headers()
+                .get("x-vouch-backend")
+                .and_then(|v| v.to_str().ok()),
+            Some("healthy")
+        );
+        assert_eq!(
+            streamed
+                .headers()
+                .get("x-vouch-fallback")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        let sse = body_text(streamed).await;
+        assert!(sse.contains("recovered answer"), "sse: {sse}");
+        assert!(!sse.contains("please sign in"), "sse leaked stderr: {sse}");
+
+        let ready = harness.get("/readyz", &[]).await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        let ready_json: Value = serde_json::from_str(&body_text(ready).await).expect("readyz JSON");
+        assert_eq!(ready_json["ready"], true);
+        let expired_status = ready_json["backends"]
+            .as_array()
+            .expect("backends")
+            .iter()
+            .find(|b| b["id"] == "expired")
+            .expect("expired entry");
+        assert_eq!(expired_status["circuit"], "open");
+        assert_eq!(expired_status["auth_expired"], true);
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_429_retry_after_header_overrides_reset_timeout() {
+        async fn mock_429() -> Response {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "4")],
+                "rate limit exceeded",
+            )
+                .into_response()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let upstream = AxumRouter::new().route("/v1/chat/completions", post(mock_429));
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        let toml = format!(
+            r#"
+[defaults]
+model = "http/limited"
+
+[resilience]
+reset_timeout_secs = 1
+open_on_rate_limit = true
+
+[[backends]]
+id = "limited"
+kind = "http"
+base_url = "http://{addr}"
+
+[routes]
+"http/limited" = ["limited"]
+"#
+        );
+        let harness = Harness::new(toml).await;
+        let resp = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                chat_body("http/limited", false),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("4")
+        );
+
+        let ready = harness.get("/readyz", &[]).await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ready_json: Value = serde_json::from_str(&body_text(ready).await).expect("readyz");
+        assert!(
+            ready_json["backends"][0]["open_remaining_secs"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 2
+        );
+
+        harness.state.shutdown().await;
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_stall_watchdog_terminates_hung_cli_and_resets_on_activity() {
+        let dir = TempDir::new().expect("tempdir");
+        let stalled = script(
+            dir.path(),
+            "stall.sh",
+            r#"#!/bin/sh
+sleep 15
+echo "never reached"
+"#,
+        );
+        let active = script(
+            dir.path(),
+            "active.sh",
+            r#"#!/bin/sh
+printf 'a'
+sleep 0.4
+printf 'b'
+sleep 0.4
+printf 'c\n'
+"#,
+        );
+        let toml = format!(
+            r#"
+[[backends]]
+id = "stalled"
+kind = "cli"
+command = {:?}
+stdin = true
+timeout_secs = 30
+idle_timeout_secs = 1
+
+[[backends]]
+id = "active"
+kind = "cli"
+command = {:?}
+stdin = true
+timeout_secs = 30
+idle_timeout_secs = 1
+
+[routes]
+"test/stall" = ["stalled"]
+"test/active" = ["active"]
+"#,
+            stalled.display().to_string(),
+            active.display().to_string(),
+        );
+        let harness = Harness::new(toml).await;
+
+        let t0 = std::time::Instant::now();
+        let resp = harness
+            .post_json("/v1/chat/completions", &[], chat_body("test/stall", false))
+            .await;
+        let elapsed = t0.elapsed();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "idle watchdog should abort quickly, took {elapsed:?}"
+        );
+
+        let ok_resp = harness
+            .post_json("/v1/chat/completions", &[], chat_body("test/active", false))
+            .await;
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        let payload: Value = serde_json::from_str(&body_text(ok_resp).await).expect("JSON");
+        assert_eq!(payload["choices"][0]["message"]["content"], "abc");
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pty_honors_configured_dimensions_and_auto_respond() {
+        let dir = TempDir::new().expect("tempdir");
+        let pty_bin = script(
+            dir.path(),
+            "pty_prompt.sh",
+            r#"#!/bin/sh
+SIZE=$(stty size 2>/dev/null || echo "unknown")
+printf 'Continue? [y/N] '
+IFS= read -r ANS
+printf 'SIZE=%s ANS=%s\n' "$SIZE" "$ANS"
+"#,
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "pty/default"
+
+[[backends]]
+id = "pty_interactive"
+kind = "pty"
+command = {:?}
+args = ["{{prompt}}"]
+stdin = false
+pty_cols = 177
+pty_rows = 55
+timeout_secs = 10
+
+[[backends.pty_auto_respond]]
+pattern = "Continue? [y/N]"
+response = "yes"
+
+[routes]
+"pty/default" = ["pty_interactive"]
+"#,
+            pty_bin.display().to_string()
+        );
+        let harness = Harness::new(toml).await;
+
+        let resp = harness
+            .post_json("/v1/chat/completions", &[], chat_body("pty/default", false))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let payload: Value = serde_json::from_str(&body_text(resp).await).expect("JSON");
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+        assert!(content.contains("SIZE=55 177"), "content: {content}");
+        assert!(content.contains("ANS=yes"), "content: {content}");
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multimodal_base64_image_extraction_and_cleanup() {
+        let dir = TempDir::new().expect("tempdir");
+        let vision_cli = script(
+            dir.path(),
+            "vision.sh",
+            r#"#!/bin/sh
+BODY=$(cat)
+IMG=$(printf '%s' "$BODY" | sed -n 's/.*\[Attached image file: \([^]]*\)\].*/\1/p' | head -n1)
+if [ -z "$IMG" ] || [ ! -s "$IMG" ]; then
+  echo "NO_IMAGE body=$BODY"
+  exit 1
+fi
+BYTES=$(wc -c < "$IMG" | tr -d ' ')
+echo "IMAGE_PATH=$IMG IMAGE_BYTES=$BYTES"
+"#,
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "vision/cli"
+
+{}
+[routes]
+"vision/cli" = ["vision"]
+"#,
+            cli_backend("vision", &vision_cli, 10, "")
+        );
+        let harness = Harness::new(toml).await;
+
+        let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+        let resp = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "vision/cli",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe image"},
+                            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{b64}")}}
+                        ]
+                    }]
+                }),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let payload: Value = serde_json::from_str(&body_text(resp).await).expect("JSON");
+        let content = payload["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content");
+        assert!(content.contains("IMAGE_PATH="), "content: {content}");
+        assert!(content.contains("IMAGE_BYTES=68"), "content: {content}");
+        let img_path = content
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("IMAGE_PATH="))
+            .expect("path token");
+        assert!(
+            !Path::new(img_path).exists(),
+            "temp image {img_path} should be deleted on drop"
+        );
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn structured_outputs_validate_schema_and_strip_fences() {
+        let dir = TempDir::new().expect("tempdir");
+        let fenced_ok = script(
+            dir.path(),
+            "fenced_ok.sh",
+            "#!/bin/sh\nprintf '```json\\n{\"city\":\"Tokyo\",\"temp\":21}\\n```\\n'\n",
+        );
+        let invalid_out = script(
+            dir.path(),
+            "invalid_out.sh",
+            "#!/bin/sh\nprintf 'Sorry, I cannot comply in JSON.'\n",
+        );
+        let toml = format!(
+            r#"
+{}
+{}
+[routes]
+"json/good" = ["fenced_ok"]
+"json/bad" = ["invalid_out"]
+"#,
+            cli_backend("fenced_ok", &fenced_ok, 10, ""),
+            cli_backend("invalid_out", &invalid_out, 10, "")
+        );
+        let harness = Harness::new(toml).await;
+
+        let schema = json!({
+            "type": "object",
+            "required": ["city", "temp"],
+            "properties": {
+                "city": {"type": "string"},
+                "temp": {"type": "number"}
+            }
+        });
+        let good = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "json/good",
+                    "messages": [{"role": "user", "content": "Weather"}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "weather",
+                            "strict": true,
+                            "schema": schema
+                        }
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(good.status(), StatusCode::OK);
+        let good_body: Value = serde_json::from_str(&body_text(good).await).expect("JSON");
+        let parsed: Value = serde_json::from_str(
+            good_body["choices"][0]["message"]["content"]
+                .as_str()
+                .expect("content"),
+        )
+        .expect("clean JSON content");
+        assert_eq!(parsed["city"], "Tokyo");
+        assert_eq!(parsed["temp"], 21);
+
+        let bad = harness
+            .post_json(
+                "/v1/responses",
+                &[],
+                json!({
+                    "model": "json/bad",
+                    "input": "Weather",
+                    "text": {
+                        "format": {
+                            "type": "json_object"
+                        }
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(bad.status(), StatusCode::BAD_GATEWAY);
+        let bad_body: Value = serde_json::from_str(&body_text(bad).await).expect("err JSON");
+        assert_eq!(bad_body["error"]["code"], "upstream_error");
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_cli_session_resumes_with_delta_prompt() {
+        let dir = TempDir::new().expect("tempdir");
+        let session_cli = script(
+            dir.path(),
+            "session_cli.sh",
+            r#"#!/bin/sh
+if [ "$1" = "--new" ]; then
+  printf 'SESSION_ID=native-777\n' >&2
+  printf 'NEW:%s\n' "$2"
+elif [ "$1" = "--resume" ]; then
+  printf 'RESUMED(%s):%s\n' "$2" "$3"
+else
+  exit 2
+fi
+"#,
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "session/cli"
+
+[[backends]]
+id = "resumable"
+kind = "cli"
+command = {:?}
+args = ["--new", "{{prompt}}"]
+resume_args = ["--resume", "{{backend_session_id}}", "{{prompt}}"]
+session_id_regex = "SESSION_ID=([a-z0-9-]+)"
+stdin = false
+timeout_secs = 10
+
+[routes]
+"session/cli" = ["resumable"]
+"#,
+            session_cli.display().to_string()
+        );
+        let harness = Harness::new(toml).await;
+
+        let turn1 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "delta-conv-1")],
+                json!({
+                    "model": "session/cli",
+                    "messages": [{"role": "user", "content": "TURN1_SECRET"}]
+                }),
+            )
+            .await;
+        assert_eq!(turn1.status(), StatusCode::OK);
+        let body1: Value = serde_json::from_str(&body_text(turn1).await).expect("JSON");
+        let text1 = body1["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+        assert!(text1.contains("NEW:"), "text1: {text1}");
+        assert!(text1.contains("TURN1_SECRET"), "text1: {text1}");
+
+        let turn2 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "delta-conv-1")],
+                json!({
+                    "model": "session/cli",
+                    "messages": [
+                        {"role": "user", "content": "TURN1_SECRET"},
+                        {"role": "assistant", "content": "ok"},
+                        {"role": "user", "content": "TURN2_DELTA"}
+                    ]
+                }),
+            )
+            .await;
+        assert_eq!(turn2.status(), StatusCode::OK);
+        let body2: Value = serde_json::from_str(&body_text(turn2).await).expect("JSON");
+        let text2 = body2["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+        assert!(text2.contains("RESUMED(native-777):"), "text2: {text2}");
+        assert!(text2.contains("TURN2_DELTA"), "text2: {text2}");
+        assert!(
+            !text2.contains("TURN1_SECRET"),
+            "turn 2 must only send delta after assistant turn: {text2}"
+        );
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn responses_stateful_previous_response_id_and_zdr() {
+        let dir = TempDir::new().expect("tempdir");
+        let echo_stdin = script(
+            dir.path(),
+            "echo_all.sh",
+            "#!/bin/sh\ntr '\\n' ' '\necho ''\n",
+        );
+        let toml = config(
+            &cli_backend("echo", &echo_stdin, 10, ""),
+            "\"coding/default\" = [\"echo\"]\n",
+            "",
+            10,
+        );
+        let harness = Harness::new(toml).await;
+
+        // Turn 1 stored by default
+        let r1 = harness
+            .post_json(
+                "/v1/responses",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "input": "Remember BLUEBERRY"
+                }),
+            )
+            .await;
+        assert_eq!(r1.status(), StatusCode::OK);
+        let body1: Value = serde_json::from_str(&body_text(r1).await).expect("r1 JSON");
+        let id1 = body1["id"].as_str().expect("id1").to_string();
+
+        // Turn 2 references previous_response_id
+        let r2 = harness
+            .post_json(
+                "/v1/responses",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "previous_response_id": id1,
+                    "input": "What fruit?"
+                }),
+            )
+            .await;
+        assert_eq!(r2.status(), StatusCode::OK);
+        let body2: Value = serde_json::from_str(&body_text(r2).await).expect("r2 JSON");
+        let out2 = body2["output"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(out2.contains("BLUEBERRY"), "expected history: {out2}");
+        assert!(out2.contains("What fruit?"), "expected new input: {out2}");
+
+        // ZDR (store = false) must not be persisted
+        let zdr = harness
+            .post_json(
+                "/v1/responses",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "store": false,
+                    "input": "ephemeral secret"
+                }),
+            )
+            .await;
+        assert_eq!(zdr.status(), StatusCode::OK);
+        let zdr_body: Value = serde_json::from_str(&body_text(zdr).await).expect("zdr JSON");
+        assert_eq!(zdr_body["store"], false);
+        let zdr_id = zdr_body["id"].as_str().expect("zdr id");
+
+        let miss = harness
+            .post_json(
+                "/v1/responses",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "previous_response_id": zdr_id,
+                    "input": "check"
+                }),
+            )
+            .await;
+        assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_2026_stateless_discover_headers_and_async_tasks() {
+        let dir = TempDir::new().expect("tempdir");
+        let plain = script(dir.path(), "plain.sh", PLAIN_SCRIPT);
+        let slow = script(dir.path(), "slow.sh", "#!/bin/sh\nsleep 10\necho awake\n");
+        let toml = format!(
+            r#"
+[defaults]
+model = "coding/default"
+
+{}
+{}
+[routes]
+"coding/default" = ["plain"]
+"coding/slow" = ["slow"]
+"#,
+            cli_backend("plain", &plain, 10, ""),
+            cli_backend("slow", &slow, 20, "")
+        );
+        let harness = Harness::new(toml).await;
+
+        // Stateless server/discover works with zero prior initialize handshake.
+        let disc = harness
+            .post_json(
+                "/mcp",
+                &[("mcp-method", "server/discover")],
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover",
+                    "params": {
+                        "_meta": {
+                            "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                        }
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(disc.status(), StatusCode::OK);
+        let disc_json: Value = serde_json::from_str(&body_text(disc).await).expect("discover");
+        assert_eq!(disc_json["result"]["protocolVersion"], "2026-07-28");
+        assert_eq!(disc_json["result"]["stateless"], true);
+
+        // Mismatched Mcp-Method header fails with -32600.
+        let bad_hdr = harness
+            .post_json(
+                "/mcp",
+                &[("mcp-method", "tools/call")],
+                json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}),
+            )
+            .await;
+        assert_eq!(bad_hdr.status(), StatusCode::BAD_REQUEST);
+        let bad_hdr_json: Value = serde_json::from_str(&body_text(bad_hdr).await).expect("err");
+        assert_eq!(bad_hdr_json["error"]["code"], -32600);
+
+        // Mismatched Mcp-Name header fails with -32600.
+        let bad_name = harness
+            .post_json(
+                "/mcp",
+                &[("mcp-method", "tools/call"), ("mcp-name", "wrong_tool")],
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "vouch_ask", "arguments": {"prompt": "hi"}}
+                }),
+            )
+            .await;
+        assert_eq!(bad_name.status(), StatusCode::BAD_REQUEST);
+
+        // tools/list includes 2026-07-28 cache hints.
+        let list = harness
+            .post_json(
+                "/mcp",
+                &[],
+                json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}),
+            )
+            .await;
+        assert_eq!(list.status(), StatusCode::OK);
+        let list_json: Value = serde_json::from_str(&body_text(list).await).expect("list");
+        assert_eq!(list_json["result"]["ttlMs"], 60_000);
+        assert_eq!(list_json["result"]["cacheScope"], "private");
+
+        // tasks/create -> tasks/result (waiting) completes cleanly.
+        let created = harness
+            .post_json(
+                "/mcp",
+                &[("mcp-method", "tasks/create")],
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tasks/create",
+                    "params": {
+                        "name": "route_coding_default",
+                        "arguments": {"prompt": "async task ping"}
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let created_json: Value = serde_json::from_str(&body_text(created).await).expect("task");
+        assert_eq!(created_json["result"]["status"], "working");
+        let task_id = created_json["result"]["taskId"].as_str().expect("taskId");
+
+        let res = harness
+            .post_json(
+                "/mcp",
+                &[],
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tasks/result",
+                    "params": {"taskId": task_id, "waitMs": 5000}
+                }),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res_json: Value = serde_json::from_str(&body_text(res).await).expect("result");
+        assert_eq!(res_json["result"]["status"], "completed");
+        assert_eq!(res_json["result"]["isError"], false);
+
+        // tasks/cancel cancels a long-running task.
+        let created_slow = harness
+            .post_json(
+                "/mcp",
+                &[],
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tasks/create",
+                    "params": {
+                        "name": "route_coding_slow",
+                        "arguments": {"prompt": "slow"}
+                    }
+                }),
+            )
+            .await;
+        let slow_json: Value = serde_json::from_str(&body_text(created_slow).await).expect("slow");
+        let slow_id = slow_json["result"]["taskId"].as_str().expect("slow taskId");
+
+        let cancelled = harness
+            .post_json(
+                "/mcp",
+                &[],
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "tasks/cancel",
+                    "params": {"taskId": slow_id}
+                }),
+            )
+            .await;
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        let cancelled_json: Value =
+            serde_json::from_str(&body_text(cancelled).await).expect("cancelled");
+        assert_eq!(cancelled_json["result"]["status"], "cancelled");
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn anthropic_extended_thinking_and_cache_control_passthrough() {
+        async fn mock_thinking_upstream(Json(payload): Json<Value>) -> Response {
+            assert_eq!(payload["thinking"]["type"], "enabled");
+            assert_eq!(payload["thinking"]["budget_tokens"], 1024);
+            let has_cache = payload["messages"].as_array().is_some_and(|msgs| {
+                msgs.iter().any(|m| {
+                    m["content"]
+                        .as_array()
+                        .is_some_and(|parts| parts.iter().any(|p| p.get("cache_control").is_some()))
+                })
+            });
+            assert!(
+                has_cache,
+                "cache_control should be preserved upstream: {payload}"
+            );
+
+            if payload.get("stream").and_then(Value::as_bool) == Some(true) {
+                let sse = concat!(
+                    "event: content_block_delta\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me reason.\"}}\n\n",
+                    "event: content_block_delta\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_abc\"}}\n\n",
+                    "event: content_block_delta\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Final answer\"}}\n\n",
+                    "event: message_delta\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n"
+                );
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(sse))
+                    .expect("SSE response");
+            }
+
+            Json(json!({
+                "id": "msg_up_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "Step by step", "signature": "sig_xyz"},
+                    {"type": "redacted_thinking", "data": "opaque_blob"},
+                    {"type": "text", "text": "42"}
+                ],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 20, "output_tokens": 12}
+            }))
+            .into_response()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = AxumRouter::new().route("/v1/messages", post(mock_thinking_upstream));
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let toml = format!(
+            r#"
+[defaults]
+model = "claude/thinking"
+
+[[backends]]
+id = "anth_up"
+kind = "http"
+base_url = "http://{addr}"
+upstream_path = "/v1/messages"
+
+[routes]
+"claude/thinking" = ["anth_up"]
+"#
+        );
+        let harness = Harness::new(toml).await;
+
+        let req_body = |stream: bool| {
+            json!({
+                "model": "claude/thinking",
+                "max_tokens": 2048,
+                "stream": stream,
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "Compute answer",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }]
+            })
+        };
+
+        let ns = harness
+            .post_json("/v1/messages", &[], req_body(false))
+            .await;
+        assert_eq!(ns.status(), StatusCode::OK);
+        let ns_json: Value = serde_json::from_str(&body_text(ns).await).expect("JSON");
+        let blocks = ns_json["content"].as_array().expect("content array");
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "Step by step");
+        assert_eq!(blocks[0]["signature"], "sig_xyz");
+        assert_eq!(blocks[1]["type"], "redacted_thinking");
+        assert_eq!(blocks[2]["type"], "text");
+        assert_eq!(blocks[2]["text"], "42");
+
+        let s = harness.post_json("/v1/messages", &[], req_body(true)).await;
+        assert_eq!(s.status(), StatusCode::OK);
+        let sse = body_text(s).await;
+        assert!(sse.contains("thinking_delta"), "sse: {sse}");
+        assert!(sse.contains("Let me reason."), "sse: {sse}");
+        assert!(sse.contains("signature_delta"), "sse: {sse}");
+        assert!(sse.contains("Final answer"), "sse: {sse}");
+
+        harness.state.shutdown().await;
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bench_runner_collects_latency_and_ttft() {
+        let dir = TempDir::new().expect("tempdir");
+        let plain = script(dir.path(), "plain.sh", PLAIN_SCRIPT);
+        let toml = format!(
+            r#"
+[defaults]
+model = "coding/default"
+
+[[backends]]
+id = "plain"
+kind = "cli"
+command = {:?}
+stdin = true
+max_concurrency = 2
+queue_timeout_ms = 2000
+timeout_secs = 10
+
+[routes]
+"coding/default" = ["plain"]
+"#,
+            plain.display().to_string()
+        );
+        let harness = Harness::new(toml).await;
+
+        let report = bench::run_benchmark(&harness.state, "coding/default", 4, 2, "ping", true)
+            .await
+            .expect("bench report");
+        assert_eq!(report.succeeded, 4);
+        assert_eq!(report.failed, 0);
+        assert!(report.total_p95_ms >= report.ttft_min_ms);
+        assert!(report.rps > 0.0);
+
+        harness.state.shutdown().await;
+    }
+}
