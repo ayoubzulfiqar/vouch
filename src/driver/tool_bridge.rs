@@ -174,8 +174,9 @@ pub fn parse_tool_calls(raw: &str) -> (String, Vec<ToolCall>) {
         };
         let body_end = body_start + rel_end;
         let inner = raw[body_start..body_end].trim();
-        if let Some(call) = parse_single_tool_call(inner) {
-            calls.push(call);
+        let parsed_calls = parse_tool_calls_block(inner);
+        if !parsed_calls.is_empty() {
+            calls.extend(parsed_calls);
         } else {
             remaining.push_str(&raw[start..body_end + CLOSE_TAG.len()]);
         }
@@ -244,6 +245,11 @@ pub fn strip_markdown_fences(raw: &str) -> String {
     body.trim().to_string()
 }
 
+/// Returns `true` when `error` originated from structured output JSON/Schema validation.
+pub fn is_schema_validation_error(error: &GatewayError) -> bool {
+    matches!(error, GatewayError::Upstream(msg) if msg.contains("structured output"))
+}
+
 /// Strip accidental Markdown fences and validate structured JSON/Schema output.
 pub fn enforce_response_format(raw: &str, format: &ResponseFormat) -> Result<String> {
     let cleaned = strip_markdown_fences(raw);
@@ -259,23 +265,43 @@ pub fn enforce_response_format(raw: &str, format: &ResponseFormat) -> Result<Str
     Ok(cleaned)
 }
 
+fn json_matches_type(value: &Value, expected_type: &str) -> bool {
+    match expected_type {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
 fn validate_json_schema_value(value: &Value, schema: &Value, path: &str) -> Result<()> {
-    if let Some(expected_type) = schema.get("type").and_then(Value::as_str) {
-        let ok = match expected_type {
-            "object" => value.is_object(),
-            "array" => value.is_array(),
-            "string" => value.is_string(),
-            "boolean" => value.is_boolean(),
-            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-            "number" => value.is_number(),
-            "null" => value.is_null(),
-            _ => true,
-        };
-        if !ok {
-            return Err(GatewayError::Upstream(format!(
-                "structured output at {path} expected JSON type {expected_type:?}"
-            )));
+    if let Some(expected) = schema.get("type") {
+        if let Some(expected_type) = expected.as_str() {
+            if !json_matches_type(value, expected_type) {
+                return Err(GatewayError::Upstream(format!(
+                    "structured output at {path} expected JSON type {expected_type:?}"
+                )));
+            }
+        } else if let Some(expected_types) = expected.as_array() {
+            let allowed: Vec<&str> = expected_types.iter().filter_map(Value::as_str).collect();
+            if !allowed.is_empty() && !allowed.iter().any(|t| json_matches_type(value, t)) {
+                return Err(GatewayError::Upstream(format!(
+                    "structured output at {path} expected JSON type in {allowed:?}"
+                )));
+            }
         }
+    }
+
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
+        && !allowed.contains(value)
+    {
+        return Err(GatewayError::Upstream(format!(
+            "structured output at {path} value must be one of {allowed:?}"
+        )));
     }
 
     if let Some(obj) = value.as_object() {
@@ -288,41 +314,88 @@ fn validate_json_schema_value(value: &Value, schema: &Value, path: &str) -> Resu
                 }
             }
         }
-        if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+        let props = schema.get("properties").and_then(Value::as_object);
+        if let Some(props) = props {
             for (key, prop_schema) in props {
                 if let Some(child) = obj.get(key) {
                     validate_json_schema_value(child, prop_schema, &format!("{path}.{key}"))?;
                 }
             }
         }
+        if let Some(additional) = schema.get("additionalProperties") {
+            match additional {
+                Value::Bool(false) => {
+                    for key in obj.keys() {
+                        let declared = props.is_some_and(|p| p.contains_key(key));
+                        if !declared {
+                            return Err(GatewayError::Upstream(format!(
+                                "structured output at {path} has disallowed additional property {key:?}"
+                            )));
+                        }
+                    }
+                }
+                Value::Object(_) => {
+                    for (key, child) in obj {
+                        let declared = props.is_some_and(|p| p.contains_key(key));
+                        if !declared {
+                            validate_json_schema_value(
+                                child,
+                                additional,
+                                &format!("{path}.{key}"),
+                            )?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     } else if let Some(items) = value.as_array()
         && let Some(item_schema) = schema.get("items")
     {
-        for (idx, item) in items.iter().enumerate() {
-            validate_json_schema_value(item, item_schema, &format!("{path}[{idx}]"))?;
+        if item_schema.is_object() {
+            for (idx, item) in items.iter().enumerate() {
+                validate_json_schema_value(item, item_schema, &format!("{path}[{idx}]"))?;
+            }
+        } else if item_schema.as_bool() == Some(false) && !items.is_empty() {
+            return Err(GatewayError::Upstream(format!(
+                "structured output at {path} does not allow array items"
+            )));
+        } else if let Some(tuple_schemas) = item_schema.as_array() {
+            for (idx, (item, sub_schema)) in items.iter().zip(tuple_schemas.iter()).enumerate() {
+                validate_json_schema_value(item, sub_schema, &format!("{path}[{idx}]"))?;
+            }
         }
     }
     Ok(())
 }
 
-fn parse_single_tool_call(inner: &str) -> Option<ToolCall> {
-    let value: Value = serde_json::from_str(inner).ok()?;
-    let name = value
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())?
-        .to_string();
-    let arguments = match value.get("arguments") {
-        Some(Value::String(raw)) => raw.clone(),
-        Some(other) => other.to_string(),
-        None => "{}".to_string(),
+fn parse_tool_calls_block(inner: &str) -> Vec<ToolCall> {
+    let Ok(value) = serde_json::from_str::<Value>(inner) else {
+        return Vec::new();
     };
-    Some(ToolCall {
-        id: format!("call_{}", Uuid::new_v4().simple()),
-        name,
-        arguments,
-    })
+    let parse_obj = |item: &Value| -> Option<ToolCall> {
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())?
+            .to_string();
+        let arguments = match item.get("arguments") {
+            Some(Value::String(raw)) => raw.clone(),
+            Some(other) => other.to_string(),
+            None => "{}".to_string(),
+        };
+        Some(ToolCall {
+            id: format!("call_{}", Uuid::new_v4().simple()),
+            name,
+            arguments,
+        })
+    };
+    if let Some(arr) = value.as_array() {
+        arr.iter().filter_map(parse_obj).collect()
+    } else {
+        parse_obj(&value).into_iter().collect()
+    }
 }
 
 /// Incremental event emitted by [`StreamingToolParser`].
@@ -382,15 +455,18 @@ impl StreamingToolParser {
                 }
             } else if let Some(end) = self.buffer.find(CLOSE_TAG) {
                 let inner = self.buffer[..end].trim();
-                if let Some(call) = parse_single_tool_call(inner) {
+                let calls = parse_tool_calls_block(inner);
+                if !calls.is_empty() {
                     self.saw_tool_calls = true;
-                    events.push(StreamParseEvent::ToolCall(ToolCallDelta {
-                        index: self.next_index,
-                        id: Some(call.id),
-                        name: Some(call.name),
-                        arguments_delta: Some(call.arguments),
-                    }));
-                    self.next_index += 1;
+                    for call in calls {
+                        events.push(StreamParseEvent::ToolCall(ToolCallDelta {
+                            index: self.next_index,
+                            id: Some(call.id),
+                            name: Some(call.name),
+                            arguments_delta: Some(call.arguments),
+                        }));
+                        self.next_index += 1;
+                    }
                 } else {
                     events.push(StreamParseEvent::Text(format!(
                         "{OPEN_TAG}{}{CLOSE_TAG}",
@@ -771,6 +847,72 @@ mod tests {
 
         let invalid_json = "not json at all";
         assert!(enforce_response_format(invalid_json, &format).is_err());
+
+        let strict_schema = json!({
+            "type": "object",
+            "required": ["mode", "items"],
+            "additionalProperties": false,
+            "properties": {
+                "mode": {"type": "string", "enum": ["fast", "deep"]},
+                "note": {"type": ["string", "null"]},
+                "items": {
+                    "type": "array",
+                    "items": {"type": "integer"}
+                }
+            }
+        });
+        let strict_format = ResponseFormat::JsonSchema {
+            name: Some("strict".into()),
+            schema: strict_schema.clone(),
+            strict: true,
+            raw: json!({"type": "json_schema", "json_schema": {"name": "strict", "schema": strict_schema}}),
+        };
+        assert!(
+            enforce_response_format(
+                r#"{"mode":"fast","note":null,"items":[1,2]}"#,
+                &strict_format
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_response_format(r#"{"mode":"invalid","items":[1]}"#, &strict_format).is_err()
+        );
+        assert!(
+            enforce_response_format(
+                r#"{"mode":"fast","items":[1],"extra":true}"#,
+                &strict_format
+            )
+            .is_err()
+        );
+        assert!(
+            enforce_response_format(r#"{"mode":"fast","items":["bad"]}"#, &strict_format).is_err()
+        );
+    }
+
+    #[test]
+    fn streaming_tool_parser_emits_multiple_parallel_tool_calls() {
+        let mut parser = StreamingToolParser::new();
+        let mut events = parser.push("Running checks:\n<vouch_tool_call>{\"name\":\"ping\",");
+        events.extend(parser.push("\"arguments\":{\"host\":\"a\"}}</vouch_tool_call><vouch_to"));
+        events.extend(
+            parser.push(
+                "ol_call>{\"name\":\"echo\",\"arguments\":{\"msg\":\"b\"}}</vouch_tool_call>",
+            ),
+        );
+        events.extend(parser.finish());
+        let calls: Vec<_> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                StreamParseEvent::ToolCall(delta) => Some(delta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].index, 0);
+        assert_eq!(calls[0].name.as_deref(), Some("ping"));
+        assert_eq!(calls[1].index, 1);
+        assert_eq!(calls[1].name.as_deref(), Some("echo"));
+        assert_ne!(calls[0].id, calls[1].id);
     }
 
     #[test]
