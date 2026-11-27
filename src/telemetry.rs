@@ -118,11 +118,34 @@ where
     global_registry().set_secrets(secrets);
 }
 
-/// Install the global JSON tracing subscriber.
+/// Output stream used by [`RedactingMakeWriter`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogTarget {
+    /// Standard output (default for `vouch serve`).
+    Stdout,
+    /// Standard error (required for `vouch mcp --transport stdio`).
+    Stderr,
+}
+
+/// Install the global JSON tracing subscriber writing to stdout.
 ///
 /// Returns an error when a subscriber has already been installed, which makes
 /// double-initialization in tests explicit rather than silently ignored.
 pub fn init(log_level: &str, secrets: impl IntoIterator<Item = String>) -> Result<()> {
+    init_with_target(log_level, secrets, LogTarget::Stdout)
+}
+
+/// Install the global JSON tracing subscriber writing to stderr.
+pub fn init_stderr(log_level: &str, secrets: impl IntoIterator<Item = String>) -> Result<()> {
+    init_with_target(log_level, secrets, LogTarget::Stderr)
+}
+
+/// Install the global JSON tracing subscriber with an explicit output target.
+pub fn init_with_target(
+    log_level: &str,
+    secrets: impl IntoIterator<Item = String>,
+    target: LogTarget,
+) -> Result<()> {
     set_global_secrets(secrets);
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
@@ -135,7 +158,7 @@ pub fn init(log_level: &str, secrets: impl IntoIterator<Item = String>) -> Resul
         .with_target(true)
         .with_thread_ids(false)
         .with_thread_names(false)
-        .with_writer(RedactingMakeWriter::new(global_registry().clone()))
+        .with_writer(RedactingMakeWriter::new(global_registry().clone(), target))
         .with_env_filter(filter)
         .finish();
 
@@ -147,12 +170,13 @@ pub fn init(log_level: &str, secrets: impl IntoIterator<Item = String>) -> Resul
 #[derive(Clone, Debug)]
 pub struct RedactingMakeWriter {
     registry: Arc<RedactionRegistry>,
+    target: LogTarget,
 }
 
 impl RedactingMakeWriter {
-    /// Build a writer for the given registry.
-    pub fn new(registry: Arc<RedactionRegistry>) -> Self {
-        Self { registry }
+    /// Build a writer for the given registry and output target.
+    pub fn new(registry: Arc<RedactionRegistry>, target: LogTarget) -> Self {
+        Self { registry, target }
     }
 }
 
@@ -162,14 +186,16 @@ impl<'a> MakeWriter<'a> for RedactingMakeWriter {
     fn make_writer(&'a self) -> Self::Writer {
         RedactingWriter {
             registry: &self.registry,
+            target: self.target,
             buffer: Vec::with_capacity(512),
         }
     }
 }
 
-/// Buffers a complete log event, redacts it, and writes it to stdout.
+/// Buffers a complete log event, redacts it, and writes it to the target stream.
 pub struct RedactingWriter<'a> {
     registry: &'a RedactionRegistry,
+    target: LogTarget,
     buffer: Vec<u8>,
 }
 
@@ -181,10 +207,20 @@ impl RedactingWriter<'_> {
         let raw = String::from_utf8_lossy(&self.buffer);
         let redacted = self.registry.redact(&raw);
         self.buffer.clear();
-        let stdout = io::stdout();
-        let mut lock = stdout.lock();
-        lock.write_all(redacted.as_bytes())?;
-        lock.flush()
+        match self.target {
+            LogTarget::Stdout => {
+                let stdout = io::stdout();
+                let mut lock = stdout.lock();
+                lock.write_all(redacted.as_bytes())?;
+                lock.flush()
+            }
+            LogTarget::Stderr => {
+                let stderr = io::stderr();
+                let mut lock = stderr.lock();
+                lock.write_all(redacted.as_bytes())?;
+                lock.flush()
+            }
+        }
     }
 }
 
