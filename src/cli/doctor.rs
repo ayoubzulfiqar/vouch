@@ -192,6 +192,7 @@ async fn probe_inner(
         backend_session_id: None,
         delta_messages: None,
         session_capture: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        trace_context: None,
         extra: serde_json::Map::new(),
     };
 
