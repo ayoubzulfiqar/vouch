@@ -389,6 +389,8 @@ pub struct ExecutionRequest {
     pub delta_messages: Option<Vec<ChatMessage>>,
     /// Slot populated with a newly captured `backend_session_id` after execution.
     pub session_capture: Arc<parking_lot::Mutex<Option<String>>>,
+    /// Propagated W3C trace context for child spans and upstream headers.
+    pub trace_context: Option<crate::telemetry::TraceContext>,
     /// Protocol-specific fields forwarded to HTTP upstreams.
     pub extra: serde_json::Map<String, Value>,
 }
@@ -892,6 +894,73 @@ impl Default for AnsiStripper {
 pub fn strip_ansi(bytes: &[u8]) -> String {
     let mut stripper = AnsiStripper::new();
     stripper.feed(bytes)
+}
+
+/// Stateful UTF-8 boundary decoder for incremental subprocess `read` loops.
+///
+/// Decodes complete leading UTF-8 codepoints immediately via `std::str::from_utf8`
+/// (`valid_up_to()`), replaces broken mid-stream byte sequences with `U+FFFD`,
+/// and carries incomplete trailing multi-byte UTF-8 sequences over to the next
+/// read call so characters split across OS pipe buffers are never corrupted.
+#[derive(Debug, Default)]
+pub struct Utf8ChunkDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8ChunkDecoder {
+    /// Create a decoder with an empty carry buffer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed raw bytes and return the valid UTF-8 prefix string ready for processing.
+    pub fn feed(&mut self, bytes: &[u8]) -> String {
+        if bytes.is_empty() {
+            return String::new();
+        }
+        self.pending.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(valid) => {
+                    out.push_str(valid);
+                    self.pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    if valid_up_to > 0
+                        && let Ok(valid) = std::str::from_utf8(&self.pending[..valid_up_to])
+                    {
+                        out.push_str(valid);
+                    }
+                    match error.error_len() {
+                        Some(bad_len) => {
+                            out.push('\u{FFFD}');
+                            self.pending.drain(..valid_up_to + bad_len);
+                        }
+                        None => {
+                            if valid_up_to > 0 {
+                                self.pending.drain(..valid_up_to);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Flush any incomplete trailing bytes at EOF cleanly as replacement characters.
+    pub fn finish(&mut self) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let remainder = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        remainder
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1784,6 +1853,47 @@ pub(crate) async fn emit_subprocess_tail(
         .is_ok()
 }
 
+/// Send pre-built stream chunks over the bounded channel, returning `false` if
+/// the downstream consumer has disconnected.
+pub(crate) async fn dispatch_stream_chunks(
+    sender: &tokio::sync::mpsc::Sender<Result<StreamChunk>>,
+    chunks: Vec<StreamChunk>,
+) -> bool {
+    for chunk in chunks {
+        if sender.send(Ok(chunk)).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Flush remaining text/tool-call buffers for `OutputMode::Text` streams,
+/// enforce any `response_format`, and send the terminal finish chunk.
+pub(crate) async fn finish_subprocess_text_stream(
+    sender: &tokio::sync::mpsc::Sender<Result<StreamChunk>>,
+    filter: &mut tool_bridge::SubprocessStreamFilter,
+    model: &str,
+    prompt: &str,
+    produced: &str,
+) -> bool {
+    match filter.finish() {
+        Ok((tail_chunks, reason)) => {
+            if !dispatch_stream_chunks(sender, tail_chunks).await {
+                return false;
+            }
+            let usage = Usage::estimate_for_model(model, prompt, produced);
+            sender
+                .send(Ok(StreamChunk::finish(reason, Some(usage))))
+                .await
+                .is_ok()
+        }
+        Err(error) => {
+            let _ = sender.send(Err(error)).await;
+            false
+        }
+    }
+}
+
 /// Convert a byte-count-limited error into a readable message.
 pub fn io_error(context: &str, error: std::io::Error) -> GatewayError {
     GatewayError::Io(std::io::Error::new(
@@ -1850,5 +1960,16 @@ mod tests {
         );
         assert_eq!(WorkspaceMode::parse("none"), Some(WorkspaceMode::None));
         assert_eq!(WorkspaceMode::parse("bogus"), None);
+    }
+
+    #[test]
+    fn utf8_chunk_decoder_handles_split_multibyte_codepoints() {
+        let mut decoder = Utf8ChunkDecoder::new();
+        let crab = "hi 🦀!".as_bytes();
+        // Split right inside the 4-byte '🦀' sequence
+        assert_eq!(decoder.feed(&crab[..4]), "hi ");
+        assert_eq!(decoder.feed(&crab[4..5]), "");
+        assert_eq!(decoder.feed(&crab[5..]), "🦀!");
+        assert_eq!(decoder.finish(), "");
     }
 }
