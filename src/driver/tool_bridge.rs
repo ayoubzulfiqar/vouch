@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    driver::{ChatMessage, ResponseFormat, ToolCall},
+    driver::{ChatMessage, ResponseFormat, StreamChunk, ToolCall, ToolCallDelta},
     error::{GatewayError, Result},
 };
 
@@ -325,6 +325,378 @@ fn parse_single_tool_call(inner: &str) -> Option<ToolCall> {
     })
 }
 
+/// Incremental event emitted by [`StreamingToolParser`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamParseEvent {
+    /// Confirmed assistant text that is safe to emit immediately.
+    Text(String),
+    /// Completed structured tool-call delta parsed from `<vouch_tool_call>...</vouch_tool_call>`.
+    ToolCall(ToolCallDelta),
+}
+
+/// Incremental parser for `<vouch_tool_call>...</vouch_tool_call>` blocks split across chunks.
+///
+/// Buffers potential tag prefixes at chunk boundaries so partial `<vouch_tool_call>` tags
+/// are never leaked to streaming clients while normal assistant prose streams immediately.
+#[derive(Debug, Default)]
+pub struct StreamingToolParser {
+    in_tag: bool,
+    buffer: String,
+    next_index: usize,
+    saw_tool_calls: bool,
+}
+
+impl StreamingToolParser {
+    /// Create a new streaming tool parser.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True if at least one complete `<vouch_tool_call>` block has been parsed.
+    pub fn saw_tool_calls(&self) -> bool {
+        self.saw_tool_calls
+    }
+
+    /// Feed an incoming chunk and return confirmed text and/or completed tool calls.
+    pub fn push(&mut self, chunk: &str) -> Vec<StreamParseEvent> {
+        if !chunk.is_empty() {
+            self.buffer.push_str(chunk);
+        }
+        let mut events = Vec::new();
+        loop {
+            if !self.in_tag {
+                if let Some(start) = self.buffer.find(OPEN_TAG) {
+                    if start > 0 {
+                        events.push(StreamParseEvent::Text(self.buffer[..start].to_string()));
+                    }
+                    self.buffer.drain(..start + OPEN_TAG.len());
+                    self.in_tag = true;
+                } else {
+                    let hold = trailing_open_tag_prefix_len(&self.buffer);
+                    let emit_len = self.buffer.len().saturating_sub(hold);
+                    if emit_len > 0 {
+                        events.push(StreamParseEvent::Text(self.buffer[..emit_len].to_string()));
+                        self.buffer.drain(..emit_len);
+                    }
+                    break;
+                }
+            } else if let Some(end) = self.buffer.find(CLOSE_TAG) {
+                let inner = self.buffer[..end].trim();
+                if let Some(call) = parse_single_tool_call(inner) {
+                    self.saw_tool_calls = true;
+                    events.push(StreamParseEvent::ToolCall(ToolCallDelta {
+                        index: self.next_index,
+                        id: Some(call.id),
+                        name: Some(call.name),
+                        arguments_delta: Some(call.arguments),
+                    }));
+                    self.next_index += 1;
+                } else {
+                    events.push(StreamParseEvent::Text(format!(
+                        "{OPEN_TAG}{}{CLOSE_TAG}",
+                        &self.buffer[..end]
+                    )));
+                }
+                self.buffer.drain(..end + CLOSE_TAG.len());
+                self.in_tag = false;
+            } else {
+                break;
+            }
+        }
+        events
+    }
+
+    /// Flush any buffered tail at EOF.
+    pub fn finish(&mut self) -> Vec<StreamParseEvent> {
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        if self.in_tag {
+            events.push(StreamParseEvent::Text(format!(
+                "{OPEN_TAG}{}",
+                std::mem::take(&mut self.buffer)
+            )));
+            self.in_tag = false;
+        } else {
+            events.push(StreamParseEvent::Text(std::mem::take(&mut self.buffer)));
+        }
+        events
+    }
+}
+
+fn trailing_open_tag_prefix_len(text: &str) -> usize {
+    let max_len = (OPEN_TAG.len() - 1).min(text.len());
+    for len in (1..=max_len).rev() {
+        if text.is_char_boundary(text.len() - len) && text.ends_with(&OPEN_TAG[..len]) {
+            return len;
+        }
+    }
+    0
+}
+
+#[derive(Debug)]
+enum FencePhase {
+    Leading(String),
+    Body { backtick_hold: String },
+}
+
+/// Incremental Markdown code-fence stripper and JSON/JSON-Schema validator for streams.
+#[derive(Debug)]
+pub struct StreamingJsonFenceStripper {
+    format: ResponseFormat,
+    phase: FencePhase,
+    accumulated: String,
+}
+
+impl StreamingJsonFenceStripper {
+    /// Create a streaming fence stripper & validator for `format`.
+    pub fn new(format: ResponseFormat) -> Self {
+        Self {
+            format,
+            phase: FencePhase::Leading(String::new()),
+            accumulated: String::new(),
+        }
+    }
+
+    /// Feed confirmed assistant text and return fence-stripped text ready for emission.
+    pub fn push(&mut self, chunk: &str) -> Option<String> {
+        if chunk.is_empty() {
+            return None;
+        }
+        let mut out = String::new();
+        match &mut self.phase {
+            FencePhase::Leading(buf) => {
+                buf.push_str(chunk);
+                let trimmed = buf.trim_start();
+                if trimmed.is_empty() {
+                    if buf.len() > 64 {
+                        let ready = std::mem::take(buf);
+                        self.phase = FencePhase::Body {
+                            backtick_hold: String::new(),
+                        };
+                        self.push_body(&ready, &mut out);
+                    }
+                } else if !trimmed.starts_with('`') {
+                    let ready = std::mem::take(buf);
+                    self.phase = FencePhase::Body {
+                        backtick_hold: String::new(),
+                    };
+                    self.push_body(&ready, &mut out);
+                } else if trimmed.len() < 3 {
+                    if !"```".starts_with(trimmed) {
+                        let ready = std::mem::take(buf);
+                        self.phase = FencePhase::Body {
+                            backtick_hold: String::new(),
+                        };
+                        self.push_body(&ready, &mut out);
+                    }
+                } else if let Some(after) = trimmed.strip_prefix("```") {
+                    if let Some(nl) = after.find('\n') {
+                        let header = after[..nl].trim();
+                        if is_fence_lang_header(header) {
+                            let rest = after[nl + 1..].to_string();
+                            self.phase = FencePhase::Body {
+                                backtick_hold: String::new(),
+                            };
+                            self.push_body(&rest, &mut out);
+                        } else {
+                            let rest = after.to_string();
+                            self.phase = FencePhase::Body {
+                                backtick_hold: String::new(),
+                            };
+                            self.push_body(&rest, &mut out);
+                        }
+                    } else if after.chars().any(|ch| !is_fence_lang_char(ch)) {
+                        let rest = after.to_string();
+                        self.phase = FencePhase::Body {
+                            backtick_hold: String::new(),
+                        };
+                        self.push_body(&rest, &mut out);
+                    } else if after.len() > 32 {
+                        let ready = std::mem::take(buf);
+                        self.phase = FencePhase::Body {
+                            backtick_hold: String::new(),
+                        };
+                        self.push_body(&ready, &mut out);
+                    }
+                } else {
+                    let ready = std::mem::take(buf);
+                    self.phase = FencePhase::Body {
+                        backtick_hold: String::new(),
+                    };
+                    self.push_body(&ready, &mut out);
+                }
+            }
+            FencePhase::Body { .. } => {
+                self.push_body(chunk, &mut out);
+            }
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    fn push_body(&mut self, text: &str, out: &mut String) {
+        let FencePhase::Body { backtick_hold } = &mut self.phase else {
+            return;
+        };
+        let mut combined = std::mem::take(backtick_hold);
+        combined.push_str(text);
+
+        // Hold back a trailing suffix if it begins with backticks followed only
+        // by backticks/whitespace (potential closing ``` fence split across reads).
+        let hold_start = find_trailing_closing_fence_start(&combined);
+        if hold_start < combined.len() {
+            *backtick_hold = combined[hold_start..].to_string();
+            let emit = &combined[..hold_start];
+            self.accumulated.push_str(emit);
+            out.push_str(emit);
+        } else {
+            self.accumulated.push_str(&combined);
+            out.push_str(&combined);
+        }
+    }
+
+    /// Flush buffered tail and validate accumulated JSON when `validate` is true.
+    pub fn finish(&mut self, validate: bool) -> Result<Option<String>> {
+        let mut tail = None;
+        let phase = std::mem::replace(
+            &mut self.phase,
+            FencePhase::Body {
+                backtick_hold: String::new(),
+            },
+        );
+        match phase {
+            FencePhase::Leading(buf) => {
+                let cleaned = strip_markdown_fences(&buf);
+                self.accumulated.push_str(&cleaned);
+                if !cleaned.is_empty() {
+                    tail = Some(cleaned);
+                }
+            }
+            FencePhase::Body { backtick_hold } => {
+                let trimmed = backtick_hold.trim();
+                if !(trimmed.starts_with("```") && trimmed.chars().all(|c| c == '`'))
+                    && !backtick_hold.is_empty()
+                {
+                    self.accumulated.push_str(&backtick_hold);
+                    tail = Some(backtick_hold);
+                }
+            }
+        }
+        if validate {
+            enforce_response_format(&self.accumulated, &self.format)?;
+        }
+        Ok(tail)
+    }
+}
+
+fn is_fence_lang_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')
+}
+
+fn is_fence_lang_header(header: &str) -> bool {
+    header.is_empty() || header.chars().all(is_fence_lang_char)
+}
+
+fn find_trailing_closing_fence_start(text: &str) -> usize {
+    let trimmed_end = text.trim_end();
+    if trimmed_end.is_empty() || !trimmed_end.ends_with('`') {
+        return text.len();
+    }
+    let backtick_start = trimmed_end
+        .rfind(|ch| ch != '`')
+        .map(|idx| idx + text[idx..].chars().next().map_or(1, char::len_utf8))
+        .unwrap_or(0);
+    let backtick_count = trimmed_end.len().saturating_sub(backtick_start);
+    if (1..=3).contains(&backtick_count) {
+        backtick_start
+    } else {
+        text.len()
+    }
+}
+
+/// Combined streaming post-processor for CLI/PTY text streams: parses split
+/// `<vouch_tool_call>` blocks and strips/validates `response_format` JSON.
+#[derive(Debug)]
+pub struct SubprocessStreamFilter {
+    tool_parser: Option<StreamingToolParser>,
+    fence_stripper: Option<StreamingJsonFenceStripper>,
+}
+
+impl SubprocessStreamFilter {
+    /// Create a filter for `OutputMode::Text` subprocess streams.
+    pub fn new(parse_tools: bool, response_format: Option<ResponseFormat>) -> Self {
+        Self {
+            tool_parser: parse_tools.then(StreamingToolParser::new),
+            fence_stripper: response_format.map(StreamingJsonFenceStripper::new),
+        }
+    }
+
+    /// True when at least one tool call has been emitted.
+    pub fn saw_tool_calls(&self) -> bool {
+        self.tool_parser
+            .as_ref()
+            .is_some_and(StreamingToolParser::saw_tool_calls)
+    }
+
+    /// Process a clean text chunk into stream chunks ready to forward immediately.
+    pub fn push(&mut self, clean_text: &str) -> Vec<StreamChunk> {
+        let mut chunks = Vec::new();
+        if let Some(parser) = &mut self.tool_parser {
+            for event in parser.push(clean_text) {
+                self.push_event(event, &mut chunks);
+            }
+        } else {
+            self.push_text_event(clean_text.to_string(), &mut chunks);
+        }
+        chunks
+    }
+
+    fn push_event(&mut self, event: StreamParseEvent, out: &mut Vec<StreamChunk>) {
+        match event {
+            StreamParseEvent::Text(text) => self.push_text_event(text, out),
+            StreamParseEvent::ToolCall(delta) => out.push(StreamChunk::tool_calls(vec![delta])),
+        }
+    }
+
+    fn push_text_event(&mut self, text: String, out: &mut Vec<StreamChunk>) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(stripper) = &mut self.fence_stripper {
+            if let Some(stripped) = stripper.push(&text)
+                && !stripped.is_empty()
+            {
+                out.push(StreamChunk::delta(stripped));
+            }
+        } else {
+            out.push(StreamChunk::delta(text));
+        }
+    }
+
+    /// Flush buffered tails and validate structured JSON output when applicable.
+    ///
+    /// Returns trailing chunks plus the terminal finish reason (`"tool_calls"` or `"stop"`).
+    pub fn finish(&mut self) -> Result<(Vec<StreamChunk>, &'static str)> {
+        let mut chunks = Vec::new();
+        if let Some(parser) = &mut self.tool_parser {
+            let pending = parser.finish();
+            for event in pending {
+                self.push_event(event, &mut chunks);
+            }
+        }
+        let saw_tools = self.saw_tool_calls();
+        if let Some(stripper) = &mut self.fence_stripper
+            && let Some(tail) = stripper.finish(!saw_tools)?
+            && !tail.is_empty()
+        {
+            chunks.push(StreamChunk::delta(tail));
+        }
+        let reason = if saw_tools { "tool_calls" } else { "stop" };
+        Ok((chunks, reason))
+    }
+}
+
 fn capitalize_role(role: &str) -> String {
     let mut chars = role.chars();
     match chars.next() {
@@ -399,5 +771,47 @@ mod tests {
 
         let invalid_json = "not json at all";
         assert!(enforce_response_format(invalid_json, &format).is_err());
+    }
+
+    #[test]
+    fn streaming_tool_parser_buffers_split_tags_without_leaking() {
+        let mut parser = StreamingToolParser::new();
+        let e1 = parser.push("Let me check <vouch_tool");
+        assert_eq!(e1, vec![StreamParseEvent::Text("Let me check ".into())]);
+
+        let e2 = parser.push("_call>{\"name\":\"search\",");
+        assert!(e2.is_empty());
+
+        let e3 = parser.push("\"arguments\":{\"q\":\"rust\"}}</vouch_tool_call> done");
+        assert_eq!(e3.len(), 2);
+        match &e3[0] {
+            StreamParseEvent::ToolCall(delta) => {
+                assert_eq!(delta.index, 0);
+                assert_eq!(delta.name.as_deref(), Some("search"));
+                assert_eq!(delta.arguments_delta.as_deref(), Some("{\"q\":\"rust\"}"));
+            }
+            other => panic!("expected tool call, got {other:?}"),
+        }
+        assert_eq!(e3[1], StreamParseEvent::Text(" done".into()));
+        assert!(parser.finish().is_empty());
+        assert!(parser.saw_tool_calls());
+    }
+
+    #[test]
+    fn streaming_fence_stripper_handles_split_fences_and_validates() {
+        let format = ResponseFormat::JsonObject;
+        let mut stripper = StreamingJsonFenceStripper::new(format.clone());
+        assert_eq!(stripper.push("```js"), None);
+        assert_eq!(
+            stripper.push("on\n{\"ok\":true}"),
+            Some("{\"ok\":true}".into())
+        );
+        assert_eq!(stripper.push("\n``"), Some("\n".into()));
+        assert_eq!(stripper.push("`\n"), None);
+        assert_eq!(stripper.finish(true).expect("valid json"), None);
+
+        let mut bad = StreamingJsonFenceStripper::new(format);
+        let _ = bad.push("not-json");
+        assert!(bad.finish(true).is_err());
     }
 }
