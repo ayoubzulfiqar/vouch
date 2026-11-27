@@ -2154,3 +2154,1072 @@ timeout_secs = 10
         harness.state.shutdown().await;
     }
 }
+
+mod v3_tests {
+    use super::*;
+    use axum::{
+        Router as AxumRouter,
+        extract::State as AxumState,
+        http::header,
+        response::IntoResponse,
+        routing::{get, post},
+    };
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::{Message as WsMessage, client::IntoClientRequest};
+    use vouch::cli::{InitArgs, StatsArgs, init, stats};
+
+    fn cli_backend_v3(id: &str, command: &Path, read_mode: &str) -> String {
+        format!(
+            r#"
+[[backends]]
+id = {id:?}
+kind = "cli"
+command = {:?}
+stdin = true
+read_mode = {read_mode:?}
+max_concurrency = 2
+queue_timeout_ms = 2000
+timeout_secs = 10
+"#,
+            command.display().to_string()
+        )
+    }
+
+    #[tokio::test]
+    async fn example_config_parses_cleanly() {
+        let example = include_str!("../vouch.example.toml");
+        let parsed = GatewayConfig::from_toml_str(example).expect("vouch.example.toml must parse");
+        assert!(!parsed.aliases.is_empty());
+        assert!(!parsed.routing_rules.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunk_mode_streams_before_newline_and_preserves_split_utf8() {
+        let dir = TempDir::new().expect("tempdir");
+        // Emits "hello " + first 2 bytes of 4-byte '🦀' WITHOUT newline, sleeps 250ms,
+        // then emits trailing 2 bytes + " world\n".
+        let chunk_script = script(
+            dir.path(),
+            "split_utf8.sh",
+            r#"#!/bin/sh
+cat >/dev/null
+printf 'hello \360\237'
+sleep 0.25
+printf '\246\200 world\n'
+"#,
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "chunk/default"
+
+{}
+{}
+[routes]
+"chunk/default" = ["chunked"]
+"line/default" = ["lined"]
+"#,
+            cli_backend_v3("chunked", &chunk_script, "chunk"),
+            cli_backend_v3("lined", &chunk_script, "line"),
+        );
+        let harness = Harness::new(toml).await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = harness.app.clone();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let started = tokio::time::Instant::now();
+        let mut resp = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&json!({
+                "model": "chunk/default",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .expect("send chunk stream");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Read SSE chunks until we observe the first non-empty content delta ("hello ").
+        let mut first_content_elapsed = None;
+        let mut accumulated_sse = String::new();
+        while let Some(chunk) = resp.chunk().await.expect("chunk") {
+            let text = String::from_utf8_lossy(&chunk);
+            accumulated_sse.push_str(&text);
+            if first_content_elapsed.is_none() && accumulated_sse.contains("\"content\":\"hello \"")
+            {
+                first_content_elapsed = Some(started.elapsed());
+            }
+        }
+        let first_elapsed = first_content_elapsed.expect("must stream hello delta");
+        assert!(
+            first_elapsed < Duration::from_millis(220),
+            "chunk mode should stream before child finishes sleeping (elapsed={first_elapsed:?})"
+        );
+        assert!(
+            accumulated_sse.contains("🦀 world"),
+            "split 4-byte UTF-8 sequence must reconstruct intact: {accumulated_sse}"
+        );
+
+        // Contrast: read_mode = "line" holds bytes until newline/EOF arrives (~250ms).
+        let started_line = tokio::time::Instant::now();
+        let mut line_resp = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&json!({
+                "model": "line/default",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .expect("send line stream");
+        let mut first_line_content = None;
+        let mut line_sse = String::new();
+        while let Some(chunk) = line_resp.chunk().await.expect("chunk") {
+            line_sse.push_str(&String::from_utf8_lossy(&chunk));
+            if first_line_content.is_none() && line_sse.contains("\"content\":\"hello ") {
+                first_line_content = Some(started_line.elapsed());
+            }
+        }
+        assert!(
+            first_line_content.expect("line content") >= Duration::from_millis(200),
+            "line mode must wait until newline arrives"
+        );
+        assert!(line_sse.contains("🦀 world"), "line sse: {line_sse}");
+
+        server.abort();
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streams_split_tool_call_tags_without_leaking_xml() {
+        let dir = TempDir::new().expect("tempdir");
+        let tool_script = script(
+            dir.path(),
+            "split_tool.sh",
+            r#"#!/bin/sh
+cat >/dev/null
+printf 'Checking files now. <vouch_to'
+sleep 0.05
+printf 'ol_call>{"name":"list_dir",'
+sleep 0.05
+printf '"arguments":{"path":"."}}</vouch_tool_call>\n'
+"#,
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "tools/stream"
+
+{}
+[routes]
+"tools/stream" = ["splitter"]
+"#,
+            cli_backend_v3("splitter", &tool_script, "chunk")
+        );
+        let harness = Harness::new(toml).await;
+
+        let resp = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "tools/stream",
+                    "stream": true,
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "list_dir",
+                            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+                        }
+                    }],
+                    "messages": [{"role": "user", "content": "list workspace"}]
+                }),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sse = body_text(resp).await;
+        assert!(
+            sse.contains("Checking files now. "),
+            "prose should stream: {sse}"
+        );
+        assert!(
+            !sse.contains("<vouch_tool_call") && !sse.contains("</vouch_tool_call"),
+            "XML tag leaked in SSE stream: {sse}"
+        );
+        assert!(
+            sse.contains("\"name\":\"list_dir\""),
+            "missing tool call: {sse}"
+        );
+        assert!(
+            sse.contains("\"finish_reason\":\"tool_calls\""),
+            "missing tool_calls finish_reason: {sse}"
+        );
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_response_format_strips_split_fences_and_validates_schema() {
+        let dir = TempDir::new().expect("tempdir");
+        let ok_json = script(
+            dir.path(),
+            "ok_fenced.sh",
+            r#"#!/bin/sh
+cat >/dev/null
+printf '```js'
+printf 'on\n{"city":'
+printf '"Osaka"}\n``'
+printf '`\n'
+"#,
+        );
+        let bad_json = script(
+            dir.path(),
+            "bad_json.sh",
+            r#"#!/bin/sh
+cat >/dev/null
+printf '```json\n{"city": 123}\n```\n'
+"#,
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "json/ok"
+
+{}
+{}
+[routes]
+"json/ok" = ["ok"]
+"json/bad" = ["bad"]
+"#,
+            cli_backend_v3("ok", &ok_json, "chunk"),
+            cli_backend_v3("bad", &bad_json, "chunk"),
+        );
+        let harness = Harness::new(toml).await;
+        let schema = json!({
+            "type": "object",
+            "required": ["city"],
+            "properties": {"city": {"type": "string"}}
+        });
+
+        let ok_resp = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "json/ok",
+                    "stream": true,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": "loc", "schema": schema}
+                    },
+                    "messages": [{"role": "user", "content": "city"}]
+                }),
+            )
+            .await;
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        let ok_sse = body_text(ok_resp).await;
+        assert!(!ok_sse.contains("```"), "markdown fence leaked: {ok_sse}");
+        assert!(ok_sse.contains("Osaka"), "JSON body missing: {ok_sse}");
+        assert!(
+            ok_sse.contains("\"finish_reason\":\"stop\""),
+            "expected stop: {ok_sse}"
+        );
+
+        let bad_resp = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "json/bad",
+                    "stream": true,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": "loc", "schema": schema}
+                    },
+                    "messages": [{"role": "user", "content": "city"}]
+                }),
+            )
+            .await;
+        let bad_sse = body_text(bad_resp).await;
+        assert!(
+            bad_sse.contains("\"code\":\"stream_error\""),
+            "invalid schema should emit structured stream_error: {bad_sse}"
+        );
+        assert!(
+            !bad_sse.contains("\"finish_reason\":\"stop\""),
+            "invalid schema must not emit stop: {bad_sse}"
+        );
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_stores_and_state_dir_persistence_survive_restart() {
+        let dir = TempDir::new().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        let echo_script = script(
+            dir.path(),
+            "echo_ok.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf 'persisted-ok'\n",
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "coding/default"
+max_session_entries = 2
+state_dir = {:?}
+
+{}
+[routes]
+"coding/default" = ["echo"]
+"#,
+            state_dir.display().to_string(),
+            cli_backend_v3("echo", &echo_script, "chunk")
+        );
+
+        // First boot: insert 3 responses; oldest must be evicted (cap = 2).
+        let h1 = Harness::new(toml.clone()).await;
+        let mut ids = Vec::new();
+        for idx in 0..3 {
+            let r = h1
+                .post_json(
+                    "/v1/responses",
+                    &[("x-session-id", &format!("sess-{idx}"))],
+                    json!({"model": "coding/default", "input": format!("turn {idx}"), "store": true}),
+                )
+                .await;
+            assert_eq!(r.status(), StatusCode::OK);
+            let body: Value = serde_json::from_str(&body_text(r).await).expect("JSON");
+            ids.push(body["id"].as_str().expect("id").to_string());
+        }
+        assert_eq!(h1.state.responses().len(), 2);
+        assert_eq!(h1.state.router().sessions().len(), 2);
+
+        // Oldest response was evicted
+        let oldest = h1
+            .post_json(
+                "/v1/responses",
+                &[],
+                json!({"model": "coding/default", "previous_response_id": ids[0], "input": "follow"}),
+            )
+            .await;
+        assert_eq!(oldest.status(), StatusCode::NOT_FOUND);
+
+        h1.state.shutdown().await;
+        let state_file = state_dir.join("gateway_state.json");
+        assert!(state_file.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&state_file)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // Second boot on same state_dir reloads responses, sessions, and usage counters.
+        let h2 = Harness::new(toml).await;
+        let resumed = h2
+            .post_json(
+                "/v1/responses",
+                &[],
+                json!({"model": "coding/default", "previous_response_id": ids[2], "input": "continued"}),
+            )
+            .await;
+        assert_eq!(resumed.status(), StatusCode::OK);
+
+        let usage = h2.get("/v1/usage", &[]).await;
+        assert_eq!(usage.status(), StatusCode::OK);
+        let usage_json: Value = serde_json::from_str(&body_text(usage).await).expect("usage JSON");
+        assert!(
+            usage_json["totals"]["requests"].as_u64().unwrap_or(0) >= 4,
+            "usage totals should include previous boot: {usage_json}"
+        );
+        h2.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_image_url_ssrf_blocked_and_allowed_fetch_cleans_up() {
+        let dir = TempDir::new().expect("tempdir");
+        let inspect = script(
+            dir.path(),
+            "inspect_prompt.sh",
+            r#"#!/bin/sh
+prompt="$(cat)"
+printf 'SAW:%s\n' "$prompt"
+"#,
+        );
+
+        async fn png_handler() -> Response {
+            // Minimal valid 1x1 PNG header bytes
+            let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+            ([(header::CONTENT_TYPE, "image/png")], png).into_response()
+        }
+        async fn html_handler() -> Response {
+            ([(header::CONTENT_TYPE, "text/html")], "<html>secret</html>").into_response()
+        }
+        async fn redirect_to_png() -> Response {
+            (
+                StatusCode::FOUND,
+                [(header::LOCATION, "/img.png")],
+                "redirecting",
+            )
+                .into_response()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let mock_app = AxumRouter::new()
+            .route("/img.png", get(png_handler))
+            .route("/redir", get(redirect_to_png))
+            .route("/bad.html", get(html_handler));
+        let mock_srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        // 1) SSRF guard: fetch_remote_urls = true, allow_private_ips = false -> blocks 127.0.0.1
+        let strict_toml = format!(
+            r#"
+[defaults]
+model = "vision/default"
+
+[attachments]
+fetch_remote_urls = true
+allow_private_ips = false
+max_image_bytes = 1024
+
+{}
+[routes]
+"vision/default" = ["inspect"]
+"#,
+            cli_backend_v3("inspect", &inspect, "chunk")
+        );
+        let h_strict = Harness::new(strict_toml).await;
+        let ssrf_resp = h_strict
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "vision/default",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "describe"},
+                            {"type": "image_url", "image_url": {"url": format!("http://{addr}/redir")}}
+                        ]
+                    }]
+                }),
+            )
+            .await;
+        assert_eq!(ssrf_resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(ssrf_resp).await.contains("blocked non-public IP"));
+        h_strict.state.shutdown().await;
+
+        // 2) Explicitly allowed local test fetch: follows redirect, downloads PNG to 0600 temp file, cleans up on drop!
+        let allow_toml = format!(
+            r#"
+[defaults]
+model = "vision/default"
+
+[attachments]
+fetch_remote_urls = true
+allow_private_ips = true
+max_image_bytes = 1024
+
+{}
+[routes]
+"vision/default" = ["inspect"]
+"#,
+            cli_backend_v3("inspect", &inspect, "chunk")
+        );
+        let h_allow = Harness::new(allow_toml).await;
+
+        let bad_mime = h_allow
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "vision/default",
+                    "messages": [{
+                        "role": "user",
+                        "content": [{"type": "image_url", "image_url": {"url": format!("http://{addr}/bad.html")}}]
+                    }]
+                }),
+            )
+            .await;
+        assert_eq!(bad_mime.status(), StatusCode::BAD_REQUEST);
+
+        let ok_resp = h_allow
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "vision/default",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "describe"},
+                            {"type": "image_url", "image_url": {"url": format!("http://{addr}/redir")}}
+                        ]
+                    }]
+                }),
+            )
+            .await;
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        let ok_json: Value = serde_json::from_str(&body_text(ok_resp).await).expect("JSON");
+        let text = ok_json["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content");
+        assert!(text.contains("[Attached image file: "), "text: {text}");
+        let start =
+            text.find("[Attached image file: ").expect("marker") + "[Attached image file: ".len();
+        let end = text[start..].find(']').expect("end bracket") + start;
+        let att_path = Path::new(&text[start..end]);
+        assert!(
+            !att_path.exists(),
+            "downloaded remote attachment must be unlinked on TempAttachmentGuard drop"
+        );
+
+        h_allow.state.shutdown().await;
+        mock_srv.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_responses_streams_and_cancels_child_pgid() {
+        let dir = TempDir::new().expect("tempdir");
+        let pid_file = dir.path().join("slow.pid");
+        let fast = script(
+            dir.path(),
+            "ws_fast.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf 'hello from '\nsleep 0.03\nprintf 'websocket'\n",
+        );
+        let slow = script(
+            dir.path(),
+            "ws_slow.sh",
+            &format!(
+                "#!/bin/sh\ncat >/dev/null\necho $$ > {:?}\nprintf 'starting... '\nsleep 30\n",
+                pid_file.display().to_string()
+            ),
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "ws/fast"
+
+{}
+{}
+[routes]
+"ws/fast" = ["fast"]
+"ws/slow" = ["slow"]
+
+[[tokens]]
+token = "vouch-ws-secret-token"
+name = "ws-client"
+"#,
+            cli_backend_v3("fast", &fast, "chunk"),
+            cli_backend_v3("slow", &slow, "chunk")
+        );
+        let harness = Harness::new(toml).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = harness.app.clone();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // Unauthenticated WS upgrade is rejected
+        let unauth_req = format!("ws://{addr}/v1/responses")
+            .into_client_request()
+            .expect("req");
+        assert!(tokio_tungstenite::connect_async(unauth_req).await.is_err());
+
+        // Authenticated WS upgrade
+        let mut req = format!("ws://{addr}/v1/responses")
+            .into_client_request()
+            .expect("req");
+        req.headers_mut().insert(
+            "authorization",
+            "Bearer vouch-ws-secret-token".parse().expect("hdr"),
+        );
+        let (mut ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("ws connect");
+
+        ws.send(WsMessage::Text(
+            json!({
+                "type": "response.create",
+                "model": "ws/fast",
+                "input": "hi ws"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send create");
+
+        let mut saw_created = false;
+        let mut saw_delta = String::new();
+        let mut completed_id = None;
+        while let Some(Ok(frame)) = ws.next().await {
+            if let WsMessage::Text(txt) = frame {
+                let v: Value = serde_json::from_str(&txt).expect("json frame");
+                match v["type"].as_str() {
+                    Some("response.created") => saw_created = true,
+                    Some("response.output_text.delta") => {
+                        saw_delta.push_str(v["delta"].as_str().unwrap_or(""));
+                    }
+                    Some("response.completed") => {
+                        completed_id = v["response"]["id"].as_str().map(ToString::to_string);
+                        break;
+                    }
+                    other => panic!("unexpected frame: {other:?} {v}"),
+                }
+            }
+        }
+        assert!(saw_created);
+        assert_eq!(saw_delta, "hello from websocket");
+        assert!(completed_id.is_some());
+
+        // Start slow request, wait for slow child PID & response.created, then send response.cancel
+        ws.send(WsMessage::Text(
+            json!({
+                "type": "response.create",
+                "model": "ws/slow",
+                "input": "slow"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send slow");
+
+        let mut seen_slow_created = false;
+        while !seen_slow_created || !pid_file.exists() {
+            tokio::select! {
+                _ = sleep(Duration::from_millis(20)) => {}
+                frame = ws.next() => {
+                    if let Some(Ok(WsMessage::Text(txt))) = frame {
+                        let v: Value = serde_json::from_str(&txt).expect("json");
+                        if v["type"] == "response.created" {
+                            seen_slow_created = true;
+                        }
+                    }
+                }
+            }
+        }
+        let pid_str = fs::read_to_string(&pid_file).expect("pid file");
+        let pid: u32 = pid_str.trim().parse().expect("numeric pid");
+
+        ws.send(WsMessage::Text(
+            json!({"type": "response.cancel"}).to_string().into(),
+        ))
+        .await
+        .expect("send cancel");
+
+        // Poll up to 2s for PGID guard to terminate slow subprocess
+        let mut reaped = false;
+        for _ in 0..40 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                reaped = true;
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            reaped,
+            "slow child pid {pid} should be reaped after response.cancel"
+        );
+
+        let _ = ws.close(None).await;
+        server.abort();
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aliases_routing_rules_daily_budget_and_usage_analytics() {
+        let dir = TempDir::new().expect("tempdir");
+        let mk_tag_script = |name: &str| {
+            script(
+                dir.path(),
+                name,
+                &format!("#!/bin/sh\ncat >/dev/null\nprintf 'TAG:{name}:1234567890'\n"),
+            )
+        };
+        let b_def = mk_tag_script("def.sh");
+        let b_tools = mk_tag_script("tools.sh");
+        let b_img = mk_tag_script("img.sh");
+        let b_long = mk_tag_script("long.sh");
+        let b_vip = mk_tag_script("vip.sh");
+
+        let toml = format!(
+            r#"
+[defaults]
+model = "gpt-4o"
+
+{}
+{}
+{}
+{}
+{}
+
+[routes]
+"coding/default" = ["def"]
+"coding/tools" = ["tools"]
+"coding/vision" = ["img"]
+"coding/long" = ["long"]
+"coding/vip" = ["vip"]
+
+[aliases]
+"gpt-4o" = "coding/default"
+
+[[routing_rules]]
+name = "header-vip"
+model_pattern = "*"
+header_equals = {{ "x-tier" = "vip" }}
+target_route = "coding/vip"
+
+[[routing_rules]]
+name = "tools-route"
+model_pattern = "*"
+has_tools = true
+target_route = "coding/tools"
+
+[[routing_rules]]
+name = "image-route"
+model_pattern = "*"
+has_images = true
+target_route = "coding/vision"
+
+[[routing_rules]]
+name = "long-route"
+model_pattern = "*"
+min_prompt_tokens = 25
+target_route = "coding/long"
+
+[[tokens]]
+token = "vouch-alias-token"
+name = "alias-only"
+allowed_models = ["gpt-4o"]
+
+[[tokens]]
+token = "vouch-route-token"
+name = "route-and-budget"
+daily_token_budget = 25
+allowed_models = ["coding/*"]
+"#,
+            cli_backend_v3("def", &b_def, "chunk"),
+            cli_backend_v3("tools", &b_tools, "chunk"),
+            cli_backend_v3("img", &b_img, "chunk"),
+            cli_backend_v3("long", &b_long, "chunk"),
+            cli_backend_v3("vip", &b_vip, "chunk"),
+        );
+        let harness = Harness::new(toml).await;
+
+        // GET /v1/models exposes aliases alongside canonical routes
+        let models_resp = harness
+            .get(
+                "/v1/models",
+                &[("authorization", "Bearer vouch-alias-token")],
+            )
+            .await;
+        assert_eq!(models_resp.status(), StatusCode::OK);
+        let models_json: Value = serde_json::from_str(&body_text(models_resp).await).expect("JSON");
+        let ids: Vec<&str> = models_json["data"]
+            .as_array()
+            .expect("data")
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"gpt-4o"),
+            "alias missing from /v1/models: {ids:?}"
+        );
+        assert!(ids.contains(&"coding/default"));
+
+        // Token allowing ["gpt-4o"] works on "gpt-4o", while ["coding/*"] also works on "gpt-4o"!
+        let r_alias = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("authorization", "Bearer vouch-alias-token")],
+                chat_body("gpt-4o", false),
+            )
+            .await;
+        assert_eq!(r_alias.status(), StatusCode::OK);
+        assert_eq!(
+            r_alias
+                .headers()
+                .get("x-vouch-backend")
+                .and_then(|v| v.to_str().ok()),
+            Some("def")
+        );
+
+        let r_vip = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[
+                    ("authorization", "Bearer vouch-alias-token"),
+                    ("x-tier", "vip"),
+                ],
+                chat_body("gpt-4o", false),
+            )
+            .await;
+        assert_eq!(
+            r_vip
+                .headers()
+                .get("x-vouch-backend")
+                .and_then(|v| v.to_str().ok()),
+            Some("vip")
+        );
+
+        let r_tools = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("authorization", "Bearer vouch-alias-token")],
+                json!({
+                    "model": "gpt-4o",
+                    "tools": [{"type": "function", "function": {"name": "ping", "parameters": {"type": "object"}}}],
+                    "messages": [{"role": "user", "content": "hi"}]
+                }),
+            )
+            .await;
+        assert_eq!(
+            r_tools
+                .headers()
+                .get("x-vouch-backend")
+                .and_then(|v| v.to_str().ok()),
+            Some("tools")
+        );
+
+        let r_img = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("authorization", "Bearer vouch-alias-token")],
+                json!({
+                    "model": "gpt-4o",
+                    "messages": [{
+                        "role": "user",
+                        "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}]
+                    }]
+                }),
+            )
+            .await;
+        assert_eq!(
+            r_img
+                .headers()
+                .get("x-vouch-backend")
+                .and_then(|v| v.to_str().ok()),
+            Some("img")
+        );
+
+        let long_text = "word ".repeat(35);
+        let r_long = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("authorization", "Bearer vouch-alias-token")],
+                json!({
+                    "model": "gpt-4o",
+                    "messages": [{"role": "user", "content": long_text}]
+                }),
+            )
+            .await;
+        assert_eq!(
+            r_long
+                .headers()
+                .get("x-vouch-backend")
+                .and_then(|v| v.to_str().ok()),
+            Some("long")
+        );
+
+        // Daily BPE token budget enforcement on vouch-route-token (allowed_models=["coding/*"])
+        // First request resolves alias "gpt-4o" -> "coding/default" and succeeds, exceeding 25 BPE tokens.
+        let r_budget_1 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("authorization", "Bearer vouch-route-token")],
+                json!({
+                    "model": "gpt-4o",
+                    "messages": [{"role": "user", "content": "Please count thirty BPE tokens across this request so the daily limit triggers cleanly!"}]
+                }),
+            )
+            .await;
+        assert_eq!(r_budget_1.status(), StatusCode::OK);
+
+        // Second request must be blocked with 429 daily_token_budget_exceeded + Retry-After header
+        let r_budget_2 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("authorization", "Bearer vouch-route-token")],
+                chat_body("coding/default", false),
+            )
+            .await;
+        assert_eq!(r_budget_2.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(r_budget_2.headers().get("retry-after").is_some());
+        let err_json: Value = serde_json::from_str(&body_text(r_budget_2).await).expect("err json");
+        assert_eq!(err_json["error"]["type"], "rate_limit_error");
+        assert_eq!(err_json["error"]["code"], "daily_token_budget_exceeded");
+
+        // GET /v1/usage & vouch::cli::stats::fetch_usage return redacted analytics
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = harness.app.clone();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let report = stats::fetch_usage(&StatsArgs {
+            url: format!("http://{addr}"),
+            unix_socket: None,
+            token: Some("vouch-alias-token".into()),
+            json: true,
+        })
+        .await
+        .expect("fetch_usage");
+        let report_json = serde_json::to_string(&report).expect("json");
+        assert!(!report_json.contains("vouch-alias-token"));
+        assert!(!report_json.contains("vouch-route-token"));
+        assert!(report.totals.requests >= 6);
+        assert!(report.totals.total_tokens > 0);
+        assert!(!report.backends.is_empty());
+
+        srv.abort();
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn otlp_trace_exporter_propagates_traceparent_and_redacts() {
+        let dir = TempDir::new().expect("tempdir");
+        let echo = script(
+            dir.path(),
+            "otel_echo.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf 'traced response'\n",
+        );
+
+        #[derive(Clone, Default)]
+        struct OtlpSink {
+            batches: std::sync::Arc<parking_lot::Mutex<Vec<Value>>>,
+        }
+        async fn ingest_otlp(
+            AxumState(sink): AxumState<OtlpSink>,
+            body: axum::body::Bytes,
+        ) -> Response {
+            if let Ok(val) = serde_json::from_slice::<Value>(&body) {
+                sink.batches.lock().push(val);
+            }
+            StatusCode::OK.into_response()
+        }
+
+        let sink = OtlpSink::default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let otel_srv_app = AxumRouter::new()
+            .route("/v1/traces", post(ingest_otlp))
+            .with_state(sink.clone());
+        let otel_srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, otel_srv_app).await;
+        });
+
+        let toml = format!(
+            r#"
+[defaults]
+model = "coding/default"
+
+[telemetry]
+otlp_endpoint = "http://{addr}/v1/traces"
+service_name = "vouch-otlp-test"
+otlp_headers = {{ Authorization = "Bearer otlp-top-secret-999" }}
+
+{}
+[routes]
+"coding/default" = ["echo"]
+"#,
+            cli_backend_v3("echo", &echo, "chunk")
+        );
+        let harness = Harness::new(toml).await;
+
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let resp = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("traceparent", tp), ("tracestate", "v=1")],
+                chat_body("coding/default", false),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Graceful shutdown flushes queued OTLP batch cleanly
+        harness.state.shutdown().await;
+        otel_srv.abort();
+
+        let batches = sink.batches.lock();
+        assert!(!batches.is_empty(), "OTLP sink received no batches");
+        let mut span_names = Vec::new();
+        for batch in batches.iter() {
+            let serialized = batch.to_string();
+            assert!(!serialized.contains("otlp-top-secret-999"));
+            let spans = batch["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                .as_array()
+                .expect("spans");
+            for span in spans {
+                assert_eq!(span["traceId"], "4bf92f3577b34da6a3ce929d0e0e4736");
+                span_names.push(span["name"].as_str().unwrap_or("").to_string());
+            }
+        }
+        assert!(span_names.iter().any(|n| n == "ingress"), "{span_names:?}");
+        assert!(
+            span_names.iter().any(|n| n == "router.dispatch"),
+            "{span_names:?}"
+        );
+        assert!(
+            span_names.iter().any(|n| n == "driver.exec"),
+            "{span_names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vouch_init_writes_0600_validated_config_and_guards_overwrite() {
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("vouch.toml");
+        init::run(&InitArgs {
+            output: target.clone(),
+            docker_bridge: false,
+            force: false,
+        })
+        .await
+        .expect("vouch init first run");
+        assert!(target.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&target).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        GatewayConfig::load(&target).expect("generated vouch.toml must pass validation");
+
+        let err = init::run(&InitArgs {
+            output: target.clone(),
+            docker_bridge: false,
+            force: false,
+        })
+        .await
+        .expect_err("must refuse overwrite without --force");
+        assert!(err.to_string().contains("--force"));
+
+        init::run(&InitArgs {
+            output: target.clone(),
+            docker_bridge: true,
+            force: true,
+        })
+        .await
+        .expect("vouch init --force should overwrite");
+        GatewayConfig::load(&target).expect("docker bridge config must pass validation");
+    }
+}
