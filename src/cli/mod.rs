@@ -2,16 +2,26 @@
 
 pub mod bench;
 pub mod doctor;
+pub mod init;
 pub mod mcp;
 pub mod service;
+pub mod stats;
 pub mod token;
 pub mod top;
 
-use std::{io::Write, net::SocketAddr, path::PathBuf};
+use std::{
+    io::Write,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::{config::GatewayConfig, error::Result};
+use crate::{
+    config::GatewayConfig,
+    error::{GatewayError, Result},
+};
 
 /// Top-level command line.
 #[derive(Debug, Parser)]
@@ -45,6 +55,10 @@ pub enum Command {
     Token(TokenArgs),
     /// Benchmark configured routes end-to-end (TTFT, latency percentiles, fallbacks).
     Bench(BenchArgs),
+    /// Query per-token and per-backend cumulative usage analytics (`GET /v1/usage`).
+    Stats(StatsArgs),
+    /// Auto-discover local AI CLIs and scaffold a validated `vouch.toml`.
+    Init(InitArgs),
 }
 
 /// Arguments for `vouch serve`.
@@ -214,6 +228,71 @@ pub struct BenchArgs {
     pub json: bool,
 }
 
+/// Arguments for `vouch stats`.
+#[derive(Debug, Args)]
+pub struct StatsArgs {
+    /// Base HTTP URL of the running vouch daemon.
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    pub url: String,
+    /// Connect via Unix domain socket instead of TCP.
+    #[arg(long)]
+    pub unix_socket: Option<PathBuf>,
+    /// Bearer token when virtual token authentication is enabled (defaults to `VOUCH_API_KEY`).
+    #[arg(long)]
+    pub token: Option<String>,
+    /// Emit raw JSON response from `GET /v1/usage`.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `vouch init`.
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// Destination configuration path.
+    #[arg(short, long, default_value = "vouch.toml")]
+    pub output: PathBuf,
+    /// Detect `docker0` bridge IPv4 and bind `tcp_listen` to it for container access.
+    #[arg(long)]
+    pub docker_bridge: bool,
+    /// Overwrite `--output` if it already exists.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// Build an HTTP/Unix-socket client targeting the local `vouch` daemon.
+pub(crate) fn build_daemon_client(
+    url: &str,
+    unix_socket: Option<&Path>,
+    timeout: Duration,
+) -> Result<(reqwest::Client, String, String)> {
+    let builder = reqwest::Client::builder().timeout(timeout);
+    if let Some(socket) = unix_socket {
+        #[cfg(unix)]
+        {
+            let client = builder.unix_socket(socket).build().map_err(|error| {
+                GatewayError::Internal(format!("cannot build Unix client: {error}"))
+            })?;
+            return Ok((
+                client,
+                "http://localhost".to_string(),
+                format!("unix://{}", socket.display()),
+            ));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = socket;
+            return Err(GatewayError::Config(
+                "--unix-socket is only supported on Unix hosts".into(),
+            ));
+        }
+    }
+    let base = url.trim_end_matches('/').to_string();
+    let client = builder
+        .build()
+        .map_err(|error| GatewayError::Internal(format!("cannot build HTTP client: {error}")))?;
+    Ok((client, base.clone(), base))
+}
+
 /// Render the configured routes as text or JSON.
 pub fn print_routes(config: &GatewayConfig, json: bool) -> Result<()> {
     if json {
@@ -238,6 +317,19 @@ pub fn print_routes(config: &GatewayConfig, json: bool) -> Result<()> {
                 None => writeln!(stdout, "  {marker} {id} (missing)")?,
             }
         }
+    }
+    if !config.aliases.is_empty() {
+        writeln!(stdout, "\naliases:")?;
+        for (alias, target) in &config.aliases {
+            writeln!(stdout, "  {alias} -> {target}")?;
+        }
+    }
+    if !config.routing_rules.is_empty() {
+        writeln!(
+            stdout,
+            "\nrouting_rules: {} configured",
+            config.routing_rules.len()
+        )?;
     }
     if config.tokens.is_empty() {
         writeln!(stdout, "\ntokens: local mode (any bearer accepted)")?;
