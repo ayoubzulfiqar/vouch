@@ -76,7 +76,9 @@ impl RedactionRegistry {
         for regex in PATTERNS.iter() {
             output = regex.replace_all(&output, "$1[REDACTED]$2").into_owned();
         }
-        output
+        BASE64_IMAGE
+            .replace_all(&output, "$1[REDACTED_BYTES]")
+            .into_owned()
     }
 }
 
@@ -85,20 +87,32 @@ static BEARER: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SK_KEY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"sk-[A-Za-z0-9_-]{6,}").expect("static sk regex"));
+static VOUCH_LIVE_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"vouch_live_[A-Za-z0-9_-]{6,}").expect("static vouch key regex"));
 static JSON_SECRET: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?i)("(?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|authorization|secret|password|credential)"\s*:\s*")[^"]*(")"#,
     )
     .expect("static json secret regex")
 });
+static ESCAPED_JSON_SECRET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)(\\"(?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|authorization|secret|password|credential)\\"\s*:\s*\\")(?:[^"\\]|\\[^"])*(\\")"#,
+    )
+    .expect("static escaped json secret regex")
+});
 static HEADER_SECRET: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(x-api-key\s*[:=]\s*)[^\s,;"']+"#).expect("static header regex")
+    Regex::new(r#"(?i)(x-api-key\s*[:=]\s*)[^\s,;"'\\]+"#).expect("static header regex")
 });
 static URL_SECRET: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)([?&](?:key|api[_-]?key|token|access[_-]?token|refresh[_-]?token|secret)=)[^&\s"']*"#,
+        r#"(?i)([?&](?:key|api[_-]?key|token|access[_-]?token|refresh[_-]?token|secret)=)[^&\s"'\\]*"#,
     )
     .expect("static url query secret regex")
+});
+static BASE64_IMAGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(data:image/[A-Za-z0-9.+-]+;base64,)[A-Za-z0-9+/=_-]+")
+        .expect("static base64 image regex")
 });
 
 /// Patterns applied after literal secrets.
@@ -109,6 +123,8 @@ static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         BEARER.clone(),
         SK_KEY.clone(),
+        VOUCH_LIVE_KEY.clone(),
+        ESCAPED_JSON_SECRET.clone(),
         JSON_SECRET.clone(),
         HEADER_SECRET.clone(),
         URL_SECRET.clone(),
@@ -309,6 +325,19 @@ mod tests {
         assert!(!redacted_json.contains("acc_secret_val"));
         assert!(!redacted_json.contains("ref_secret_val"));
         assert!(redacted_json.contains("\"ok\":1"));
+    }
+
+    #[test]
+    fn redacts_escaped_quotes_vouch_keys_and_base64_images() {
+        let registry = RedactionRegistry::new(Vec::<String>::new());
+        let escaped = r#"upstream payload: \"Bearer tok_123456\" and \"sk-abcdef123456\" and \"vouch_live_supersecret99\" and \"api_key\":\"hidden_nested_key\" with data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="tail""#;
+        let redacted = registry.redact(escaped);
+        assert!(!redacted.contains("tok_123456"));
+        assert!(!redacted.contains("sk-abcdef123456"));
+        assert!(!redacted.contains("vouch_live_supersecret99"));
+        assert!(!redacted.contains("hidden_nested_key"));
+        assert!(!redacted.contains("iVBORw0KGgoAAAANSUhEUg=="));
+        assert!(redacted.contains("data:image/png;base64,[REDACTED_BYTES]"));
     }
 
     #[test]
