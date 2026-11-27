@@ -23,6 +23,7 @@ pub mod driver;
 pub mod error;
 pub mod ingress;
 pub mod metrics;
+pub mod persistence;
 pub mod router;
 pub mod state;
 pub mod telemetry;
