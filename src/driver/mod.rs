@@ -14,6 +14,7 @@ pub mod tool_bridge;
 pub mod workspace;
 
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     pin::Pin,
     sync::Arc,
@@ -391,6 +392,12 @@ pub struct ExecutionRequest {
     pub session_capture: Arc<parking_lot::Mutex<Option<String>>>,
     /// Propagated W3C trace context for child spans and upstream headers.
     pub trace_context: Option<crate::telemetry::TraceContext>,
+    /// Selected credential profile id for CLI/PTY rotation (`VOUCH_PROFILE_ID`).
+    pub profile_id: Option<String>,
+    /// Environment variables overlaid for the active profile.
+    pub profile_env: BTreeMap<String, String>,
+    /// Optional per-token allowlist restricting eligible backend ids.
+    pub allowed_backends: Option<Vec<String>>,
     /// Protocol-specific fields forwarded to HTTP upstreams.
     pub extra: serde_json::Map<String, Value>,
 }
