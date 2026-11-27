@@ -1,11 +1,13 @@
 //! Operator-facing command line.
 
 pub mod doctor;
+pub mod mcp;
 pub mod service;
+pub mod top;
 
 use std::{io::Write, net::SocketAddr, path::PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::{config::GatewayConfig, error::Result};
 
@@ -33,6 +35,10 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Install or remove a user service (systemd or launchd).
     Service(ServiceArgs),
+    /// Run a Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio or HTTP.
+    Mcp(McpArgs),
+    /// Display a live terminal dashboard polling `/healthz`, `/readyz`, and `/metrics`.
+    Top(TopArgs),
 }
 
 /// Arguments for `vouch serve`.
@@ -108,6 +114,43 @@ pub struct ServiceUninstallArgs {
     /// Remove the unit but do not stop a running service.
     #[arg(long)]
     pub no_stop: bool,
+}
+
+/// Transport mode for `vouch mcp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum McpTransport {
+    /// JSON-RPC 2.0 over stdin/stdout (tracing logs routed to stderr).
+    Stdio,
+    /// JSON-RPC 2.0 over HTTP (`POST /mcp`).
+    Http,
+}
+
+/// Arguments for `vouch mcp`.
+#[derive(Debug, Args)]
+pub struct McpArgs {
+    /// Path to the TOML configuration.
+    #[arg(short, long, default_value = "vouch.toml")]
+    pub config: PathBuf,
+    /// Transport implementation.
+    #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
+    pub transport: McpTransport,
+    /// Bind address when `--transport http` is used.
+    #[arg(long, default_value = "127.0.0.1:8081")]
+    pub bind: SocketAddr,
+}
+
+/// Arguments for `vouch top`.
+#[derive(Debug, Args)]
+pub struct TopArgs {
+    /// Base HTTP URL of the running vouch daemon.
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    pub url: String,
+    /// Connect via Unix domain socket instead of TCP.
+    #[arg(long)]
+    pub unix_socket: Option<PathBuf>,
+    /// Refresh interval in milliseconds.
+    #[arg(long, default_value_t = 1000)]
+    pub interval_ms: u64,
 }
 
 /// Render the configured routes as text or JSON.
