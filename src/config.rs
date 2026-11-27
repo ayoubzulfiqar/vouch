@@ -77,6 +77,9 @@ pub struct ServerConfig {
     /// Whether to allow cross-origin browser clients. Defaults to `false`.
     #[serde(default)]
     pub cors_permissive: bool,
+    /// Serve the embedded read-only operational dashboard at `GET /ui`. Defaults to `false`.
+    #[serde(default)]
+    pub enable_ui: bool,
 }
 
 /// Defaults applied when a backend or request omits a value.
@@ -153,6 +156,9 @@ pub struct DiscoveryConfig {
     /// Additional credential files to report on.
     #[serde(default)]
     pub extra_auth_paths: Vec<PathBuf>,
+    /// Per-backend timeout in seconds for CLI/PTY smoke probes in `vouch doctor`.
+    #[serde(default = "default_probe_timeout_secs")]
+    pub probe_timeout_secs: u64,
 }
 
 /// Egress backend definition.
@@ -375,6 +381,11 @@ impl GatewayConfig {
         if self.resilience.half_open_max_probes == 0 {
             return Err(GatewayError::Config(
                 "resilience.half_open_max_probes must be greater than zero".into(),
+            ));
+        }
+        if self.discovery.probe_timeout_secs == 0 {
+            return Err(GatewayError::Config(
+                "discovery.probe_timeout_secs must be greater than zero".into(),
             ));
         }
 
@@ -707,6 +718,9 @@ fn default_backend_timeout_secs() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn default_probe_timeout_secs() -> u64 {
+    30
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -719,6 +733,7 @@ impl Default for ServerConfig {
             max_body_bytes: default_max_body_bytes(),
             log_level: default_log_level(),
             cors_permissive: false,
+            enable_ui: false,
         }
     }
 }
@@ -764,6 +779,7 @@ impl Default for DiscoveryConfig {
             enabled: true,
             probe_ports: true,
             extra_auth_paths: Vec::new(),
+            probe_timeout_secs: default_probe_timeout_secs(),
         }
     }
 }
@@ -838,5 +854,30 @@ stdin = true
         let secrets = config.secrets();
         assert!(secrets.contains(&"vouch-super-secret-token".to_string()));
         assert!(secrets.contains(&"sk-abcdefghijklmnop".to_string()));
+    }
+
+    #[test]
+    fn parses_v1_defaults_and_overrides() {
+        let base = GatewayConfig::from_toml_str(&minimal("")).expect("valid");
+        assert!(!base.server.enable_ui);
+        assert_eq!(base.discovery.probe_timeout_secs, 30);
+
+        let text = format!(
+            "{}\n[discovery]\nprobe_timeout_secs = 45\n",
+            minimal("").replace(
+                "tcp_listen = \"127.0.0.1:0\"",
+                "tcp_listen = \"127.0.0.1:0\"\nenable_ui = true"
+            )
+        );
+        let custom = GatewayConfig::from_toml_str(&text).expect("valid custom");
+        assert!(custom.server.enable_ui);
+        assert_eq!(custom.discovery.probe_timeout_secs, 45);
+    }
+
+    #[test]
+    fn rejects_zero_probe_timeout() {
+        let text = format!("{}\n[discovery]\nprobe_timeout_secs = 0\n", minimal(""));
+        let error = GatewayConfig::from_toml_str(&text).expect_err("must fail");
+        assert!(error.to_string().contains("probe_timeout_secs"));
     }
 }
