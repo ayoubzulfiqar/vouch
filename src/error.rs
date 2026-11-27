@@ -49,6 +49,15 @@ pub enum GatewayError {
         message: String,
     },
 
+    /// The caller exceeded a virtual token daily BPE token budget.
+    #[error("daily token budget exceeded: {message}")]
+    DailyTokenBudgetExceeded {
+        /// Suggested number of seconds before retrying (until midnight UTC).
+        retry_after_secs: u64,
+        /// Human-readable explanation.
+        message: String,
+    },
+
     /// Every candidate backend was at its concurrency limit.
     #[error("all backends are saturated: {0}")]
     Saturated(String),
@@ -132,9 +141,9 @@ impl GatewayError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::RateLimited { .. } | Self::UpstreamRateLimited { .. } => {
-                StatusCode::TOO_MANY_REQUESTS
-            }
+            Self::RateLimited { .. }
+            | Self::DailyTokenBudgetExceeded { .. }
+            | Self::UpstreamRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::Saturated(_) | Self::NoHealthyBackend(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Upstream(_) | Self::UpstreamAuthExpired(_) => StatusCode::BAD_GATEWAY,
             Self::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
@@ -146,6 +155,9 @@ impl GatewayError {
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
             Self::RateLimited {
+                retry_after_secs, ..
+            }
+            | Self::DailyTokenBudgetExceeded {
                 retry_after_secs, ..
             } => Some(*retry_after_secs),
             Self::UpstreamRateLimited {
@@ -196,7 +208,9 @@ impl GatewayError {
             Self::Unauthorized(_) | Self::UpstreamAuthExpired(_) => "authentication_error",
             Self::Forbidden(_) => "permission_error",
             Self::NotFound(_) => "not_found_error",
-            Self::RateLimited { .. } | Self::UpstreamRateLimited { .. } => "rate_limit_error",
+            Self::RateLimited { .. }
+            | Self::DailyTokenBudgetExceeded { .. }
+            | Self::UpstreamRateLimited { .. } => "rate_limit_error",
             Self::Saturated(_) | Self::NoHealthyBackend(_) => "service_unavailable_error",
             Self::Config(_) | Self::Internal(_) | Self::Io(_) => "server_error",
             Self::Upstream(_) | Self::Timeout(_) | Self::ClientDisconnected => "api_error",
@@ -212,6 +226,7 @@ impl GatewayError {
             Self::Forbidden(_) => "model_not_allowed",
             Self::NotFound(_) => "model_not_found",
             Self::RateLimited { .. } => "rate_limit_exceeded",
+            Self::DailyTokenBudgetExceeded { .. } => "daily_token_budget_exceeded",
             Self::UpstreamRateLimited { .. } => "upstream_rate_limited",
             Self::UpstreamAuthExpired(_) => "upstream_auth_expired",
             Self::Saturated(_) => "backend_saturated",
@@ -230,7 +245,9 @@ impl GatewayError {
             Self::Unauthorized(_) | Self::UpstreamAuthExpired(_) => "authentication_error",
             Self::Forbidden(_) => "permission_error",
             Self::NotFound(_) => "not_found_error",
-            Self::RateLimited { .. } | Self::UpstreamRateLimited { .. } => "rate_limit_error",
+            Self::RateLimited { .. }
+            | Self::DailyTokenBudgetExceeded { .. }
+            | Self::UpstreamRateLimited { .. } => "rate_limit_error",
             Self::Saturated(_) | Self::NoHealthyBackend(_) => "overloaded_error",
             Self::Upstream(_) | Self::Timeout(_) => "api_error",
             Self::ClientDisconnected => "api_error",
