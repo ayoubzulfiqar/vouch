@@ -18,8 +18,8 @@ use tracing::{error, info, warn};
 
 use vouch::{
     cli::{
-        Cli, Command, ServeArgs, ServiceCommand, bench, doctor, mcp, print_routes, service, token,
-        top,
+        Cli, Command, ServeArgs, ServiceCommand, bench, doctor, init, mcp, print_routes, service,
+        stats, token, top,
     },
     config::GatewayConfig,
     error::{GatewayError, Result},
@@ -58,6 +58,8 @@ async fn real_main() -> Result<()> {
         Command::Top(args) => top::run(&args).await,
         Command::Token(args) => token::run(&args),
         Command::Bench(args) => bench::run(&args).await,
+        Command::Stats(args) => stats::run(&args).await,
+        Command::Init(args) => init::run(&args).await,
     }
 }
 
