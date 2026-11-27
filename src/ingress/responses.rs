@@ -10,20 +10,28 @@
 use std::{
     collections::BTreeMap,
     convert::Infallible,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use axum::{
     Json,
-    extract::{State, rejection::JsonRejection},
+    extract::{
+        State,
+        rejection::JsonRejection,
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+    },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response, sse::Event},
 };
 use dashmap::DashMap;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -34,10 +42,15 @@ use crate::{
     },
     error::{GatewayError, Result},
     ingress::{
-        CancelOnDrop, completion, execute, execution_request, first_user_text, into_chunk_stream,
-        openai::parse_openai_response_format, parse_json_content, prepare, sse_response, unix_now,
+        CancelOnDrop, RequestContext, completion, execute, execution_request, into_chunk_stream,
+        openai::parse_openai_response_format, parse_json_content, prepare_routed,
+        record_completion_outcome, record_error_outcome, sse_response, start_ingress_span,
+        unix_now,
     },
+    persistence::{PersistedResponse, evict_oldest_if_full, instant_from_unix, unix_now_secs},
     state::AppState,
+    telemetry::ActiveSpan,
+    usage::count_tokens,
 };
 
 /// Persisted conversation state for stateful `/v1/responses` chaining.
@@ -48,19 +61,57 @@ pub struct StoredResponse {
     /// Full message history including the assistant's output and tool calls.
     pub messages: Vec<ChatMessage>,
     stored_at: Instant,
+    stored_at_unix_secs: u64,
+    seq: u64,
 }
 
 /// Thread-safe in-memory store for `previous_response_id` chaining with TTL
-/// eviction.
-#[derive(Debug, Default)]
+/// eviction and bounded capacity.
+#[derive(Debug)]
 pub struct ResponseStore {
     entries: DashMap<String, StoredResponse>,
+    max_entries: AtomicUsize,
+    seq: AtomicU64,
+}
+
+impl Default for ResponseStore {
+    fn default() -> Self {
+        Self::with_max_entries(10_000)
+    }
 }
 
 impl ResponseStore {
-    /// Create an empty store.
+    /// Create an empty store with default capacity (`10_000`).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an empty store bounded to `max_entries`.
+    pub fn with_max_entries(max_entries: usize) -> Self {
+        Self {
+            entries: DashMap::new(),
+            max_entries: AtomicUsize::new(max_entries.max(1)),
+            seq: AtomicU64::new(1),
+        }
+    }
+
+    /// Update the configured entry limit.
+    pub fn set_max_entries(&self, max_entries: usize) {
+        let cap = max_entries.max(1);
+        self.max_entries.store(cap, Ordering::Relaxed);
+        if self.entries.len() > cap {
+            evict_oldest_if_full(&self.entries, cap.saturating_add(1), |e| e.seq);
+        }
+    }
+
+    /// Number of currently stored response entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when no entries are stored.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Look up an unexpired stored response.
@@ -75,16 +126,63 @@ impl ResponseStore {
         }
     }
 
-    /// Persist a completed response turn when `store = true`.
+    /// Persist a completed response turn when `store = true`, evicting oldest
+    /// entries when `max_session_entries` is reached.
     pub fn insert(&self, id: &str, system: Option<String>, messages: Vec<ChatMessage>) {
+        let cap = self.max_entries.load(Ordering::Relaxed).max(1);
+        if !self.entries.contains_key(id) {
+            evict_oldest_if_full(&self.entries, cap, |e| e.seq);
+        }
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         self.entries.insert(
             id.to_string(),
             StoredResponse {
                 system,
                 messages,
                 stored_at: Instant::now(),
+                stored_at_unix_secs: unix_now_secs(),
+                seq,
             },
         );
+    }
+
+    /// Snapshot live responses for `state_dir` persistence.
+    pub fn export_snapshot(&self, ttl: Duration) -> Vec<PersistedResponse> {
+        self.evict_expired(ttl);
+        self.entries
+            .iter()
+            .map(|entry| PersistedResponse {
+                id: entry.key().clone(),
+                system: entry.system.clone(),
+                messages: entry.messages.clone(),
+                stored_at_unix_secs: entry.stored_at_unix_secs,
+            })
+            .collect()
+    }
+
+    /// Restore non-expired response entries persisted on disk.
+    pub fn restore_snapshot(&self, items: &[PersistedResponse], ttl: Duration) {
+        let now_unix = unix_now_secs();
+        let cap = self.max_entries.load(Ordering::Relaxed).max(1);
+        for item in items {
+            let Some(stored_at) = instant_from_unix(item.stored_at_unix_secs, now_unix, ttl) else {
+                continue;
+            };
+            if !self.entries.contains_key(&item.id) {
+                evict_oldest_if_full(&self.entries, cap, |e| e.seq);
+            }
+            let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+            self.entries.insert(
+                item.id.clone(),
+                StoredResponse {
+                    system: item.system.clone(),
+                    messages: item.messages.clone(),
+                    stored_at,
+                    stored_at_unix_secs: item.stored_at_unix_secs,
+                    seq,
+                },
+            );
+        }
     }
 
     /// Remove expired responses.
@@ -179,11 +277,26 @@ pub async fn responses(
     }
 }
 
-async fn responses_inner(
-    state: Arc<AppState>,
-    headers: HeaderMap,
+struct PreparedResponsesExec {
+    context: RequestContext,
+    routed_backend: String,
+    fallback: bool,
+    driver_response: crate::driver::DriverResponse,
+    response_id: String,
+    should_store: bool,
+    history_before_reply: Vec<ChatMessage>,
+    history_system: Option<String>,
+    started: Instant,
+    ingress_span: ActiveSpan,
+}
+
+async fn prepare_responses_execution(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
     payload: OpenAiResponsesRequest,
-) -> Result<Response> {
+    stream: bool,
+    cancel: CancellationToken,
+) -> Result<PreparedResponsesExec> {
     let (new_system, new_messages) = normalize_input(payload.instructions, payload.input)?;
     let ttl = Duration::from_secs(state.router().session_ttl_secs());
 
@@ -211,40 +324,88 @@ async fn responses_inner(
     }
 
     let response_format = parse_responses_text_format(payload.text)?;
-    let first_user = first_user_text(&messages);
-    let context = prepare(
-        &state,
-        &headers,
+    let tools = normalize_tools(payload.tools);
+    let context = prepare_routed(
+        state,
+        headers,
         payload.model.as_deref(),
         system.as_deref(),
-        &first_user,
+        &messages,
+        &tools,
     )?;
+    let started = Instant::now();
+    let ingress_span = start_ingress_span(state, &context, "/v1/responses");
     let max_tokens = payload.max_output_tokens.or(payload.max_tokens);
-    let tools = normalize_tools(payload.tools);
     let history_before_reply = messages.clone();
     let history_system = system.clone();
-    let cancel = CancellationToken::new();
+    let mut extra = payload.extra;
+    extra.remove("type");
+    extra.remove("event_id");
+
     let request = execution_request(
         &context,
         system,
         messages,
-        payload.stream,
+        stream,
         payload.temperature,
         max_tokens,
         tools,
         payload.tool_choice,
         response_format,
-        payload.extra,
-        cancel.clone(),
+        extra,
+        cancel,
     );
-    let routed = execute(&state, request).await?;
-    let backend = routed.backend_id.clone();
-    let fallback = routed.fallback_used;
-    let driver_response = routed.response;
-    let response_id = format!("resp_{}", Uuid::new_v4().simple());
-    let should_store = payload.store;
+    let routed = match execute(state, request).await {
+        Ok(routed) => routed,
+        Err(error) => {
+            record_error_outcome(
+                state,
+                &context,
+                None,
+                started.elapsed(),
+                &error.to_string(),
+                Some(ingress_span),
+            );
+            return Err(error);
+        }
+    };
+    Ok(PreparedResponsesExec {
+        context,
+        routed_backend: routed.backend_id,
+        fallback: routed.fallback_used,
+        driver_response: routed.response,
+        response_id: format!("resp_{}", Uuid::new_v4().simple()),
+        should_store: payload.store,
+        history_before_reply,
+        history_system,
+        started,
+        ingress_span,
+    })
+}
 
-    if payload.stream {
+async fn responses_inner(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    payload: OpenAiResponsesRequest,
+) -> Result<Response> {
+    let want_stream = payload.stream;
+    let cancel = CancellationToken::new();
+    let prepared =
+        prepare_responses_execution(&state, &headers, payload, want_stream, cancel.clone()).await?;
+    let PreparedResponsesExec {
+        context,
+        routed_backend: backend,
+        fallback,
+        driver_response,
+        response_id,
+        should_store,
+        history_before_reply,
+        history_system,
+        started,
+        ingress_span,
+    } = prepared;
+
+    if want_stream {
         let config = state.config();
         let keep_alive = config.server.keep_alive_interval_secs;
         let stream_timeout = config.server.stream_timeout_secs.max(1);
@@ -255,9 +416,13 @@ async fn responses_inner(
         let created_at = unix_now();
         let store = state.responses().clone();
         let resp_id_for_store = response_id.clone();
+        let stream_state = state.clone();
+        let stream_context = context.clone();
+        let stream_backend = backend.clone();
 
         let stream = async_stream::stream! {
             let _guard = CancelOnDrop(stream_cancel.clone());
+            let mut ingress_span = Some(ingress_span);
             let msg_id = format!("msg_{}", Uuid::new_v4().simple());
             let created_payload = json!({
                 "type": "response.created",
@@ -294,6 +459,14 @@ async fn responses_inner(
                 };
                 if timed_out {
                     stream_cancel.cancel();
+                    record_error_outcome(
+                        &stream_state,
+                        &stream_context,
+                        Some(&stream_backend),
+                        started.elapsed(),
+                        "stream timeout",
+                        ingress_span.take(),
+                    );
                     let error = json!({
                         "type": "error",
                         "error": {
@@ -401,6 +574,21 @@ async fn responses_inner(
                                 });
                                 store.insert(&resp_id_for_store, history_system, full_history);
                             }
+                            let effective_usage = final_usage.unwrap_or_else(|| {
+                                Usage::new(
+                                    stream_context.prompt_tokens,
+                                    count_tokens(&model, &full_text),
+                                )
+                            });
+                            record_completion_outcome(
+                                &stream_state,
+                                &stream_context,
+                                &stream_backend,
+                                fallback,
+                                effective_usage,
+                                started.elapsed(),
+                                ingress_span.take(),
+                            );
                             let completed_body = build_response_object(
                                 &response_id,
                                 created_at,
@@ -409,7 +597,7 @@ async fn responses_inner(
                                 should_store,
                                 &full_text,
                                 &collected_calls,
-                                final_usage.unwrap_or_default(),
+                                effective_usage,
                             );
                             let completed = json!({
                                 "type": "response.completed",
@@ -422,6 +610,14 @@ async fn responses_inner(
                         }
                     }
                     Some(Err(error)) => {
+                        record_error_outcome(
+                            &stream_state,
+                            &stream_context,
+                            Some(&stream_backend),
+                            started.elapsed(),
+                            &error.to_string(),
+                            ingress_span.take(),
+                        );
                         let payload = json!({
                             "type": "error",
                             "error": {
@@ -458,6 +654,21 @@ async fn responses_inner(
                             });
                             store.insert(&resp_id_for_store, history_system, full_history);
                         }
+                        let effective_usage = final_usage.unwrap_or_else(|| {
+                            Usage::new(
+                                stream_context.prompt_tokens,
+                                count_tokens(&model, &full_text),
+                            )
+                        });
+                        record_completion_outcome(
+                            &stream_state,
+                            &stream_context,
+                            &stream_backend,
+                            fallback,
+                            effective_usage,
+                            started.elapsed(),
+                            ingress_span.take(),
+                        );
                         let completed_body = build_response_object(
                             &response_id,
                             created_at,
@@ -466,7 +677,7 @@ async fn responses_inner(
                             should_store,
                             &full_text,
                             &collected_calls,
-                            final_usage.unwrap_or_default(),
+                            effective_usage,
                         );
                         let completed = json!({
                             "type": "response.completed",
@@ -492,7 +703,31 @@ async fn responses_inner(
         return Ok(response);
     }
 
-    let completion = completion(driver_response).await?;
+    let completion = match completion(driver_response).await {
+        Ok(c) => {
+            record_completion_outcome(
+                &state,
+                &context,
+                &backend,
+                fallback,
+                c.usage,
+                started.elapsed(),
+                Some(ingress_span),
+            );
+            c
+        }
+        Err(error) => {
+            record_error_outcome(
+                &state,
+                &context,
+                Some(&backend),
+                started.elapsed(),
+                &error.to_string(),
+                Some(ingress_span),
+            );
+            return Err(error);
+        }
+    };
     if should_store {
         let mut full_history = history_before_reply;
         full_history.push(ChatMessage {
@@ -526,6 +761,403 @@ async fn responses_inner(
     );
     crate::ingress::insert_header(&mut response, "x-vouch-request-id", &context.request_id);
     Ok(response)
+}
+
+/// WebSocket upgrade endpoint (`GET /v1/responses`) supporting stateful
+/// `response.create` and immediate cancellation via `response.cancel`.
+pub async fn responses_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(error) = state.tokens().authenticate(&headers) {
+        return error.into_openai_response();
+    }
+    ws.on_upgrade(move |socket| handle_ws_session(socket, state, headers))
+}
+
+async fn handle_ws_session(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (tx, mut rx) = mpsc::channel::<WsMessage>(64);
+
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if ws_tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut active_cancel: Option<CancellationToken> = None;
+
+    while let Some(incoming) = ws_rx.next().await {
+        let msg = match incoming {
+            Ok(msg) => msg,
+            Err(_) => break,
+        };
+        match msg {
+            WsMessage::Text(text) => {
+                let value: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(error) => {
+                        let err = ws_error_frame("invalid_json", &format!("invalid JSON: {error}"));
+                        let _ = tx.send(WsMessage::Text(err.into())).await;
+                        continue;
+                    }
+                };
+                match value.get("type").and_then(Value::as_str) {
+                    Some("response.cancel") => {
+                        if let Some(cancel) = active_cancel.take() {
+                            cancel.cancel();
+                        }
+                    }
+                    Some("response.create") => {
+                        if let Some(cancel) = active_cancel.take() {
+                            cancel.cancel();
+                        }
+                        let body_val = value.get("response").cloned().unwrap_or(value);
+                        let req_payload: OpenAiResponsesRequest =
+                            match serde_json::from_value(body_val) {
+                                Ok(req) => req,
+                                Err(error) => {
+                                    let err = ws_error_frame(
+                                        "invalid_request",
+                                        &format!("invalid response.create payload: {error}"),
+                                    );
+                                    let _ = tx.send(WsMessage::Text(err.into())).await;
+                                    continue;
+                                }
+                            };
+                        let cancel = CancellationToken::new();
+                        active_cancel = Some(cancel.clone());
+                        let state_clone = state.clone();
+                        let headers_clone = headers.clone();
+                        let tx_clone = tx.clone();
+                        tokio::spawn(async move {
+                            run_ws_response(
+                                state_clone,
+                                headers_clone,
+                                req_payload,
+                                cancel,
+                                tx_clone,
+                            )
+                            .await;
+                        });
+                    }
+                    other => {
+                        let err = ws_error_frame(
+                            "unsupported_event",
+                            &format!("unsupported client event type {other:?}"),
+                        );
+                        let _ = tx.send(WsMessage::Text(err.into())).await;
+                    }
+                }
+            }
+            WsMessage::Ping(bytes) => {
+                let _ = tx.send(WsMessage::Pong(bytes)).await;
+            }
+            WsMessage::Close(_) => break,
+            WsMessage::Binary(_) => {
+                let err = ws_error_frame("unsupported_frame", "binary frames are not supported");
+                let _ = tx.send(WsMessage::Text(err.into())).await;
+            }
+            WsMessage::Pong(_) => {}
+        }
+    }
+
+    if let Some(cancel) = active_cancel.take() {
+        cancel.cancel();
+    }
+    drop(tx);
+    let _ = writer.await;
+}
+
+async fn run_ws_response(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    payload: OpenAiResponsesRequest,
+    cancel: CancellationToken,
+    tx: mpsc::Sender<WsMessage>,
+) {
+    let prepared =
+        match prepare_responses_execution(&state, &headers, payload, true, cancel.clone()).await {
+            Ok(p) => p,
+            Err(error) => {
+                let frame = ws_error_frame("request_error", &error.to_string());
+                let _ = tx.send(WsMessage::Text(frame.into())).await;
+                return;
+            }
+        };
+
+    let PreparedResponsesExec {
+        context,
+        routed_backend: backend,
+        fallback,
+        driver_response,
+        response_id,
+        should_store,
+        history_before_reply,
+        history_system,
+        started,
+        ingress_span,
+    } = prepared;
+
+    let stream_timeout = state.config().server.stream_timeout_secs.max(1);
+    let mut chunks = into_chunk_stream(driver_response);
+    let mut ingress_span = Some(ingress_span);
+    let model = context.model.clone();
+    let created_at = unix_now();
+    let msg_id = format!("msg_{}", Uuid::new_v4().simple());
+
+    let created = json!({
+        "type": "response.created",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "in_progress",
+            "model": model,
+            "store": should_store,
+            "output": [],
+        }
+    });
+    if tx
+        .send(WsMessage::Text(created.to_string().into()))
+        .await
+        .is_err()
+    {
+        cancel.cancel();
+        record_error_outcome(
+            &state,
+            &context,
+            Some(&backend),
+            started.elapsed(),
+            "websocket closed",
+            ingress_span.take(),
+        );
+        return;
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(stream_timeout);
+    let mut full_text = String::new();
+    let mut tool_calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
+    let mut final_usage: Option<Usage> = None;
+
+    loop {
+        enum WsLoopItem {
+            Cancelled,
+            TimedOut,
+            Chunk(Option<Result<StreamChunk>>),
+        }
+        let next_item = tokio::select! {
+            _ = cancel.cancelled() => WsLoopItem::Cancelled,
+            _ = tokio::time::sleep_until(deadline) => WsLoopItem::TimedOut,
+            item = chunks.next() => WsLoopItem::Chunk(item),
+        };
+        match next_item {
+            WsLoopItem::Cancelled => {
+                record_error_outcome(
+                    &state,
+                    &context,
+                    Some(&backend),
+                    started.elapsed(),
+                    "response cancelled",
+                    ingress_span.take(),
+                );
+                break;
+            }
+            WsLoopItem::TimedOut => {
+                cancel.cancel();
+                record_error_outcome(
+                    &state,
+                    &context,
+                    Some(&backend),
+                    started.elapsed(),
+                    "stream timeout",
+                    ingress_span.take(),
+                );
+                let frame = ws_error_frame(
+                    "stream_timeout",
+                    &format!("stream timed out after {stream_timeout} seconds"),
+                );
+                let _ = tx.send(WsMessage::Text(frame.into())).await;
+                break;
+            }
+            WsLoopItem::Chunk(Some(Ok(chunk))) => {
+                let StreamChunk {
+                    delta,
+                    tool_calls: tc_deltas,
+                    finish_reason,
+                    usage,
+                    ..
+                } = chunk;
+                if usage.is_some() {
+                    final_usage = usage;
+                }
+                if !delta.is_empty() {
+                    full_text.push_str(&delta);
+                    let delta_frame = json!({
+                        "type": "response.output_text.delta",
+                        "item_id": msg_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": delta,
+                    });
+                    if tx
+                        .send(WsMessage::Text(delta_frame.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        cancel.cancel();
+                        break;
+                    }
+                }
+                for tc in tc_deltas {
+                    let entry = tool_calls.entry(tc.index).or_insert_with(|| ToolCall {
+                        id: format!("call_{}", Uuid::new_v4().simple()),
+                        name: String::new(),
+                        arguments: String::new(),
+                    });
+                    if let Some(id) = tc.id {
+                        entry.id = id;
+                    }
+                    if let Some(name) = tc.name {
+                        entry.name.push_str(&name);
+                    }
+                    if let Some(args) = tc.arguments_delta {
+                        entry.arguments.push_str(&args);
+                        let delta_frame = json!({
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": entry.id,
+                            "output_index": tc.index + 1,
+                            "delta": args,
+                        });
+                        if tx
+                            .send(WsMessage::Text(delta_frame.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            cancel.cancel();
+                            break;
+                        }
+                    }
+                }
+                if finish_reason.is_some() {
+                    let collected_calls: Vec<ToolCall> = tool_calls.into_values().collect();
+                    if should_store {
+                        let mut full_history = history_before_reply;
+                        full_history.push(ChatMessage {
+                            role: "assistant".into(),
+                            content: MessageContent::Text(full_text.clone()),
+                            tool_calls: collected_calls.clone(),
+                            tool_call_id: None,
+                            name: None,
+                        });
+                        state
+                            .responses()
+                            .insert(&response_id, history_system, full_history);
+                    }
+                    let effective_usage = final_usage.unwrap_or_else(|| {
+                        Usage::new(context.prompt_tokens, count_tokens(&model, &full_text))
+                    });
+                    record_completion_outcome(
+                        &state,
+                        &context,
+                        &backend,
+                        fallback,
+                        effective_usage,
+                        started.elapsed(),
+                        ingress_span.take(),
+                    );
+                    let completed_body = build_response_object(
+                        &response_id,
+                        created_at,
+                        &model,
+                        &msg_id,
+                        should_store,
+                        &full_text,
+                        &collected_calls,
+                        effective_usage,
+                    );
+                    let completed = json!({
+                        "type": "response.completed",
+                        "response": completed_body,
+                    });
+                    let _ = tx.send(WsMessage::Text(completed.to_string().into())).await;
+                    break;
+                }
+            }
+            WsLoopItem::Chunk(Some(Err(error))) => {
+                record_error_outcome(
+                    &state,
+                    &context,
+                    Some(&backend),
+                    started.elapsed(),
+                    &error.to_string(),
+                    ingress_span.take(),
+                );
+                let frame = ws_error_frame("stream_error", &error.to_string());
+                let _ = tx.send(WsMessage::Text(frame.into())).await;
+                break;
+            }
+            WsLoopItem::Chunk(None) => {
+                let collected_calls: Vec<ToolCall> = tool_calls.into_values().collect();
+                if should_store {
+                    let mut full_history = history_before_reply;
+                    full_history.push(ChatMessage {
+                        role: "assistant".into(),
+                        content: MessageContent::Text(full_text.clone()),
+                        tool_calls: collected_calls.clone(),
+                        tool_call_id: None,
+                        name: None,
+                    });
+                    state
+                        .responses()
+                        .insert(&response_id, history_system, full_history);
+                }
+                let effective_usage = final_usage.unwrap_or_else(|| {
+                    Usage::new(context.prompt_tokens, count_tokens(&model, &full_text))
+                });
+                record_completion_outcome(
+                    &state,
+                    &context,
+                    &backend,
+                    fallback,
+                    effective_usage,
+                    started.elapsed(),
+                    ingress_span.take(),
+                );
+                let completed_body = build_response_object(
+                    &response_id,
+                    created_at,
+                    &model,
+                    &msg_id,
+                    should_store,
+                    &full_text,
+                    &collected_calls,
+                    effective_usage,
+                );
+                let completed = json!({
+                    "type": "response.completed",
+                    "response": completed_body,
+                });
+                let _ = tx.send(WsMessage::Text(completed.to_string().into())).await;
+                break;
+            }
+        }
+    }
+}
+
+fn ws_error_frame(code: &str, message: &str) -> String {
+    json!({
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "code": code,
+            "message": message,
+        }
+    })
+    .to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
