@@ -6,13 +6,17 @@
 //! back. Authentication, model resolution, session affinity, and fallback are
 //! shared.
 
+pub mod admin;
 pub mod anthropic;
+pub mod gemini;
+pub mod ollama;
 pub mod openai;
 pub mod ops;
 pub mod responses;
 pub mod ui;
 
 use std::{
+    collections::BTreeMap,
     convert::Infallible,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -28,7 +32,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use futures::Stream;
 use tokio_util::sync::CancellationToken;
@@ -36,10 +40,11 @@ use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 use crate::{
-    auth::Principal,
+    auth::{Principal, tokens::TokenConcurrencyGuard},
+    cache::{CACHE_STATUS_HEADER, CacheLookup, synthesize_stream_from_completion},
     driver::{
         ChatMessage, ChunkStream, Completion, ContentPart, DriverResponse, ExecutionRequest,
-        MessageContent, ResponseFormat, StreamChunk, ThinkingBlock, ToolCallDelta, Usage,
+        MessageContent, ResponseFormat, StreamChunk, ThinkingBlock, ToolCall, ToolCallDelta, Usage,
         WorkspaceMode, attachments::parse_data_uri, collect_stream_full, render_prompt,
     },
     error::{GatewayError, Result},
@@ -69,6 +74,242 @@ pub(crate) struct RequestContext {
     pub trace_context: TraceContext,
     /// Estimated prompt BPE tokens computed at ingress.
     pub prompt_tokens: u64,
+    /// Per-token concurrency permit released when response/stream drops.
+    #[allow(dead_code)]
+    pub concurrency_guard: Arc<TokenConcurrencyGuard>,
+}
+
+/// Dispatched route result paired with optional `X-Vouch-Cache` header and miss key.
+pub(crate) struct DispatchedExecution {
+    pub routed: RoutedResponse,
+    pub cache_status: Option<HeaderValue>,
+    pub cache_miss_key: Option<String>,
+}
+
+/// RAII accounting guard for streaming responses (SSE, WS, NDJSON, Gemini JSON array).
+///
+/// Counts emitted text and tool-call bytes via `tiktoken` if a stream closes early
+/// (e.g., client disconnect `408` or stream timeout `504`) and debits [`UsageTracker`]
+/// plus daily/TPM token budgets exactly once on completion or drop.
+pub(crate) struct StreamUsageGuard {
+    state: Arc<AppState>,
+    context: RequestContext,
+    backend_id: String,
+    fallback: bool,
+    started: Instant,
+    ingress_span: Option<ActiveSpan>,
+    cache_miss_key: Option<String>,
+    emitted_text: String,
+    emitted_thinking: Vec<ThinkingBlock>,
+    emitted_tool_bytes: String,
+    emitted_tool_calls: BTreeMap<usize, ToolCall>,
+    explicit_usage: Option<Usage>,
+    committed: bool,
+}
+
+impl StreamUsageGuard {
+    /// Create an armed accounting guard wrapping an active stream.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        state: Arc<AppState>,
+        context: RequestContext,
+        backend_id: String,
+        fallback: bool,
+        started: Instant,
+        ingress_span: Option<ActiveSpan>,
+        cache_miss_key: Option<String>,
+    ) -> Self {
+        Self {
+            state,
+            context,
+            backend_id,
+            fallback,
+            started,
+            ingress_span,
+            cache_miss_key,
+            emitted_text: String::new(),
+            emitted_thinking: Vec::new(),
+            emitted_tool_bytes: String::new(),
+            emitted_tool_calls: BTreeMap::new(),
+            explicit_usage: None,
+            committed: false,
+        }
+    }
+
+    /// Observe an upstream [`StreamChunk`] before rendering it to the wire format.
+    pub(crate) fn observe_chunk(&mut self, chunk: &StreamChunk) {
+        if !chunk.delta.is_empty() {
+            self.emitted_text.push_str(&chunk.delta);
+        }
+        if let Some(thinking) = &chunk.thinking_delta
+            && !thinking.is_empty()
+        {
+            self.emitted_tool_bytes.push_str(thinking);
+            match self.emitted_thinking.last_mut() {
+                Some(ThinkingBlock::Thinking { thinking: prev, .. }) => prev.push_str(thinking),
+                _ => self.emitted_thinking.push(ThinkingBlock::Thinking {
+                    thinking: thinking.clone(),
+                    signature: None,
+                }),
+            }
+        }
+        if let Some(sig) = &chunk.signature_delta
+            && let Some(ThinkingBlock::Thinking { signature, .. }) =
+                self.emitted_thinking.last_mut()
+        {
+            signature.get_or_insert_with(String::new).push_str(sig);
+        }
+        if let Some(redacted) = &chunk.redacted_thinking {
+            self.emitted_thinking.push(ThinkingBlock::RedactedThinking {
+                data: redacted.clone(),
+            });
+        }
+        for delta in &chunk.tool_calls {
+            let entry = self
+                .emitted_tool_calls
+                .entry(delta.index)
+                .or_insert_with(|| ToolCall {
+                    id: delta
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple())),
+                    name: delta.name.clone().unwrap_or_default(),
+                    arguments: String::new(),
+                });
+            if let Some(id) = &delta.id {
+                entry.id = id.clone();
+            }
+            if let Some(name) = &delta.name {
+                entry.name = name.clone();
+                self.emitted_tool_bytes.push_str(name);
+            }
+            if let Some(args) = &delta.arguments_delta {
+                entry.arguments.push_str(args);
+                self.emitted_tool_bytes.push_str(args);
+            }
+        }
+        if let Some(usage) = chunk.usage {
+            self.explicit_usage = Some(usage);
+        }
+    }
+
+    fn estimate_emitted_usage(&self) -> Usage {
+        let mut combined =
+            String::with_capacity(self.emitted_text.len() + self.emitted_tool_bytes.len());
+        combined.push_str(&self.emitted_text);
+        if !self.emitted_tool_bytes.is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(&self.emitted_tool_bytes);
+        }
+        let completion_tokens = count_tokens(&self.context.model, &combined);
+        Usage::new(self.context.prompt_tokens, completion_tokens)
+    }
+
+    /// Commit normal stream completion once and populate the deterministic cache on a miss.
+    pub(crate) fn complete(&mut self, usage: Option<Usage>, finish_reason: &str) -> Usage {
+        let mut effective = usage
+            .or(self.explicit_usage)
+            .unwrap_or_else(|| self.estimate_emitted_usage());
+        if effective.prompt_tokens == 0 && self.context.prompt_tokens > 0 {
+            effective = Usage::new(self.context.prompt_tokens, effective.completion_tokens);
+        }
+        if effective.completion_tokens == 0
+            && (!self.emitted_text.is_empty() || !self.emitted_tool_bytes.is_empty())
+        {
+            let est = self.estimate_emitted_usage();
+            effective = Usage::new(effective.prompt_tokens, est.completion_tokens);
+        }
+        if self.committed {
+            return effective;
+        }
+        self.committed = true;
+
+        record_completion_outcome(
+            &self.state,
+            &self.context,
+            &self.backend_id,
+            self.fallback,
+            effective,
+            self.started.elapsed(),
+            self.ingress_span.take(),
+        );
+        if let Some(key) = self.cache_miss_key.take() {
+            let cached = Completion {
+                content: self.emitted_text.clone(),
+                finish_reason: finish_reason.to_string(),
+                usage: effective,
+                raw: None,
+                tool_calls: self.emitted_tool_calls.values().cloned().collect(),
+                thinking: self.emitted_thinking.clone(),
+            };
+            self.state.cache().store(key, &self.backend_id, &cached);
+        }
+        effective
+    }
+
+    /// Record stream timeout / error once while still billing emitted partial tokens.
+    pub(crate) fn fail(&mut self, error: &str) {
+        if self.committed {
+            return;
+        }
+        self.committed = true;
+        let usage = self.estimate_emitted_usage();
+        let has_emitted = !self.emitted_text.is_empty() || !self.emitted_tool_bytes.is_empty();
+        if has_emitted && usage.total_tokens > 0 {
+            self.context.principal.record_tokens(usage.total_tokens);
+            let cost = self
+                .state
+                .calculate_cost_usd(&self.context.model, &self.backend_id, usage);
+            self.state.usage().record_outcome_with_cost(
+                &self.context.principal.name,
+                &self.backend_id,
+                usage,
+                self.started.elapsed(),
+                cost,
+                true,
+            );
+        } else {
+            self.state.usage().record_error(
+                &self.context.principal.name,
+                Some(&self.backend_id),
+                self.started.elapsed(),
+            );
+        }
+        if let Some(span) = self.ingress_span.take() {
+            span.finish_err(error);
+        }
+    }
+}
+
+impl Drop for StreamUsageGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.committed = true;
+            let has_emitted = !self.emitted_text.is_empty() || !self.emitted_tool_bytes.is_empty();
+            let usage = if has_emitted {
+                self.estimate_emitted_usage()
+            } else {
+                Usage::new(self.context.prompt_tokens, 0)
+            };
+            self.context.principal.record_tokens(usage.total_tokens);
+            let cost = self
+                .state
+                .calculate_cost_usd(&self.context.model, &self.backend_id, usage);
+            self.state.usage().record_outcome_with_cost(
+                &self.context.principal.name,
+                &self.backend_id,
+                usage,
+                self.started.elapsed(),
+                cost,
+                true,
+            );
+            if let Some(span) = self.ingress_span.take() {
+                span.finish_err("stream dropped before completion");
+            }
+        }
+    }
 }
 
 /// Build the complete axum application.
@@ -85,6 +326,16 @@ pub fn build_router(state: Arc<AppState>) -> AxumRouter {
             post(responses::responses).get(responses::responses_ws),
         )
         .route("/v1/messages", post(anthropic::messages))
+        .route("/v1beta/models/{*model_action}", post(gemini::generate))
+        .route("/api/tags", get(ollama::tags))
+        .route("/api/chat", post(ollama::chat))
+        .route("/api/generate", post(ollama::generate))
+        .route("/admin/reload", post(admin::reload))
+        .route(
+            "/admin/circuits/{backend}/reset",
+            post(admin::reset_circuit),
+        )
+        .route("/admin/cache", delete(admin::purge_cache))
         .route("/v1/usage", get(ops::usage))
         .route("/mcp", post(crate::cli::mcp::http_mcp))
         .route("/ui", get(ui::dashboard))
@@ -112,6 +363,27 @@ pub(crate) fn prepare_routed(
     messages: &[ChatMessage],
     tools: &[serde_json::Value],
 ) -> Result<RequestContext> {
+    prepare_routed_with_key_hint(
+        state,
+        headers,
+        None,
+        requested_model,
+        system,
+        messages,
+        tools,
+    )
+}
+
+/// Variant of [`prepare_routed`] accepting an optional query-string API key (Gemini `?key=`).
+pub(crate) fn prepare_routed_with_key_hint(
+    state: &AppState,
+    headers: &HeaderMap,
+    key_hint: Option<&str>,
+    requested_model: Option<&str>,
+    system: Option<&str>,
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+) -> Result<RequestContext> {
     let first_user = first_user_text(messages);
     let has_images = messages_have_images(messages);
     let model_hint = requested_model
@@ -128,10 +400,13 @@ pub(crate) fn prepare_routed(
         prompt_tokens,
         headers,
     })?;
-    let principal =
-        state
-            .tokens()
-            .authorize_route(headers, &resolved.requested, &resolved.route)?;
+    let principal = state.tokens().authorize_route_with_key_hint(
+        headers,
+        key_hint,
+        &resolved.requested,
+        &resolved.route,
+    )?;
+    let concurrency_guard = principal.acquire_concurrency_permit()?;
 
     let request_id = header_text(headers, "x-request-id")
         .filter(|value| value.len() <= 128 && is_safe_id(value))
@@ -167,6 +442,7 @@ pub(crate) fn prepare_routed(
         workspace_mode,
         trace_context,
         prompt_tokens,
+        concurrency_guard,
     })
 }
 
@@ -215,9 +491,14 @@ pub(crate) fn record_completion_outcome(
         usage
     };
     context.principal.record_tokens(effective.total_tokens);
-    state
-        .usage()
-        .record_success(&context.principal.name, backend, effective, elapsed);
+    let cost_usd = state.calculate_cost_usd(&context.model, backend, effective);
+    state.usage().record_success_with_cost(
+        &context.principal.name,
+        backend,
+        effective,
+        elapsed,
+        cost_usd,
+    );
     if let Some(mut span) = span {
         span.set_str("vouch.route", &context.model);
         span.set_str("vouch.backend", backend);
@@ -285,8 +566,105 @@ pub(crate) fn execution_request(
         delta_messages: None,
         session_capture: Arc::new(parking_lot::Mutex::new(None)),
         trace_context: Some(context.trace_context.clone()),
+        profile_id: None,
+        profile_env: BTreeMap::new(),
+        allowed_backends: context.principal.allowed_backends(),
         extra,
     }
+}
+
+/// Dispatch a request with deterministic response cache lookup and router deadline.
+pub(crate) async fn execute_or_cached(
+    state: &AppState,
+    context: &RequestContext,
+    headers: &HeaderMap,
+    request: ExecutionRequest,
+) -> Result<DispatchedExecution> {
+    let workspace_isolated = match context.workspace_mode {
+        WorkspaceMode::Worktree => true,
+        WorkspaceMode::None => false,
+        WorkspaceMode::Auto => state.workspaces().enabled(),
+    };
+    let lookup = state
+        .cache()
+        .lookup(&context.model, &request, headers, workspace_isolated);
+    let cache_status = lookup.header_value();
+    let cache_miss_key = lookup.miss_key().map(ToString::to_string);
+
+    match lookup {
+        CacheLookup::Hit(cached) => {
+            let response = if request.stream {
+                DriverResponse::Stream(synthesize_stream_from_completion(&cached.completion))
+            } else {
+                DriverResponse::Complete(cached.completion)
+            };
+            Ok(DispatchedExecution {
+                routed: RoutedResponse {
+                    backend_id: cached.backend_id,
+                    fallback_used: false,
+                    response,
+                    attempts: Vec::new(),
+                },
+                cache_status,
+                cache_miss_key: None,
+            })
+        }
+        CacheLookup::Miss(_) | CacheLookup::Bypass | CacheLookup::Disabled => {
+            let routed = execute(state, request).await?;
+            Ok(DispatchedExecution {
+                routed,
+                cache_status,
+                cache_miss_key,
+            })
+        }
+    }
+}
+
+/// Attach `x-vouch-cache` when `[cache].enabled` returned a cache status header.
+pub(crate) fn insert_cache_header(response: &mut Response, status: Option<HeaderValue>) {
+    if let Some(value) = status {
+        response.headers_mut().insert(CACHE_STATUS_HEADER, value);
+    }
+}
+
+/// Attach standard `x-vouch-*` routing and cache headers onto any egress HTTP response.
+pub(crate) fn insert_routing_headers(
+    response: &mut Response,
+    backend: &str,
+    fallback: bool,
+    request_id: &str,
+    cache_status: Option<HeaderValue>,
+) {
+    insert_header(response, "x-vouch-backend", backend);
+    insert_header(
+        response,
+        "x-vouch-fallback",
+        if fallback { "true" } else { "false" },
+    );
+    insert_header(response, "x-vouch-request-id", request_id);
+    insert_cache_header(response, cache_status);
+}
+
+/// Parse an RFC-3339-like UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp for current time.
+pub(crate) fn iso8601_utc_now() -> String {
+    let secs = unix_now();
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+    // Civil calendar conversion from Unix epoch days (Howard Hinnant algorithm).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(m <= 2);
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
 /// Dispatch a request with the configured non-streaming deadline.
@@ -574,6 +952,12 @@ async fn metrics_middleware(request: Request<Body>, next: Next) -> Response {
         "anthropic"
     } else if path == "/mcp" {
         "mcp"
+    } else if path.starts_with("/v1beta/") {
+        "gemini"
+    } else if path.starts_with("/api/") {
+        "ollama"
+    } else if path.starts_with("/admin/") {
+        "admin"
     } else if path.starts_with("/v1/") {
         "openai"
     } else {
