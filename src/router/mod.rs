@@ -27,11 +27,12 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::{BackendConfig, BackendKind, GatewayConfig},
+    config::{BackendConfig, BackendKind, GatewayConfig, RoutePolicyConfig, RouteStrategy},
     driver::{
         ChatMessage, ChunkStream, Driver, DriverResponse, ExecutionRequest, WorkspaceMode,
         cli_pipe::CliPipeDriver, http_proxy::HttpProxyDriver, prime_stream,
-        pty_runner::PtyRunnerDriver, workspace::WorkspaceManager,
+        pty_runner::PtyRunnerDriver, tool_bridge::is_schema_validation_error,
+        workspace::WorkspaceManager,
     },
     error::{GatewayError, Result},
     metrics,
@@ -43,6 +44,8 @@ use crate::{
 };
 
 use self::circuit_breaker::{BreakerSettings, CircuitBreaker, CircuitState, FailureDetails};
+
+const TTFT_EWMA_ALPHA: f64 = 0.3;
 
 /// Sticky backend selected for a session.
 #[derive(Debug, Clone)]
@@ -71,6 +74,7 @@ pub struct BackendSessionState {
 pub struct SessionAffinity {
     entries: DashMap<String, AffinityEntry>,
     backend_sessions: DashMap<(String, String), BackendSessionState>,
+    profile_affinity: DashMap<(String, String), AffinityEntry>,
     max_entries: AtomicUsize,
     seq: AtomicU64,
 }
@@ -92,6 +96,7 @@ impl SessionAffinity {
         Self {
             entries: DashMap::new(),
             backend_sessions: DashMap::new(),
+            profile_affinity: DashMap::new(),
             max_entries: AtomicUsize::new(max_entries.max(1)),
             seq: AtomicU64::new(1),
         }
@@ -106,6 +111,9 @@ impl SessionAffinity {
         }
         if self.backend_sessions.len() > cap {
             evict_oldest_if_full(&self.backend_sessions, cap.saturating_add(1), |e| e.seq);
+        }
+        if self.profile_affinity.len() > cap {
+            evict_oldest_if_full(&self.profile_affinity, cap.saturating_add(1), |e| e.seq);
         }
     }
 
@@ -136,6 +144,43 @@ impl SessionAffinity {
             key.to_string(),
             AffinityEntry {
                 backend_id: backend_id.to_string(),
+                last_used: Instant::now(),
+                updated_unix_secs: unix_now_secs(),
+                seq,
+            },
+        );
+    }
+
+    /// Look up sticky credential profile for `(session_key, backend_id)`.
+    pub fn get_profile(
+        &self,
+        session_key: &str,
+        backend_id: &str,
+        ttl: Duration,
+    ) -> Option<String> {
+        let composite = (session_key.to_string(), backend_id.to_string());
+        let entry = self.profile_affinity.get(&composite)?;
+        if entry.last_used.elapsed() > ttl {
+            drop(entry);
+            self.profile_affinity.remove(&composite);
+            None
+        } else {
+            Some(entry.backend_id.clone())
+        }
+    }
+
+    /// Record sticky credential profile for `(session_key, backend_id)`.
+    pub fn set_profile(&self, session_key: &str, backend_id: &str, profile_id: &str) {
+        let composite = (session_key.to_string(), backend_id.to_string());
+        let cap = self.max_entries.load(Ordering::Relaxed).max(1);
+        if !self.profile_affinity.contains_key(&composite) {
+            evict_oldest_if_full(&self.profile_affinity, cap, |e| e.seq);
+        }
+        let seq = self.next_seq();
+        self.profile_affinity.insert(
+            composite,
+            AffinityEntry {
+                backend_id: profile_id.to_string(),
                 last_used: Instant::now(),
                 updated_unix_secs: unix_now_secs(),
                 seq,
@@ -293,6 +338,16 @@ impl SessionAffinity {
         for key in expired_bs {
             self.backend_sessions.remove(&key);
         }
+
+        let expired_profiles: Vec<(String, String)> = self
+            .profile_affinity
+            .iter()
+            .filter(|entry| entry.last_used.elapsed() > ttl)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in expired_profiles {
+            self.profile_affinity.remove(&key);
+        }
     }
 
     /// Number of tracked sessions.
@@ -374,6 +429,8 @@ pub struct BackendHandle {
     pub driver: Arc<dyn Driver>,
     /// Circuit breaker.
     pub breaker: Arc<CircuitBreaker>,
+    /// Weighted round-robin cursor across configured credential profiles.
+    profile_cursor: AtomicUsize,
 }
 
 impl std::fmt::Debug for BackendHandle {
@@ -429,6 +486,8 @@ pub struct RouterTable {
     routes: HashMap<String, Vec<Arc<BackendHandle>>>,
     aliases: BTreeMap<String, String>,
     rules: Vec<CompiledRoutingRule>,
+    policies: BTreeMap<String, RoutePolicyConfig>,
+    schema_repair_retries: u8,
     order: Vec<Arc<BackendHandle>>,
     default_model: Option<String>,
     default_requested: Option<String>,
@@ -489,6 +548,8 @@ pub struct Router {
     table: ArcSwap<RouterTable>,
     sessions: Arc<SessionAffinity>,
     breakers: DashMap<String, Arc<CircuitBreaker>>,
+    profile_breakers: DashMap<String, Arc<CircuitBreaker>>,
+    ttft_ewma_ms: DashMap<String, f64>,
     ttl_secs: Arc<AtomicU64>,
     otel: ArcSwap<Option<Arc<OtelExporter>>>,
 }
@@ -500,11 +561,28 @@ impl Router {
             table: ArcSwap::from_pointee(RouterTable::default()),
             sessions,
             breakers: DashMap::new(),
+            profile_breakers: DashMap::new(),
+            ttft_ewma_ms: DashMap::new(),
             ttl_secs: Arc::new(AtomicU64::new(config.defaults.session_ttl_secs.max(1))),
             otel: ArcSwap::from_pointee(None),
         };
         router.rebuild(config)?;
         Ok(router)
+    }
+
+    /// Manually reset the circuit breaker for `backend_id` (and all its profiles).
+    pub fn reset_circuit(&self, backend_id: &str) -> bool {
+        let Some(breaker) = self.breakers.get(backend_id) else {
+            return false;
+        };
+        breaker.reset();
+        let prefix = format!("{backend_id}::profile::");
+        for entry in self.profile_breakers.iter() {
+            if entry.key().starts_with(&prefix) {
+                entry.value().reset();
+            }
+        }
+        true
     }
 
     /// Attach the OpenTelemetry exporter used to emit `router.dispatch`,
@@ -520,6 +598,7 @@ impl Router {
         let mut handles: HashMap<String, Arc<BackendHandle>> = HashMap::new();
         let mut order = Vec::with_capacity(config.backends.len());
         let mut active = HashSet::with_capacity(config.backends.len());
+        let mut active_profiles = HashSet::new();
 
         for backend in &config.backends {
             active.insert(backend.id.clone());
@@ -535,6 +614,17 @@ impl Router {
                     breaker
                 }
             };
+            for profile in &backend.profiles {
+                let pkey = profile_breaker_key(&backend.id, &profile.id);
+                active_profiles.insert(pkey.clone());
+                match self.profile_breakers.get(&pkey) {
+                    Some(existing) => existing.reconfigure(settings.clone()),
+                    None => {
+                        let pb = Arc::new(CircuitBreaker::new(pkey.clone(), settings.clone()));
+                        self.profile_breakers.insert(pkey, pb);
+                    }
+                }
+            }
             let driver: Arc<dyn Driver> = match backend.kind {
                 BackendKind::Http => {
                     Arc::new(HttpProxyDriver::new(backend.clone(), &config.defaults)?)
@@ -552,12 +642,16 @@ impl Router {
                 config: backend.clone(),
                 driver,
                 breaker,
+                profile_cursor: AtomicUsize::new(0),
             });
             handles.insert(backend.id.clone(), handle.clone());
             order.push(handle);
         }
 
         self.breakers.retain(|id, _| active.contains(id));
+        self.profile_breakers
+            .retain(|key, _| active_profiles.contains(key));
+        self.ttft_ewma_ms.retain(|id, _| active.contains(id));
 
         let mut routes = HashMap::with_capacity(config.routes.len());
         for (model, chain) in &config.routes {
@@ -614,6 +708,8 @@ impl Router {
             routes,
             aliases: config.aliases.clone(),
             rules: compiled_rules,
+            policies: config.route_policies.clone(),
+            schema_repair_retries: config.defaults.schema_repair_retries,
             order,
             default_model: config.default_model().map(ToString::to_string),
             default_requested,
@@ -690,7 +786,7 @@ impl Router {
         })
     }
 
-    /// Execute a request with fallback and affinity.
+    /// Execute a request with fallback, strategy policies, multi-profile rotation, and affinity.
     pub async fn execute(
         &self,
         request: ExecutionRequest,
@@ -736,22 +832,167 @@ impl Router {
             return Err(err);
         }
 
-        let ttl = Duration::from_secs(self.ttl_secs.load(Ordering::Relaxed).max(1));
         let mut candidates = chain;
-        if let Some(sticky) = self.sessions.get(&request.session_key, ttl)
-            && let Some(position) = candidates
-                .iter()
-                .position(|backend| backend.config.id == sticky)
-        {
-            let backend = candidates.remove(position);
-            candidates.insert(0, backend);
+        if let Some(allowlist) = &request.allowed_backends {
+            candidates.retain(|backend| {
+                allowlist
+                    .iter()
+                    .any(|allowed| allowed == &backend.config.id)
+            });
+            if candidates.is_empty() {
+                let err = GatewayError::Forbidden(format!(
+                    "token is not allowed to use any backend for model {:?}",
+                    request.model
+                ));
+                if let Some(span) = dispatch_span {
+                    span.finish_err(&err.to_string());
+                }
+                return Err(err);
+            }
+        }
+
+        let policy = table
+            .policies
+            .get(&request.model)
+            .cloned()
+            .unwrap_or(RoutePolicyConfig {
+                strategy: RouteStrategy::Ordered,
+                hedge_delay_ms: 2500,
+            });
+        let ttl = Duration::from_secs(self.ttl_secs.load(Ordering::Relaxed).max(1));
+
+        match policy.strategy {
+            RouteStrategy::LeastLatency => {
+                let mut indexed: Vec<(usize, Arc<BackendHandle>)> =
+                    candidates.into_iter().enumerate().collect();
+                indexed.sort_by(|(idx_a, a), (idx_b, b)| {
+                    let lat_a = self
+                        .ttft_ewma_ms
+                        .get(&a.config.id)
+                        .map(|v| *v)
+                        .unwrap_or(0.0);
+                    let lat_b = self
+                        .ttft_ewma_ms
+                        .get(&b.config.id)
+                        .map(|v| *v)
+                        .unwrap_or(0.0);
+                    lat_a.total_cmp(&lat_b).then_with(|| idx_a.cmp(idx_b))
+                });
+                candidates = indexed.into_iter().map(|(_, b)| b).collect();
+            }
+            RouteStrategy::Ordered | RouteStrategy::Hedged => {
+                if let Some(sticky) = self.sessions.get(&request.session_key, ttl)
+                    && let Some(position) = candidates
+                        .iter()
+                        .position(|backend| backend.config.id == sticky)
+                {
+                    let backend = candidates.remove(position);
+                    candidates.insert(0, backend);
+                }
+            }
         }
 
         let mut attempts = Vec::new();
         let mut last_error: Option<GatewayError> = None;
         let mut previous_backend: Option<String> = None;
+        let schema_repair_retries = table.schema_repair_retries;
 
-        for (index, backend) in candidates.iter().enumerate() {
+        let seq_start_idx = if policy.strategy == RouteStrategy::Hedged && candidates.len() >= 2 {
+            let mut circuit_ok = Vec::new();
+            let mut deferred = 0usize;
+            for backend in &candidates {
+                if backend.breaker.allow_request() {
+                    circuit_ok.push(backend.clone());
+                } else {
+                    attempts.push(format!(
+                        "{}: circuit {}",
+                        backend.config.id,
+                        backend.breaker.state().as_str()
+                    ));
+                    previous_backend = Some(backend.config.id.clone());
+                }
+                deferred += 1;
+                if circuit_ok.len() == 2 {
+                    break;
+                }
+            }
+
+            if circuit_ok.len() == 2 {
+                let c1 = circuit_ok[0].clone();
+                let c2 = circuit_ok[1].clone();
+                if let Some(outcome) = self
+                    .try_hedged_pair(
+                        c1,
+                        c2,
+                        &request,
+                        policy.hedge_delay_ms,
+                        workspace_mode,
+                        workspaces,
+                        &dispatch_ctx,
+                        ttl,
+                        schema_repair_retries,
+                        &otel,
+                        &mut attempts,
+                        &mut last_error,
+                        &mut previous_backend,
+                    )
+                    .await?
+                {
+                    return Ok(self.finalize_winner(
+                        outcome,
+                        &request.session_key,
+                        previous_backend.as_deref(),
+                        attempts,
+                        dispatch_span,
+                    ));
+                }
+                deferred
+            } else {
+                // Consume the single circuit-checked candidate if only 1 was healthy before sequential scan.
+                if let Some(single) = circuit_ok.into_iter().next() {
+                    match self
+                        .execute_single_backend(
+                            &single,
+                            &request,
+                            workspace_mode,
+                            workspaces,
+                            &dispatch_ctx,
+                            ttl,
+                            schema_repair_retries,
+                            &otel,
+                            true,
+                            &mut attempts,
+                        )
+                        .await
+                    {
+                        Ok(outcome) => {
+                            return Ok(self.finalize_winner(
+                                outcome,
+                                &request.session_key,
+                                previous_backend.as_deref(),
+                                attempts,
+                                dispatch_span,
+                            ));
+                        }
+                        Err(error) => {
+                            if !error.is_retryable() {
+                                if let Some(span) = dispatch_span {
+                                    span.finish_err(&error.to_string());
+                                }
+                                return Err(error);
+                            }
+                            previous_backend = Some(single.config.id.clone());
+                            last_error = Some(error);
+                        }
+                    }
+                }
+                deferred
+            }
+        } else {
+            0
+        };
+
+        for (offset, backend) in candidates.iter().skip(seq_start_idx).enumerate() {
             if !backend.breaker.allow_request() {
                 attempts.push(format!(
                     "{}: circuit {}",
@@ -761,172 +1002,32 @@ impl Router {
                 previous_backend = Some(backend.config.id.clone());
                 continue;
             }
-
-            let mut attempt = request.clone();
-            let attempt_capture = Arc::new(parking_lot::Mutex::new(None));
-            attempt.session_capture = attempt_capture.clone();
-
-            if backend.config.kind != BackendKind::Http
-                && !backend.config.resume_args.is_empty()
-                && let Some(prior) =
-                    self.sessions
-                        .get_backend_session(&request.session_key, &backend.config.id, ttl)
+            let fallback_used = seq_start_idx + offset > 0 || previous_backend.is_some();
+            match self
+                .execute_single_backend(
+                    backend,
+                    &request,
+                    workspace_mode,
+                    workspaces,
+                    &dispatch_ctx,
+                    ttl,
+                    schema_repair_retries,
+                    &otel,
+                    fallback_used,
+                    &mut attempts,
+                )
+                .await
             {
-                let can_resume = prior.has_history
-                    && (backend.config.session_id_regex.is_none()
-                        || prior.backend_session_id.is_some());
-                if can_resume {
-                    attempt.backend_session_id = prior.backend_session_id;
-                    let delta = slice_delta_messages(&attempt.messages);
-                    if !delta.is_empty() {
-                        attempt.delta_messages = Some(delta);
-                    }
-                }
-            }
-
-            let isolate = match workspace_mode {
-                WorkspaceMode::Worktree => true,
-                WorkspaceMode::Auto => backend.config.isolate_workspace,
-                WorkspaceMode::None => false,
-            };
-            if isolate && backend.config.kind != BackendKind::Http {
-                let mut ws_span = otel.as_ref().map(|o| {
-                    o.start_span(
-                        dispatch_ctx.child(),
-                        "workspace.worktree",
-                        SpanKind::Internal,
-                    )
-                });
-                if let Some(span) = &mut ws_span {
-                    span.set_str("vouch.backend", &backend.config.id);
-                }
-                match workspaces.acquire(&request.session_key).await {
-                    Ok(entry) => {
-                        attempt.workdir = Some(entry.path.clone());
-                        if let Some(span) = ws_span {
-                            span.finish_ok();
-                        }
-                    }
-                    Err(error) => {
-                        if let Some(span) = ws_span {
-                            span.finish_err(&error.to_string());
-                        }
-                        backend.breaker.record_neutral();
-                        attempts.push(format!("{}: workspace error: {error}", backend.config.id));
-                        previous_backend = Some(backend.config.id.clone());
-                        last_error = Some(error);
-                        continue;
-                    }
-                }
-            } else if attempt.workdir.is_none() {
-                attempt.workdir = backend.config.workdir.clone();
-            }
-
-            let mut exec_span = otel
-                .as_ref()
-                .map(|o| o.start_span(dispatch_ctx.child(), "driver.exec", SpanKind::Client));
-            if let Some(span) = &mut exec_span {
-                span.set_str("vouch.route", &request.model);
-                span.set_str("vouch.backend", &backend.config.id);
-                attempt.trace_context = Some(span.context().clone());
-            } else {
-                attempt.trace_context = Some(dispatch_ctx.child());
-            }
-
-            let exec_result = match backend.driver.execute(attempt).await {
-                Ok(DriverResponse::Stream(stream)) => {
-                    prime_stream(stream).await.map(DriverResponse::Stream)
-                }
-                other => other,
-            };
-
-            match exec_result {
-                Ok(response) => {
-                    let fallback_used = index > 0;
-                    if let Some(span) = &mut exec_span {
-                        span.set_bool("vouch.fallback", fallback_used);
-                    }
-                    if let Some(span) = &mut dispatch_span {
-                        span.set_str("vouch.backend", &backend.config.id);
-                        span.set_bool("vouch.fallback", fallback_used);
-                    }
-                    let final_response = match response {
-                        DriverResponse::Stream(stream) => {
-                            let sessions = self.sessions.clone();
-                            let session_key = request.session_key.clone();
-                            let backend_id = backend.config.id.clone();
-                            let capture = attempt_capture.clone();
-                            DriverResponse::Stream(wrap_stream_session_commit(
-                                stream,
-                                sessions,
-                                session_key,
-                                backend_id,
-                                capture,
-                                exec_span,
-                                dispatch_span,
-                            ))
-                        }
-                        DriverResponse::Complete(completion) => {
-                            let captured = attempt_capture.lock().take();
-                            self.sessions.record_backend_session(
-                                &request.session_key,
-                                &backend.config.id,
-                                captured,
-                            );
-                            if let Some(mut span) = exec_span {
-                                span.set_int(
-                                    "gen_ai.usage.input_tokens",
-                                    completion.usage.prompt_tokens as i64,
-                                );
-                                span.set_int(
-                                    "gen_ai.usage.output_tokens",
-                                    completion.usage.completion_tokens as i64,
-                                );
-                                span.finish_ok();
-                            }
-                            if let Some(mut span) = dispatch_span {
-                                span.set_int(
-                                    "gen_ai.usage.input_tokens",
-                                    completion.usage.prompt_tokens as i64,
-                                );
-                                span.set_int(
-                                    "gen_ai.usage.output_tokens",
-                                    completion.usage.completion_tokens as i64,
-                                );
-                                span.finish_ok();
-                            }
-                            DriverResponse::Complete(completion)
-                        }
-                    };
-                    backend.breaker.record_success();
-                    self.sessions.set(&request.session_key, &backend.config.id);
-                    if let Some(previous) = previous_backend.as_deref() {
-                        metrics::record_fallback(previous, &backend.config.id);
-                    }
-                    return Ok(RoutedResponse {
-                        backend_id: backend.config.id.clone(),
-                        fallback_used,
-                        response: final_response,
+                Ok(outcome) => {
+                    return Ok(self.finalize_winner(
+                        outcome,
+                        &request.session_key,
+                        previous_backend.as_deref(),
                         attempts,
-                    });
+                        dispatch_span,
+                    ));
                 }
                 Err(error) => {
-                    if let Some(span) = exec_span {
-                        span.finish_err(&error.to_string());
-                    }
-                    if error.counts_as_backend_failure() {
-                        backend.breaker.record_failure_detailed(
-                            error.to_string(),
-                            FailureDetails {
-                                rate_limited: error.is_rate_limited(),
-                                auth_expired: error.is_auth_expired(),
-                                retry_after: error.upstream_rate_limit_retry_after(),
-                            },
-                        );
-                    } else {
-                        backend.breaker.record_neutral();
-                    }
-                    attempts.push(format!("{}: {error}", backend.config.id));
                     if !error.is_retryable() {
                         if let Some(span) = dispatch_span {
                             span.finish_err(&error.to_string());
@@ -951,6 +1052,825 @@ impl Router {
             span.finish_err(&final_err.to_string());
         }
         Err(final_err)
+    }
+
+    fn record_ttft(&self, backend_id: &str, elapsed: Duration) {
+        let sample_ms = elapsed.as_secs_f64() * 1000.0;
+        self.ttft_ewma_ms
+            .entry(backend_id.to_string())
+            .and_modify(|ewma| {
+                *ewma = (*ewma * (1.0 - TTFT_EWMA_ALPHA)) + (sample_ms * TTFT_EWMA_ALPHA);
+            })
+            .or_insert(sample_ms);
+    }
+
+    fn ordered_profiles(
+        &self,
+        backend: &BackendHandle,
+        session_key: &str,
+        ttl: Duration,
+    ) -> Vec<ProfileSlot> {
+        let profiles = &backend.config.profiles;
+        if profiles.is_empty() {
+            return vec![ProfileSlot {
+                id: None,
+                env: BTreeMap::new(),
+                breaker: backend.breaker.clone(),
+            }];
+        }
+
+        let mut weighted_indices = Vec::new();
+        for (idx, profile) in profiles.iter().enumerate() {
+            let weight = profile.weight.clamp(1, 64) as usize;
+            for _ in 0..weight {
+                weighted_indices.push(idx);
+            }
+        }
+        let start = backend.profile_cursor.fetch_add(1, Ordering::Relaxed) % weighted_indices.len();
+        let mut seen = vec![false; profiles.len()];
+        let mut ordered_indices = Vec::with_capacity(profiles.len());
+        for offset in 0..weighted_indices.len() {
+            let idx = weighted_indices[(start + offset) % weighted_indices.len()];
+            if !seen[idx] {
+                seen[idx] = true;
+                ordered_indices.push(idx);
+            }
+        }
+
+        if let Some(sticky_id) = self
+            .sessions
+            .get_profile(session_key, &backend.config.id, ttl)
+            && let Some(pos) = ordered_indices
+                .iter()
+                .position(|&idx| profiles[idx].id == sticky_id)
+        {
+            let sticky_idx = ordered_indices.remove(pos);
+            ordered_indices.insert(0, sticky_idx);
+        }
+
+        ordered_indices
+            .into_iter()
+            .map(|idx| {
+                let profile = &profiles[idx];
+                let pkey = profile_breaker_key(&backend.config.id, &profile.id);
+                let breaker = self
+                    .profile_breakers
+                    .get(&pkey)
+                    .map(|b| b.clone())
+                    .unwrap_or_else(|| backend.breaker.clone());
+                ProfileSlot {
+                    id: Some(profile.id.clone()),
+                    env: profile.env.clone(),
+                    breaker,
+                }
+            })
+            .collect()
+    }
+
+    async fn prepare_backend_attempt(
+        &self,
+        backend: &BackendHandle,
+        base: &ExecutionRequest,
+        workspace_mode: WorkspaceMode,
+        workspaces: &WorkspaceManager,
+        dispatch_ctx: &TraceContext,
+        otel: &Option<Arc<OtelExporter>>,
+    ) -> std::result::Result<
+        (
+            ExecutionRequest,
+            Arc<parking_lot::Mutex<Option<String>>>,
+            Option<ActiveSpan>,
+        ),
+        GatewayError,
+    > {
+        let ttl = Duration::from_secs(self.ttl_secs.load(Ordering::Relaxed).max(1));
+        let mut attempt = base.clone();
+        let attempt_capture = Arc::new(parking_lot::Mutex::new(None));
+        attempt.session_capture = attempt_capture.clone();
+
+        if backend.config.kind != BackendKind::Http
+            && !backend.config.resume_args.is_empty()
+            && let Some(prior) =
+                self.sessions
+                    .get_backend_session(&base.session_key, &backend.config.id, ttl)
+        {
+            let can_resume = prior.has_history
+                && (backend.config.session_id_regex.is_none()
+                    || prior.backend_session_id.is_some());
+            if can_resume {
+                attempt.backend_session_id = prior.backend_session_id;
+                let delta = slice_delta_messages(&attempt.messages);
+                if !delta.is_empty() {
+                    attempt.delta_messages = Some(delta);
+                }
+            }
+        }
+
+        let isolate = match workspace_mode {
+            WorkspaceMode::Worktree => true,
+            WorkspaceMode::Auto => backend.config.isolate_workspace,
+            WorkspaceMode::None => false,
+        };
+        if isolate && backend.config.kind != BackendKind::Http {
+            let mut ws_span = otel.as_ref().map(|o| {
+                o.start_span(
+                    dispatch_ctx.child(),
+                    "workspace.worktree",
+                    SpanKind::Internal,
+                )
+            });
+            if let Some(span) = &mut ws_span {
+                span.set_str("vouch.backend", &backend.config.id);
+            }
+            match workspaces.acquire(&base.session_key).await {
+                Ok(entry) => {
+                    attempt.workdir = Some(entry.path.clone());
+                    if let Some(span) = ws_span {
+                        span.finish_ok();
+                    }
+                }
+                Err(error) => {
+                    if let Some(span) = ws_span {
+                        span.finish_err(&error.to_string());
+                    }
+                    backend.breaker.record_neutral();
+                    return Err(error);
+                }
+            }
+        } else if attempt.workdir.is_none() {
+            attempt.workdir = backend.config.workdir.clone();
+        }
+
+        let mut exec_span = otel
+            .as_ref()
+            .map(|o| o.start_span(dispatch_ctx.child(), "driver.exec", SpanKind::Client));
+        if let Some(span) = &mut exec_span {
+            span.set_str("vouch.route", &base.model);
+            span.set_str("vouch.backend", &backend.config.id);
+            attempt.trace_context = Some(span.context().clone());
+        } else {
+            attempt.trace_context = Some(dispatch_ctx.child());
+        }
+        Ok((attempt, attempt_capture, exec_span))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_single_backend(
+        &self,
+        backend: &Arc<BackendHandle>,
+        base_request: &ExecutionRequest,
+        workspace_mode: WorkspaceMode,
+        workspaces: &WorkspaceManager,
+        dispatch_ctx: &TraceContext,
+        ttl: Duration,
+        schema_repair_retries: u8,
+        otel: &Option<Arc<OtelExporter>>,
+        fallback_used: bool,
+        attempts: &mut Vec<String>,
+    ) -> Result<CandidateOutcome> {
+        let (base_attempt, capture, mut exec_span) = match self
+            .prepare_backend_attempt(
+                backend,
+                base_request,
+                workspace_mode,
+                workspaces,
+                dispatch_ctx,
+                otel,
+            )
+            .await
+        {
+            Ok(prep) => prep,
+            Err(error) => {
+                attempts.push(format!("{}: workspace error: {error}", backend.config.id));
+                return Err(error);
+            }
+        };
+
+        let profiles = self.ordered_profiles(backend, &base_request.session_key, ttl);
+        let has_profiles = profiles.first().is_some_and(|p| p.id.is_some());
+        let mut last_profile_err: Option<GatewayError> = None;
+
+        for slot in profiles {
+            if has_profiles && !slot.breaker.allow_request() {
+                attempts.push(format!(
+                    "{}:{}: circuit {}",
+                    backend.config.id,
+                    slot.id.as_deref().unwrap_or("default"),
+                    slot.breaker.state().as_str()
+                ));
+                continue;
+            }
+
+            let mut attempt = base_attempt.clone();
+            attempt.profile_id = slot.id.clone();
+            attempt.profile_env = slot.env.clone();
+
+            let started = Instant::now();
+            let exec_result = execute_with_repair(
+                &backend.driver,
+                attempt,
+                schema_repair_retries,
+                backend.config.kind,
+            )
+            .await;
+
+            match exec_result {
+                Ok(response) => {
+                    let elapsed = started.elapsed();
+                    self.record_ttft(&backend.config.id, elapsed);
+                    slot.breaker.record_success();
+                    backend.breaker.record_success();
+                    if let Some(pid) = &slot.id {
+                        self.sessions.set_profile(
+                            &base_request.session_key,
+                            &backend.config.id,
+                            pid,
+                        );
+                    }
+                    return Ok(CandidateOutcome {
+                        backend: backend.clone(),
+                        response,
+                        capture,
+                        exec_span,
+                        fallback_used,
+                    });
+                }
+                Err(error) => {
+                    if base_request.cancel.is_cancelled() {
+                        if let Some(span) = exec_span.take() {
+                            span.finish_err("cancelled");
+                        }
+                        slot.breaker.record_neutral();
+                        backend.breaker.record_neutral();
+                        return Err(error);
+                    }
+                    let prof_label = slot.id.as_deref().unwrap_or("default");
+                    if has_profiles {
+                        attempts.push(format!("{}:{}: {error}", backend.config.id, prof_label));
+                    } else {
+                        attempts.push(format!("{}: {error}", backend.config.id));
+                    }
+                    if error.counts_as_backend_failure() {
+                        slot.breaker.record_failure_detailed(
+                            error.to_string(),
+                            FailureDetails {
+                                rate_limited: error.is_rate_limited(),
+                                auth_expired: error.is_auth_expired(),
+                                retry_after: error.upstream_rate_limit_retry_after(),
+                            },
+                        );
+                    } else {
+                        slot.breaker.record_neutral();
+                    }
+                    let retryable = error.is_retryable();
+                    last_profile_err = Some(error);
+                    if !retryable || !has_profiles {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let err = last_profile_err.unwrap_or_else(|| {
+            GatewayError::NoHealthyBackend(format!(
+                "backend {:?} has no healthy credential profiles",
+                backend.config.id
+            ))
+        });
+        if has_profiles {
+            if err.counts_as_backend_failure() {
+                backend.breaker.record_failure_detailed(
+                    err.to_string(),
+                    FailureDetails {
+                        rate_limited: err.is_rate_limited(),
+                        auth_expired: err.is_auth_expired(),
+                        retry_after: err.upstream_rate_limit_retry_after(),
+                    },
+                );
+            } else {
+                backend.breaker.record_neutral();
+            }
+        }
+        if let Some(span) = exec_span {
+            span.finish_err(&err.to_string());
+        }
+        Err(err)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_hedged_pair(
+        &self,
+        c1: Arc<BackendHandle>,
+        c2: Arc<BackendHandle>,
+        base_request: &ExecutionRequest,
+        hedge_delay_ms: u64,
+        workspace_mode: WorkspaceMode,
+        workspaces: &WorkspaceManager,
+        dispatch_ctx: &TraceContext,
+        ttl: Duration,
+        schema_repair_retries: u8,
+        otel: &Option<Arc<OtelExporter>>,
+        attempts: &mut Vec<String>,
+        last_error: &mut Option<GatewayError>,
+        previous_backend: &mut Option<String>,
+    ) -> Result<Option<CandidateOutcome>> {
+        let mut req1 = base_request.clone();
+        let cancel1 = base_request.cancel.child_token();
+        req1.cancel = cancel1.clone();
+
+        let (mut attempt1, capture1, exec_span1) = match self
+            .prepare_backend_attempt(&c1, &req1, workspace_mode, workspaces, dispatch_ctx, otel)
+            .await
+        {
+            Ok(prep) => prep,
+            Err(error) => {
+                attempts.push(format!("{}: workspace error: {error}", c1.config.id));
+                *previous_backend = Some(c1.config.id.clone());
+                let retryable = error.is_retryable();
+                *last_error = Some(error);
+                c2.breaker.record_neutral();
+                if !retryable {
+                    return Err(last_error
+                        .take()
+                        .unwrap_or_else(|| GatewayError::Upstream("non-retryable error".into())));
+                }
+                if !c2.breaker.allow_request() {
+                    attempts.push(format!(
+                        "{}: circuit {}",
+                        c2.config.id,
+                        c2.breaker.state().as_str()
+                    ));
+                    return Ok(None);
+                }
+                match self
+                    .execute_single_backend(
+                        &c2,
+                        base_request,
+                        workspace_mode,
+                        workspaces,
+                        dispatch_ctx,
+                        ttl,
+                        schema_repair_retries,
+                        otel,
+                        true,
+                        attempts,
+                    )
+                    .await
+                {
+                    Ok(win) => return Ok(Some(win)),
+                    Err(err2) => {
+                        *previous_backend = Some(c2.config.id.clone());
+                        *last_error = Some(err2);
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+
+        let profiles1 = self.ordered_profiles(&c1, &base_request.session_key, ttl);
+        let slot1 = profiles1
+            .into_iter()
+            .find(|s| s.id.is_none() || s.breaker.allow_request());
+        let Some(slot1) = slot1 else {
+            c2.breaker.record_neutral();
+            attempts.push(format!("{}: no healthy profile", c1.config.id));
+            *previous_backend = Some(c1.config.id.clone());
+            if !c2.breaker.allow_request() {
+                attempts.push(format!(
+                    "{}: circuit {}",
+                    c2.config.id,
+                    c2.breaker.state().as_str()
+                ));
+                return Ok(None);
+            }
+            match self
+                .execute_single_backend(
+                    &c2,
+                    base_request,
+                    workspace_mode,
+                    workspaces,
+                    dispatch_ctx,
+                    ttl,
+                    schema_repair_retries,
+                    otel,
+                    true,
+                    attempts,
+                )
+                .await
+            {
+                Ok(win) => return Ok(Some(win)),
+                Err(err2) => {
+                    *previous_backend = Some(c2.config.id.clone());
+                    *last_error = Some(err2);
+                    return Ok(None);
+                }
+            }
+        };
+        attempt1.profile_id = slot1.id.clone();
+        attempt1.profile_env = slot1.env.clone();
+
+        let drv1 = c1.driver.clone();
+        let kind1 = c1.config.kind;
+        let started1 = Instant::now();
+        let mut handle1 = tokio::spawn(async move {
+            let res = execute_with_repair(&drv1, attempt1, schema_repair_retries, kind1).await;
+            (res, started1.elapsed())
+        });
+
+        let delay = tokio::time::sleep(Duration::from_millis(hedge_delay_ms.max(1)));
+        tokio::pin!(delay);
+
+        enum FirstPhase {
+            Finished1(
+                std::result::Result<(Result<DriverResponse>, Duration), tokio::task::JoinError>,
+            ),
+            DelayElapsed,
+        }
+
+        let phase = tokio::select! {
+            res = &mut handle1 => FirstPhase::Finished1(res),
+            _ = &mut delay => FirstPhase::DelayElapsed,
+        };
+
+        match phase {
+            FirstPhase::Finished1(Ok((Ok(response), elapsed))) => {
+                c2.breaker.record_neutral();
+                self.record_ttft(&c1.config.id, elapsed);
+                slot1.breaker.record_success();
+                c1.breaker.record_success();
+                if let Some(pid) = &slot1.id {
+                    self.sessions
+                        .set_profile(&base_request.session_key, &c1.config.id, pid);
+                }
+                return Ok(Some(CandidateOutcome {
+                    backend: c1,
+                    response,
+                    capture: capture1,
+                    exec_span: exec_span1,
+                    fallback_used: false,
+                }));
+            }
+            FirstPhase::Finished1(join_res) => {
+                c2.breaker.record_neutral();
+                if let Some(span) = exec_span1 {
+                    span.finish_err("primary failed before hedge delay");
+                }
+                let err = match join_res {
+                    Ok((Err(e), _)) => e,
+                    Err(e) => GatewayError::Internal(format!("hedged task failed: {e}")),
+                    _ => unreachable!(),
+                };
+                if base_request.cancel.is_cancelled() {
+                    slot1.breaker.record_neutral();
+                    c1.breaker.record_neutral();
+                    return Err(err);
+                }
+                record_candidate_failure(&c1, Some(&slot1), &err, attempts);
+                *previous_backend = Some(c1.config.id.clone());
+                let retryable = err.is_retryable();
+                *last_error = Some(err);
+                if !retryable {
+                    return Err(last_error
+                        .take()
+                        .unwrap_or_else(|| GatewayError::Upstream("non-retryable error".into())));
+                }
+                match self
+                    .execute_single_backend(
+                        &c2,
+                        base_request,
+                        workspace_mode,
+                        workspaces,
+                        dispatch_ctx,
+                        ttl,
+                        schema_repair_retries,
+                        otel,
+                        true,
+                        attempts,
+                    )
+                    .await
+                {
+                    Ok(win) => return Ok(Some(win)),
+                    Err(err2) => {
+                        *previous_backend = Some(c2.config.id.clone());
+                        *last_error = Some(err2);
+                        return Ok(None);
+                    }
+                }
+            }
+            FirstPhase::DelayElapsed => {}
+        }
+
+        // Speculatively launch c2 concurrently while c1 continues.
+        let mut req2 = base_request.clone();
+        let cancel2 = base_request.cancel.child_token();
+        req2.cancel = cancel2.clone();
+        let (mut attempt2, capture2, exec_span2) = match self
+            .prepare_backend_attempt(&c2, &req2, workspace_mode, workspaces, dispatch_ctx, otel)
+            .await
+        {
+            Ok(prep) => prep,
+            Err(error) => {
+                attempts.push(format!("{}: workspace error: {error}", c2.config.id));
+                match handle1.await {
+                    Ok((Ok(response), elapsed)) => {
+                        self.record_ttft(&c1.config.id, elapsed);
+                        slot1.breaker.record_success();
+                        c1.breaker.record_success();
+                        return Ok(Some(CandidateOutcome {
+                            backend: c1,
+                            response,
+                            capture: capture1,
+                            exec_span: exec_span1,
+                            fallback_used: false,
+                        }));
+                    }
+                    Ok((Err(e), _)) => {
+                        if let Some(span) = exec_span1 {
+                            span.finish_err(&e.to_string());
+                        }
+                        record_candidate_failure(&c1, Some(&slot1), &e, attempts);
+                        *previous_backend = Some(c1.config.id.clone());
+                        *last_error = Some(e);
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        if let Some(span) = exec_span1 {
+                            span.finish_err(&e.to_string());
+                        }
+                        *previous_backend = Some(c1.config.id.clone());
+                        *last_error =
+                            Some(GatewayError::Internal(format!("hedged task panicked: {e}")));
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+
+        let profiles2 = self.ordered_profiles(&c2, &base_request.session_key, ttl);
+        let slot2 = match profiles2
+            .into_iter()
+            .find(|s| s.id.is_none() || s.breaker.allow_request())
+        {
+            Some(s) => s,
+            None => {
+                if let Some(span) = exec_span2 {
+                    span.finish_err("no healthy profile");
+                }
+                attempts.push(format!("{}: no healthy profile", c2.config.id));
+                match handle1.await {
+                    Ok((Ok(response), elapsed)) => {
+                        self.record_ttft(&c1.config.id, elapsed);
+                        slot1.breaker.record_success();
+                        c1.breaker.record_success();
+                        return Ok(Some(CandidateOutcome {
+                            backend: c1,
+                            response,
+                            capture: capture1,
+                            exec_span: exec_span1,
+                            fallback_used: false,
+                        }));
+                    }
+                    Ok((Err(e), _)) => {
+                        if let Some(span) = exec_span1 {
+                            span.finish_err(&e.to_string());
+                        }
+                        record_candidate_failure(&c1, Some(&slot1), &e, attempts);
+                        *previous_backend = Some(c2.config.id.clone());
+                        *last_error = Some(e);
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        if let Some(span) = exec_span1 {
+                            span.finish_err(&e.to_string());
+                        }
+                        *previous_backend = Some(c2.config.id.clone());
+                        *last_error =
+                            Some(GatewayError::Internal(format!("hedged task panicked: {e}")));
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+        attempt2.profile_id = slot2.id.clone();
+        attempt2.profile_env = slot2.env.clone();
+
+        let drv2 = c2.driver.clone();
+        let kind2 = c2.config.kind;
+        let started2 = Instant::now();
+        let handle2 = tokio::spawn(async move {
+            let res = execute_with_repair(&drv2, attempt2, schema_repair_retries, kind2).await;
+            (res, started2.elapsed())
+        });
+
+        let mut opt1 = Some(handle1);
+        let mut opt2 = Some(handle2);
+        let mut span1 = exec_span1;
+        let mut span2 = exec_span2;
+
+        loop {
+            enum RaceEvt {
+                One(
+                    std::result::Result<(Result<DriverResponse>, Duration), tokio::task::JoinError>,
+                ),
+                Two(
+                    std::result::Result<(Result<DriverResponse>, Duration), tokio::task::JoinError>,
+                ),
+            }
+            let evt = match (&mut opt1, &mut opt2) {
+                (Some(h1), Some(h2)) => tokio::select! {
+                    r1 = h1 => {
+                        opt1 = None;
+                        RaceEvt::One(r1)
+                    }
+                    r2 = h2 => {
+                        opt2 = None;
+                        RaceEvt::Two(r2)
+                    }
+                },
+                (Some(_), None) => {
+                    let Some(h1) = opt1.take() else {
+                        break;
+                    };
+                    RaceEvt::One(h1.await)
+                }
+                (None, Some(_)) => {
+                    let Some(h2) = opt2.take() else {
+                        break;
+                    };
+                    RaceEvt::Two(h2.await)
+                }
+                (None, None) => break,
+            };
+
+            match evt {
+                RaceEvt::One(Ok((Ok(response), elapsed))) => {
+                    self.record_ttft(&c1.config.id, elapsed);
+                    slot1.breaker.record_success();
+                    c1.breaker.record_success();
+                    if let Some(pid) = &slot1.id {
+                        self.sessions
+                            .set_profile(&base_request.session_key, &c1.config.id, pid);
+                    }
+                    if let Some(h2) = opt2.take() {
+                        cancel2.cancel();
+                        c2.breaker.record_neutral();
+                        slot2.breaker.record_neutral();
+                        if let Some(s) = span2.take() {
+                            s.finish_err("cancelled (hedged race lost)");
+                        }
+                        tokio::spawn(async move {
+                            let _ = tokio::time::timeout(Duration::from_secs(3), h2).await;
+                        });
+                        metrics::record_hedged_win(&c1.config.id, &c2.config.id);
+                    }
+                    return Ok(Some(CandidateOutcome {
+                        backend: c1,
+                        response,
+                        capture: capture1,
+                        exec_span: span1.take(),
+                        fallback_used: false,
+                    }));
+                }
+                RaceEvt::Two(Ok((Ok(response), elapsed))) => {
+                    self.record_ttft(&c2.config.id, elapsed);
+                    slot2.breaker.record_success();
+                    c2.breaker.record_success();
+                    if let Some(pid) = &slot2.id {
+                        self.sessions
+                            .set_profile(&base_request.session_key, &c2.config.id, pid);
+                    }
+                    if let Some(h1) = opt1.take() {
+                        cancel1.cancel();
+                        c1.breaker.record_neutral();
+                        slot1.breaker.record_neutral();
+                        if let Some(s) = span1.take() {
+                            s.finish_err("cancelled (hedged race lost)");
+                        }
+                        tokio::spawn(async move {
+                            let _ = tokio::time::timeout(Duration::from_secs(3), h1).await;
+                        });
+                        metrics::record_hedged_win(&c2.config.id, &c1.config.id);
+                    }
+                    return Ok(Some(CandidateOutcome {
+                        backend: c2,
+                        response,
+                        capture: capture2,
+                        exec_span: span2.take(),
+                        fallback_used: true,
+                    }));
+                }
+                RaceEvt::One(join_res) => {
+                    if let Some(s) = span1.take() {
+                        s.finish_err("hedged primary error");
+                    }
+                    let err = match join_res {
+                        Ok((Err(e), _)) => e,
+                        Err(e) => GatewayError::Internal(format!("hedged task failed: {e}")),
+                        _ => unreachable!(),
+                    };
+                    if !base_request.cancel.is_cancelled() {
+                        record_candidate_failure(&c1, Some(&slot1), &err, attempts);
+                        *previous_backend = Some(c1.config.id.clone());
+                        *last_error = Some(err);
+                    } else {
+                        c1.breaker.record_neutral();
+                        slot1.breaker.record_neutral();
+                        *last_error = Some(err);
+                    }
+                }
+                RaceEvt::Two(join_res) => {
+                    if let Some(s) = span2.take() {
+                        s.finish_err("hedged backup error");
+                    }
+                    let err = match join_res {
+                        Ok((Err(e), _)) => e,
+                        Err(e) => GatewayError::Internal(format!("hedged task failed: {e}")),
+                        _ => unreachable!(),
+                    };
+                    if !base_request.cancel.is_cancelled() {
+                        record_candidate_failure(&c2, Some(&slot2), &err, attempts);
+                        *previous_backend = Some(c2.config.id.clone());
+                        *last_error = Some(err);
+                    } else {
+                        c2.breaker.record_neutral();
+                        slot2.breaker.record_neutral();
+                        *last_error = Some(err);
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn finalize_winner(
+        &self,
+        outcome: CandidateOutcome,
+        session_key: &str,
+        previous_backend: Option<&str>,
+        attempts: Vec<String>,
+        dispatch_span: Option<ActiveSpan>,
+    ) -> RoutedResponse {
+        let backend_id = outcome.backend.config.id.clone();
+        let fallback_used = outcome.fallback_used;
+        let mut exec_span = outcome.exec_span;
+        let mut dispatch_span = dispatch_span;
+        if let Some(span) = &mut exec_span {
+            span.set_bool("vouch.fallback", fallback_used);
+        }
+        if let Some(span) = &mut dispatch_span {
+            span.set_str("vouch.backend", &backend_id);
+            span.set_bool("vouch.fallback", fallback_used);
+        }
+
+        let final_response = match outcome.response {
+            DriverResponse::Stream(stream) => DriverResponse::Stream(wrap_stream_session_commit(
+                stream,
+                self.sessions.clone(),
+                session_key.to_string(),
+                backend_id.clone(),
+                outcome.capture,
+                exec_span,
+                dispatch_span,
+            )),
+            DriverResponse::Complete(completion) => {
+                let captured = outcome.capture.lock().take();
+                self.sessions
+                    .record_backend_session(session_key, &backend_id, captured);
+                if let Some(mut span) = exec_span {
+                    span.set_int(
+                        "gen_ai.usage.input_tokens",
+                        completion.usage.prompt_tokens as i64,
+                    );
+                    span.set_int(
+                        "gen_ai.usage.output_tokens",
+                        completion.usage.completion_tokens as i64,
+                    );
+                    span.finish_ok();
+                }
+                if let Some(mut span) = dispatch_span {
+                    span.set_int(
+                        "gen_ai.usage.input_tokens",
+                        completion.usage.prompt_tokens as i64,
+                    );
+                    span.set_int(
+                        "gen_ai.usage.output_tokens",
+                        completion.usage.completion_tokens as i64,
+                    );
+                    span.finish_ok();
+                }
+                DriverResponse::Complete(completion)
+            }
+        };
+        self.sessions.set(session_key, &backend_id);
+        if let Some(previous) = previous_backend {
+            metrics::record_fallback(previous, &backend_id);
+        }
+        RoutedResponse {
+            backend_id,
+            fallback_used,
+            response: final_response,
+            attempts,
+        }
     }
 
     /// Default model, when configured or unambiguous.
@@ -1032,6 +1952,119 @@ impl Router {
     pub fn session_ttl_secs(&self) -> u64 {
         self.ttl_secs.load(Ordering::Relaxed).max(1)
     }
+}
+
+fn profile_breaker_key(backend_id: &str, profile_id: &str) -> String {
+    format!("{backend_id}::profile::{profile_id}")
+}
+
+struct ProfileSlot {
+    id: Option<String>,
+    env: BTreeMap<String, String>,
+    breaker: Arc<CircuitBreaker>,
+}
+
+struct CandidateOutcome {
+    backend: Arc<BackendHandle>,
+    response: DriverResponse,
+    capture: Arc<parking_lot::Mutex<Option<String>>>,
+    exec_span: Option<ActiveSpan>,
+    fallback_used: bool,
+}
+
+fn record_candidate_failure(
+    backend: &BackendHandle,
+    profile: Option<&ProfileSlot>,
+    error: &GatewayError,
+    attempts: &mut Vec<String>,
+) {
+    let prof_label = profile.and_then(|s| s.id.as_deref());
+    if let Some(pl) = prof_label {
+        attempts.push(format!("{}:{}: {error}", backend.config.id, pl));
+    } else {
+        attempts.push(format!("{}: {error}", backend.config.id));
+    }
+    if error.counts_as_backend_failure() {
+        let details = FailureDetails {
+            rate_limited: error.is_rate_limited(),
+            auth_expired: error.is_auth_expired(),
+            retry_after: error.upstream_rate_limit_retry_after(),
+        };
+        if let Some(slot) = profile
+            && slot.id.is_some()
+        {
+            slot.breaker
+                .record_failure_detailed(error.to_string(), details);
+        } else {
+            backend
+                .breaker
+                .record_failure_detailed(error.to_string(), details);
+        }
+    } else {
+        if let Some(slot) = profile {
+            slot.breaker.record_neutral();
+        }
+        backend.breaker.record_neutral();
+    }
+}
+
+async fn execute_with_repair(
+    driver: &Arc<dyn Driver>,
+    mut request: ExecutionRequest,
+    schema_repair_retries: u8,
+    kind: BackendKind,
+) -> Result<DriverResponse> {
+    let can_repair =
+        !request.stream && request.response_format.is_some() && kind != BackendKind::Http;
+    let first = match driver.execute(request.clone()).await {
+        Ok(DriverResponse::Stream(stream)) => {
+            prime_stream(stream).await.map(DriverResponse::Stream)
+        }
+        other => other,
+    };
+    let Err(mut last_err) = first else {
+        return first;
+    };
+    if !can_repair || schema_repair_retries == 0 || !is_schema_validation_error(&last_err) {
+        return Err(last_err);
+    }
+
+    for _ in 0..schema_repair_retries.min(2) {
+        if request.cancel.is_cancelled() {
+            return Err(GatewayError::ClientDisconnected);
+        }
+        request.backend_session_id = None;
+        request.delta_messages = None;
+        request.messages.push(ChatMessage::text(
+            "user",
+            format!(
+                "Your previous response failed structured output schema validation with the following error:\n{last_err}\n\nPlease reply again with ONLY valid JSON conforming strictly to the requested format/schema, without markdown fences or prose."
+            ),
+        ));
+        request.prompt = crate::driver::render_prompt(request.system.as_deref(), &request.messages);
+
+        match driver.execute(request.clone()).await {
+            Ok(DriverResponse::Stream(stream)) => {
+                match prime_stream(stream).await.map(DriverResponse::Stream) {
+                    Ok(resp) => return Ok(resp),
+                    Err(err) => {
+                        last_err = err;
+                        if !is_schema_validation_error(&last_err) {
+                            return Err(last_err);
+                        }
+                    }
+                }
+            }
+            Ok(resp) => return Ok(resp),
+            Err(err) => {
+                last_err = err;
+                if !is_schema_validation_error(&last_err) {
+                    return Err(last_err);
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 
 fn wrap_stream_session_commit(
