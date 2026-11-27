@@ -224,8 +224,10 @@
           const active = m.permits[b.id] || 0;
           const ok = m.okExits[b.id] || 0;
           const err = m.errExits[b.id] || 0;
-          const cls = b.circuit === "open" ? "err" : (b.circuit === "half_open" ? "warn" : "ok");
-          const cText = b.circuit === "open" ? "OPEN (" + b.open_remaining_secs + "s)" : b.circuit.toUpperCase();
+          const cls = (b.auth_expired || b.circuit === "open") ? "err" : (b.circuit === "half_open" ? "warn" : "ok");
+          const cText = b.auth_expired
+            ? "AUTH_EXPIRED (" + b.open_remaining_secs + "s)"
+            : (b.circuit === "open" ? "OPEN (" + b.open_remaining_secs + "s)" : b.circuit.toUpperCase());
           addCell(tr, b.id);
           addCell(tr, b.kind, "info");
           addCell(tr, active + " / " + b.max_concurrency);
