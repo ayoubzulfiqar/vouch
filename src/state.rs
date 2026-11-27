@@ -18,9 +18,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     auth::TokenRegistry,
+    cli::mcp::McpTaskStore,
     config::{ConfigStore, GatewayConfig},
     driver::workspace::WorkspaceManager,
     error::{GatewayError, Result},
+    ingress::responses::ResponseStore,
     metrics::Metrics,
     router::{Router, SessionAffinity},
     telemetry,
@@ -32,6 +34,8 @@ pub struct AppState {
     router: Arc<Router>,
     tokens: Arc<TokenRegistry>,
     workspaces: Arc<WorkspaceManager>,
+    responses: Arc<ResponseStore>,
+    mcp_tasks: Arc<McpTaskStore>,
     metrics: Metrics,
     shutdown_token: CancellationToken,
     reload_lock: tokio::sync::Mutex<()>,
@@ -62,6 +66,8 @@ impl AppState {
         let router = Arc::new(Router::new(&config, sessions)?);
         let tokens = Arc::new(TokenRegistry::new(&config.tokens)?);
         let workspaces = Arc::new(WorkspaceManager::new(config.workspace.clone()));
+        let responses = Arc::new(ResponseStore::new());
+        let mcp_tasks = Arc::new(McpTaskStore::new());
         let config = Arc::new(ConfigStore::new(path, config));
 
         Ok(Arc::new(Self {
@@ -69,12 +75,24 @@ impl AppState {
             router,
             tokens,
             workspaces,
+            responses,
+            mcp_tasks,
             metrics,
             shutdown_token: CancellationToken::new(),
             reload_lock: tokio::sync::Mutex::new(()),
             started_at: Instant::now(),
             background: ParkingMutex::new(Vec::new()),
         }))
+    }
+
+    /// Stateful `/v1/responses` chaining store.
+    pub fn responses(&self) -> &Arc<ResponseStore> {
+        &self.responses
+    }
+
+    /// Async MCP `tasks/*` execution store.
+    pub fn mcp_tasks(&self) -> &Arc<McpTaskStore> {
+        &self.mcp_tasks
     }
 
     /// Path of the active configuration file.
@@ -178,7 +196,7 @@ impl AppState {
         Ok(next)
     }
 
-    /// Start session and worktree eviction loops. Safe to call once.
+    /// Start session, response, task, and worktree eviction loops. Safe to call once.
     pub fn start_background_tasks(self: &Arc<Self>) {
         let mut background = self.background.lock();
         if !background.is_empty() {
@@ -189,6 +207,14 @@ impl AppState {
             sessions.spawn_eviction_task(self.router.ttl_handle(), self.shutdown_token.clone()),
         );
         background.push(
+            self.responses
+                .spawn_eviction_task(self.router.ttl_handle(), self.shutdown_token.clone()),
+        );
+        background.push(
+            self.mcp_tasks
+                .spawn_eviction_task(self.router.ttl_handle(), self.shutdown_token.clone()),
+        );
+        background.push(
             self.workspaces
                 .spawn_eviction_task(self.shutdown_token.clone()),
         );
@@ -197,6 +223,7 @@ impl AppState {
     /// Cancel background work, wait briefly for tasks, and clean worktrees.
     pub async fn shutdown(&self) {
         self.shutdown_token.cancel();
+        self.mcp_tasks.cancel_all();
         let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.background.lock());
         for handle in handles {
             let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
