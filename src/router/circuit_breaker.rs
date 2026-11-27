@@ -79,8 +79,21 @@ pub struct BreakerSnapshot {
     pub consecutive_failures: u32,
     /// Remaining cooldown in seconds when open.
     pub open_remaining_secs: u64,
+    /// True when opened by an upstream authentication expiry/unauthorized error.
+    pub auth_expired: bool,
     /// Last failure reason, if any.
     pub last_failure: Option<String>,
+}
+
+/// Classification metadata passed when recording a backend failure.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FailureDetails {
+    /// True for HTTP 429 or CLI rate-limit output.
+    pub rate_limited: bool,
+    /// True for HTTP 401/403 or CLI auth-expiry output.
+    pub auth_expired: bool,
+    /// Optional explicit cooldown override (e.g. from HTTP `Retry-After`).
+    pub retry_after: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -95,6 +108,7 @@ struct Inner {
     state: InternalState,
     consecutive_failures: u32,
     half_open_probes: u32,
+    auth_expired: bool,
     last_failure: Option<String>,
 }
 
@@ -118,6 +132,7 @@ impl CircuitBreaker {
                 state: InternalState::Closed,
                 consecutive_failures: 0,
                 half_open_probes: 0,
+                auth_expired: false,
                 last_failure: None,
             }),
         }
@@ -177,6 +192,7 @@ impl CircuitBreaker {
             let mut inner = self.inner.lock();
             inner.consecutive_failures = 0;
             inner.half_open_probes = 0;
+            inner.auth_expired = false;
             inner.last_failure = None;
             let was_closed = matches!(inner.state, InternalState::Closed);
             inner.state = InternalState::Closed;
@@ -193,22 +209,43 @@ impl CircuitBreaker {
 
     /// Record a failure. `rate_limited` indicates an upstream HTTP 429.
     pub fn record_failure(&self, reason: impl Into<String>, rate_limited: bool) {
+        self.record_failure_detailed(
+            reason,
+            FailureDetails {
+                rate_limited,
+                auth_expired: false,
+                retry_after: None,
+            },
+        );
+    }
+
+    /// Record a failure with auth-expiry and dynamic cooldown metadata.
+    pub fn record_failure_detailed(&self, reason: impl Into<String>, details: FailureDetails) {
         let reason = reason.into();
         let settings = self.settings.lock().clone();
         let transition = {
             let mut inner = self.inner.lock();
             inner.last_failure = Some(reason);
+            if details.auth_expired {
+                inner.auth_expired = true;
+            }
             let should_open = match inner.state {
                 InternalState::HalfOpen => true,
-                _ if rate_limited && settings.open_on_rate_limit => true,
+                _ if details.auth_expired => true,
+                _ if details.rate_limited && settings.open_on_rate_limit => true,
                 _ => {
                     inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
                     inner.consecutive_failures >= settings.failure_threshold
                 }
             };
             if should_open {
+                let cooldown = if details.rate_limited {
+                    details.retry_after.unwrap_or(settings.reset_timeout)
+                } else {
+                    settings.reset_timeout
+                };
                 inner.state = InternalState::Open {
-                    until: Instant::now() + settings.reset_timeout,
+                    until: Instant::now() + cooldown.max(Duration::from_millis(1)),
                 };
                 inner.half_open_probes = 0;
                 Some(CircuitState::Open)
@@ -270,6 +307,7 @@ impl CircuitBreaker {
             state,
             consecutive_failures: inner.consecutive_failures,
             open_remaining_secs,
+            auth_expired: inner.auth_expired,
             last_failure: inner.last_failure.clone(),
         }
     }
@@ -325,5 +363,44 @@ mod tests {
         let breaker = breaker(10, 50);
         breaker.record_failure("429", true);
         assert_eq!(breaker.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn auth_expired_opens_immediately_and_clears_on_success() {
+        let breaker = breaker(10, 10);
+        breaker.record_failure_detailed(
+            "please sign in",
+            FailureDetails {
+                rate_limited: false,
+                auth_expired: true,
+                retry_after: None,
+            },
+        );
+        let snap = breaker.snapshot();
+        assert_eq!(snap.state, CircuitState::Open);
+        assert!(snap.auth_expired);
+
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(breaker.allow_request());
+        breaker.record_success();
+        let snap = breaker.snapshot();
+        assert_eq!(snap.state, CircuitState::Closed);
+        assert!(!snap.auth_expired);
+    }
+
+    #[test]
+    fn rate_limit_honors_retry_after_override() {
+        let breaker = breaker(10, 10);
+        breaker.record_failure_detailed(
+            "429",
+            FailureDetails {
+                rate_limited: true,
+                auth_expired: false,
+                retry_after: Some(Duration::from_secs(3)),
+            },
+        );
+        let snap = breaker.snapshot();
+        assert_eq!(snap.state, CircuitState::Open);
+        assert!(snap.open_remaining_secs >= 2);
     }
 }
