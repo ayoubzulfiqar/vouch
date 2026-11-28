@@ -289,6 +289,7 @@ mod tests {
             max_tokens: None,
             workspace_mode: WorkspaceMode::Auto,
             workdir: None,
+            workspace_root: None,
             cancel: CancellationToken::new(),
             tools: Vec::new(),
             tool_choice: None,
