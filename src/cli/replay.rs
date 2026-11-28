@@ -160,6 +160,7 @@ async fn replay_one(
         max_tokens: None,
         workspace_mode: WorkspaceMode::None,
         workdir: None,
+        workspace_root: None,
         cancel: CancellationToken::new(),
         tools: rec.tools.clone(),
         tool_choice: None,
