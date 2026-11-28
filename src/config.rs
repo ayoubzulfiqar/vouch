@@ -202,6 +202,9 @@ pub struct CacheConfig {
     /// Collapse consecutive whitespace in prompt text before hashing cache/singleflight keys.
     #[serde(default)]
     pub normalize_whitespace: bool,
+    /// Maximum concurrent singleflight waiters queued behind one in-flight leader. Default: `64`.
+    #[serde(default = "default_cache_max_coalesce_waiters")]
+    pub max_coalesce_waiters: usize,
 }
 
 impl CacheConfig {
@@ -674,6 +677,9 @@ pub struct TokenConfig {
     /// Glob patterns of models this token may call. Empty means all.
     #[serde(default)]
     pub allowed_models: Vec<String>,
+    /// Optional glob allowlist restricting MCP tool names (`tools/call`, `tasks/create`).
+    #[serde(default)]
+    pub allowed_mcp_tools: Option<Vec<String>>,
     /// Optional backend id/glob restriction; `None` permits all backends.
     #[serde(default)]
     pub allowed_backends: Option<Vec<String>>,
@@ -690,18 +696,23 @@ pub struct ModelAllowlist {
 }
 
 impl ModelAllowlist {
-    /// Compile glob patterns.
+    /// Compile glob patterns for `allowed_models`.
     pub fn compile(patterns: &[String]) -> Result<Self> {
+        Self::compile_named("allowed_models", patterns)
+    }
+
+    /// Compile glob patterns for a named configuration allowlist field.
+    pub fn compile_named(field: &str, patterns: &[String]) -> Result<Self> {
         let mut builder = GlobSetBuilder::new();
         for pattern in patterns {
             let glob = Glob::new(pattern).map_err(|error| {
-                GatewayError::Config(format!("invalid allowed_models glob {pattern:?}: {error}"))
+                GatewayError::Config(format!("invalid {field} glob {pattern:?}: {error}"))
             })?;
             builder.add(glob);
         }
-        let set = builder.build().map_err(|error| {
-            GatewayError::Config(format!("invalid allowed_models glob set: {error}"))
-        })?;
+        let set = builder
+            .build()
+            .map_err(|error| GatewayError::Config(format!("invalid {field} glob set: {error}")))?;
         Ok(Self {
             set,
             patterns: patterns.to_vec(),
@@ -753,6 +764,15 @@ impl GatewayConfig {
                 "server.stream_timeout_secs must be greater than zero".into(),
             ));
         }
+        if let Some(socket) = &self.server.unix_socket {
+            let socket_len = socket.to_string_lossy().len();
+            if socket_len == 0 || socket_len >= 100 {
+                return Err(GatewayError::Config(format!(
+                    "server.unix_socket {:?} must be non-empty and under 100 bytes for macOS/BSD sockaddr_un compatibility (got {socket_len} bytes)",
+                    socket.display()
+                )));
+            }
+        }
         if self.backends.is_empty() {
             return Err(GatewayError::Config(
                 "at least one [[backends]] entry is required".into(),
@@ -791,6 +811,11 @@ impl GatewayConfig {
         if !self.cache.max_temperature.is_finite() || self.cache.max_temperature < 0.0 {
             return Err(GatewayError::Config(
                 "cache.max_temperature must be a finite number >= 0.0".into(),
+            ));
+        }
+        if self.cache.max_coalesce_waiters == 0 {
+            return Err(GatewayError::Config(
+                "cache.max_coalesce_waiters must be greater than zero".into(),
             ));
         }
         if self.attachments.max_image_bytes == 0 {
@@ -1096,7 +1121,10 @@ impl GatewayConfig {
                 parse_rfc3339_unix_secs(exp)?;
             }
             if let Some(allowed_backends) = &token.allowed_backends {
-                ModelAllowlist::compile(allowed_backends)?;
+                ModelAllowlist::compile_named("allowed_backends", allowed_backends)?;
+            }
+            if let Some(allowed_mcp_tools) = &token.allowed_mcp_tools {
+                ModelAllowlist::compile_named("allowed_mcp_tools", allowed_mcp_tools)?;
             }
             ModelAllowlist::compile(&token.allowed_models)?;
         }
@@ -1674,6 +1702,9 @@ fn default_cache_ttl_secs() -> u64 {
 fn default_cache_max_temperature() -> f64 {
     0.2
 }
+fn default_cache_max_coalesce_waiters() -> usize {
+    64
+}
 fn default_profile_weight() -> u32 {
     1
 }
@@ -1738,6 +1769,7 @@ impl Default for CacheConfig {
             persist: false,
             coalesce_inflight: None,
             normalize_whitespace: false,
+            max_coalesce_waiters: default_cache_max_coalesce_waiters(),
         }
     }
 }
