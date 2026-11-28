@@ -23,6 +23,7 @@ pub mod config;
 pub mod driver;
 pub mod error;
 pub mod ingress;
+pub mod memory;
 pub mod metrics;
 pub mod persistence;
 pub mod recorder;
