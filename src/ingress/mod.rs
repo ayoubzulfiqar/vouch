@@ -446,6 +446,7 @@ pub fn build_router(state: Arc<AppState>) -> AxumRouter {
         .route("/readyz", get(ops::readyz))
         .route("/metrics", get(ops::metrics))
         .layer(DefaultBodyLimit::max(body_limit))
+        .layer(middleware::from_fn(content_type_guard_middleware))
         .layer(middleware::from_fn(metrics_middleware))
         .with_state(state);
 
@@ -850,7 +851,11 @@ pub(crate) async fn execute_or_cached(
                 .cache()
                 .begin_or_join_inflight(cache_miss_key.as_deref(), request.stream);
             match role {
-                CoalesceRole::Waiter(mut rx) => {
+                CoalesceRole::Saturated => Err(GatewayError::Saturated(format!(
+                    "singleflight coalesce queue saturated (limit {} waiters)",
+                    state.config().cache.max_coalesce_waiters
+                ))),
+                CoalesceRole::Waiter(mut rx, _waiter_guard) => {
                     let cancel = request.cancel.clone();
                     let timeout =
                         Duration::from_secs(state.config().server.request_timeout_secs.max(1));
@@ -1330,6 +1335,53 @@ where
         insert_header(&mut response, "x-accel-buffering", "no");
         response
     }
+}
+
+fn requires_json_post_content_type(path: &str) -> bool {
+    path.starts_with("/v1/")
+        || path.starts_with("/api/")
+        || path == "/mcp"
+        || path.starts_with("/admin/")
+        || path.starts_with("/v1beta/")
+}
+
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    let Some(raw) = headers.get(axum::http::header::CONTENT_TYPE) else {
+        return false;
+    };
+    let Ok(value) = raw.to_str() else {
+        return false;
+    };
+    let trimmed = value.trim();
+    let prefix = "application/json";
+    if trimmed.len() < prefix.len() {
+        return false;
+    }
+    let (head, rest) = trimmed.split_at(prefix.len());
+    head.eq_ignore_ascii_case(prefix)
+        && (rest.is_empty() || rest.starts_with(';') || rest.starts_with(char::is_whitespace))
+}
+
+async fn content_type_guard_middleware(request: Request<Body>, next: Next) -> Response {
+    if request.method() == axum::http::Method::POST {
+        let path = request.uri().path();
+        if requires_json_post_content_type(path) && !is_json_content_type(request.headers()) {
+            let err = GatewayError::UnsupportedMediaType(
+                "POST requests to this endpoint require Content-Type: application/json".into(),
+            );
+            if path == "/v1/messages" {
+                return err.into_anthropic_response();
+            }
+            if path.starts_with("/v1beta/") {
+                return gemini::into_gemini_error_response(err);
+            }
+            if path.starts_with("/api/") {
+                return ollama::into_ollama_error_response(err);
+            }
+            return err.into_openai_response();
+        }
+    }
+    next.run(request).await
 }
 
 async fn metrics_middleware(request: Request<Body>, next: Next) -> Response {
