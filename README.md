@@ -135,7 +135,7 @@ Prebuilt archives and native distro packages are published on [GitHub Releases](
 
 ```bash
 # Debian / Ubuntu (.deb)
-sudo apt install ./vouch_6.0.0_amd64.deb        # or arm64
+sudo apt install ./vouch_6.0.0-1_amd64.deb      # or arm64
 
 # Fedora / RHEL / openSUSE (.rpm)
 sudo dnf install ./vouch-6.0.0-1.x86_64.rpm     # or aarch64
