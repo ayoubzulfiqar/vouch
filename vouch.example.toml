@@ -281,6 +281,34 @@ max_records = 500
 # path = "/var/lib/vouch/state/flight.jsonl"
 
 # ---------------------------------------------------------------------------
+# [shared_memory] — deterministic cross-agent canonical session ledger and
+# zero-LLM-token `<vouch_shared_context>` handoff synthesizer.
+# ---------------------------------------------------------------------------
+[shared_memory]
+enabled = true
+# Rolling cap of canonical user/assistant/tool turns retained per session. Default: 32.
+max_turns_per_session = 32
+# Strict BPE token budget for synthesized `<vouch_shared_context>` handoff envelopes. Default: 1500.
+max_context_tokens = 1500
+# Automatically push a checkpoint to `[trace]` on cross-agent handoffs and session expiry. Default: true.
+sync_to_trace = true
+
+# ---------------------------------------------------------------------------
+# [trace] — optional model-free `trace` MCP codebase intelligence bridge.
+# ---------------------------------------------------------------------------
+[trace]
+enabled = false
+# When false (default), missing/slow `trace` binaries degrade gracefully without failing requests or `doctor`.
+required = false
+command = "trace"
+args = ["serve"]
+# Base workspace root for repository queries and `X-Workspace-Root` overrides (defaults to `workspace.repo_path` or CWD).
+# workspace_root = "/path/to/agent-workspace"
+startup_timeout_ms = 3000
+query_timeout_ms = 1500
+max_trace_tokens = 900
+
+# ---------------------------------------------------------------------------
 # [pricing.<route_or_backend>] — optional USD token pricing per 1M tokens.
 # ---------------------------------------------------------------------------
 [pricing."coding/default"]
