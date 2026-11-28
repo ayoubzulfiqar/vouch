@@ -280,6 +280,16 @@ impl WorkspaceManager {
         }
     }
 
+    /// Remove a single session worktree if present, awaiting git cleanup.
+    pub async fn remove_session(&self, session_key: &str) -> bool {
+        if let Some((_, entry)) = self.entries.remove(session_key) {
+            entry.cleanup().await;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Number of live worktrees.
     pub fn len(&self) -> usize {
         self.entries.len()
