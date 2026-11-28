@@ -2,6 +2,7 @@
 //! Ollama API ingress (`GET /api/tags`, `POST /api/chat`, `POST /api/generate`).
 
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -18,6 +19,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::{
     driver::{
@@ -27,8 +29,9 @@ use crate::{
     error::{GatewayError, Result},
     ingress::{
         CancelOnDrop, RequestContext, StreamUsageGuard, completion, execute_or_cached,
-        execution_request, insert_routing_headers, into_chunk_stream, iso8601_utc_now,
-        prepare_routed, record_completion_outcome, record_error_outcome, start_ingress_span,
+        execution_request, insert_dispatched_headers, insert_routing_headers, into_chunk_stream,
+        iso8601_utc_now, prepare_routed, record_completion_outcome, record_error_outcome,
+        start_ingress_span,
     },
     state::AppState,
     telemetry::redact_text,
@@ -82,6 +85,12 @@ struct OllamaMessage {
     content: String,
     #[serde(default)]
     images: Vec<String>,
+    #[serde(default)]
+    tool_calls: Vec<Value>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -90,6 +99,8 @@ struct OllamaOptions {
     temperature: Option<f64>,
     #[serde(default)]
     num_predict: Option<u32>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 fn default_ollama_stream() -> bool {
@@ -184,12 +195,42 @@ async fn chat_inner(
             msg.role
         };
         let content = build_ollama_content(&msg.content, &msg.images);
+        let tool_calls = msg
+            .tool_calls
+            .into_iter()
+            .filter_map(|tc| {
+                let func = tc.get("function").unwrap_or(&tc);
+                let name = func.get("name").and_then(Value::as_str)?.to_string();
+                let args_val = func.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let arguments = match args_val {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                let id = tc
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+                Some(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                })
+            })
+            .collect();
+        let tool_call_id = msg.tool_call_id.or_else(|| {
+            if role.eq_ignore_ascii_case("tool") {
+                msg.name.clone()
+            } else {
+                None
+            }
+        });
         messages.push(ChatMessage {
             role,
             content,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
+            tool_calls,
+            tool_call_id,
+            name: msg.name,
         });
     }
     if messages.is_empty() {
@@ -205,6 +246,13 @@ async fn chat_inner(
     let tools = normalize_tools(payload.tools);
     let response_format = parse_ollama_format(payload.format);
     let options = payload.options.unwrap_or_default();
+    let mut extra = payload.extra;
+    if !options.extra.is_empty() {
+        extra.insert(
+            "ollama_options".into(),
+            Value::Object(options.extra.clone()),
+        );
+    }
 
     dispatch_ollama(
         state,
@@ -216,7 +264,7 @@ async fn chat_inner(
         options,
         tools,
         response_format,
-        payload.extra,
+        extra,
         false,
         "/api/chat",
     )
@@ -320,6 +368,7 @@ async fn dispatch_ollama(
     let driver_response = dispatched.routed.response;
     let cache_status = dispatched.cache_status;
     let cache_miss_key = dispatched.cache_miss_key;
+    let coalesced = dispatched.coalesced;
     let request_id = context.request_id.clone();
 
     if stream {
@@ -388,7 +437,14 @@ async fn dispatch_ollama(
         )
     };
     let mut response = Json(body).into_response();
-    insert_routing_headers(&mut response, &backend, fallback, &request_id, cache_status);
+    insert_dispatched_headers(
+        &mut response,
+        &backend,
+        fallback,
+        &request_id,
+        cache_status,
+        coalesced,
+    );
     Ok(response)
 }
 
@@ -424,6 +480,7 @@ fn build_ollama_ndjson_stream(
         let _cancel_guard = CancelOnDrop(cancel_clone.clone());
         let deadline = tokio::time::Instant::now() + Duration::from_secs(stream_timeout);
         let mut final_usage: Option<Usage> = None;
+        let mut pending_calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
 
         loop {
             let item = tokio::select! {
@@ -449,21 +506,30 @@ fn build_ollama_ndjson_stream(
                     if let Some(u) = usage {
                         final_usage = Some(u);
                     }
-                    if !delta.is_empty() || !tool_calls.is_empty() {
-                        let calls: Vec<ToolCall> = tool_calls
-                            .iter()
-                            .filter_map(|d| {
-                                d.name.as_ref().map(|n| ToolCall {
-                                    id: d.id.clone().unwrap_or_default(),
-                                    name: n.clone(),
-                                    arguments: d.arguments_delta.clone().unwrap_or_default(),
-                                })
-                            })
-                            .collect();
+                    for td in tool_calls {
+                        let entry = pending_calls.entry(td.index).or_insert_with(|| ToolCall {
+                            id: td
+                                .id
+                                .clone()
+                                .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple())),
+                            name: td.name.clone().unwrap_or_default(),
+                            arguments: String::new(),
+                        });
+                        if let Some(id) = td.id {
+                            entry.id = id;
+                        }
+                        if let Some(name) = td.name {
+                            entry.name = name;
+                        }
+                        if let Some(args) = td.arguments_delta {
+                            entry.arguments.push_str(&args);
+                        }
+                    }
+                    if !delta.is_empty() {
                         let frame = if is_generate_mode {
                             ollama_generate_frame(&model, &delta, false, None, None)
                         } else {
-                            ollama_chat_frame(&model, &delta, &calls, false, None, None)
+                            ollama_chat_frame(&model, &delta, &[], false, None, None)
                         };
                         let line = format!("{frame}\n");
                         if tx.send(axum::body::Bytes::from(line)).await.is_err() {
@@ -471,11 +537,19 @@ fn build_ollama_ndjson_stream(
                         }
                     }
                     if let Some(reason) = finish_reason {
+                        let calls: Vec<ToolCall> = pending_calls.into_values().collect();
                         let effective = usage_guard.complete(final_usage.or(usage), &reason);
                         let frame = if is_generate_mode {
                             ollama_generate_frame(&model, "", true, Some(&reason), Some(effective))
                         } else {
-                            ollama_chat_frame(&model, "", &[], true, Some(&reason), Some(effective))
+                            ollama_chat_frame(
+                                &model,
+                                "",
+                                &calls,
+                                true,
+                                Some(&reason),
+                                Some(effective),
+                            )
                         };
                         let _ = tx.send(axum::body::Bytes::from(format!("{frame}\n"))).await;
                         break;
@@ -489,11 +563,12 @@ fn build_ollama_ndjson_stream(
                     break;
                 }
                 None => {
+                    let calls: Vec<ToolCall> = pending_calls.into_values().collect();
                     let effective = usage_guard.complete(final_usage, "stop");
                     let frame = if is_generate_mode {
                         ollama_generate_frame(&model, "", true, Some("stop"), Some(effective))
                     } else {
-                        ollama_chat_frame(&model, "", &[], true, Some("stop"), Some(effective))
+                        ollama_chat_frame(&model, "", &calls, true, Some("stop"), Some(effective))
                     };
                     let _ = tx.send(axum::body::Bytes::from(format!("{frame}\n"))).await;
                     break;
