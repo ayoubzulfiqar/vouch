@@ -26,9 +26,11 @@ use crate::{
     ingress::responses::ResponseStore,
     metrics::Metrics,
     persistence::{GatewaySnapshot, load_snapshot, save_snapshot},
+    recorder::FlightRecorder,
     router::{ResolvedRoute, Router, RoutingInput, SessionAffinity},
-    telemetry::{self, OtelExporter},
-    usage::{UsageTracker, calculate_cost_usd},
+    security::EgressGuard,
+    telemetry::{self, OtelExporter, TraceRingBuffer},
+    usage::{UsageTracker, calculate_cost_usd_with_profile},
 };
 
 /// Process-wide gateway state.
@@ -43,6 +45,9 @@ pub struct AppState {
     metrics: Metrics,
     usage: Arc<UsageTracker>,
     otel: Arc<OtelExporter>,
+    egress_guard: Arc<EgressGuard>,
+    flight_recorder: Arc<FlightRecorder>,
+    traces: Arc<TraceRingBuffer>,
     shutdown_token: CancellationToken,
     reload_lock: tokio::sync::Mutex<()>,
     started_at: Instant,
@@ -81,6 +86,12 @@ impl AppState {
         let responses = Arc::new(ResponseStore::with_max_entries(max_entries));
         let cache = Arc::new(ResponseCache::new(config.cache.clone()));
         let mcp_tasks = Arc::new(McpTaskStore::new());
+        let egress_guard = Arc::new(EgressGuard::new(&config.security.egress_guard)?);
+        let flight_recorder = FlightRecorder::new(
+            config.flight_recorder.clone(),
+            config.defaults.state_dir.clone(),
+        );
+        let traces = Arc::new(TraceRingBuffer::new(100));
 
         if let Some(state_dir) = config.defaults.state_dir.as_deref()
             && let Some(snapshot) = load_snapshot(state_dir)
@@ -112,6 +123,9 @@ impl AppState {
             metrics,
             usage,
             otel,
+            egress_guard,
+            flight_recorder,
+            traces,
             shutdown_token: CancellationToken::new(),
             reload_lock: tokio::sync::Mutex::new(()),
             started_at: Instant::now(),
@@ -131,12 +145,44 @@ impl AppState {
 
     /// Calculate USD cost for `usage` using `[pricing]` overrides.
     pub fn calculate_cost_usd(&self, route: &str, backend_id: &str, usage: Usage) -> f64 {
-        calculate_cost_usd(&self.config.load().pricing, route, backend_id, usage)
+        calculate_cost_usd_with_profile(&self.config.load().pricing, route, backend_id, None, usage)
+    }
+
+    /// Profile-aware USD pricing calculation (`backend:profile` -> `backend` -> `route`).
+    pub fn calculate_cost_usd_for_profile(
+        &self,
+        route: &str,
+        backend_id: &str,
+        profile_id: Option<&str>,
+        usage: Usage,
+    ) -> f64 {
+        calculate_cost_usd_with_profile(
+            &self.config.load().pricing,
+            route,
+            backend_id,
+            profile_id,
+            usage,
+        )
     }
 
     /// Non-blocking OpenTelemetry trace span exporter.
     pub fn otel(&self) -> &Arc<OtelExporter> {
         &self.otel
+    }
+
+    /// Outbound secret/PII egress guardrail engine.
+    pub fn egress_guard(&self) -> &Arc<EgressGuard> {
+        &self.egress_guard
+    }
+
+    /// Opt-in redacted JSONL flight recorder.
+    pub fn flight_recorder(&self) -> &Arc<FlightRecorder> {
+        &self.flight_recorder
+    }
+
+    /// Bounded ring buffer of recent completed request traces (`GET /v1/traces`).
+    pub fn traces(&self) -> &Arc<TraceRingBuffer> {
+        &self.traces
     }
 
     /// Stateful `/v1/responses` chaining store.
@@ -222,7 +268,12 @@ impl AppState {
         let previous = self.config.load();
 
         self.tokens.reload(&next.tokens)?;
+        if let Err(error) = self.egress_guard.update(&next.security.egress_guard) {
+            let _ = self.tokens.reload(&previous.tokens);
+            return Err(error);
+        }
         if let Err(error) = self.router.rebuild(&next) {
+            let _ = self.egress_guard.update(&previous.security.egress_guard);
             let _ = self.tokens.reload(&previous.tokens);
             return Err(error);
         }
@@ -231,6 +282,10 @@ impl AppState {
             .set_max_entries(next.defaults.max_session_entries);
         self.cache.update_config(next.cache.clone());
         self.workspaces.update_config(next.workspace.clone());
+        self.flight_recorder.update_config(
+            next.flight_recorder.clone(),
+            next.defaults.state_dir.clone(),
+        );
         self.otel.reconfigure(&next.telemetry);
         telemetry::set_global_secrets(next.secrets());
 
@@ -287,6 +342,12 @@ impl AppState {
         if let Some(otel_handle) = self.otel.start_worker(self.shutdown_token.clone()) {
             background.push(otel_handle);
         }
+        if let Some(rec_handle) = self
+            .flight_recorder
+            .start_worker(self.shutdown_token.clone())
+        {
+            background.push(rec_handle);
+        }
 
         let state_for_persist = self.clone();
         let shutdown = self.shutdown_token.clone();
@@ -325,6 +386,7 @@ impl AppState {
 
     /// Cancel background work, wait briefly for tasks, persist state, and clean worktrees.
     pub async fn shutdown(&self) {
+        self.flight_recorder.flush().await;
         if let Err(error) = self.persist_state() {
             tracing::warn!(error = %error, "failed to flush state snapshot before shutdown");
         }
