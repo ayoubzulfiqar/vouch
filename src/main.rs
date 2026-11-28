@@ -10,10 +10,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use clap::Parser;
 use notify::Watcher as _;
-use tokio::{
-    net::{TcpListener, UnixListener},
-    task::JoinSet,
-};
+use tokio::{net::TcpListener, task::JoinSet};
 use tracing::{error, info, warn};
 
 use vouch::{
@@ -125,36 +122,45 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     let socket_path = state.config().server.unix_socket.clone();
     if let Some(path) = &socket_path {
-        vouch::prepare_unix_socket_path(path)?;
-        let listener = UnixListener::bind(path).map_err(|error| {
-            GatewayError::Io(std::io::Error::new(
-                error.kind(),
-                format!("cannot bind Unix socket {}: {error}", path.display()),
-            ))
-        })?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |error| {
-                    GatewayError::Io(std::io::Error::new(
-                        error.kind(),
-                        format!("cannot chmod {}: {error}", path.display()),
-                    ))
-                },
-            )?;
-        }
-        info!(path = %path.display(), "Unix socket listener ready");
-        let uds_shutdown = listener_shutdown.clone();
-        let uds_app = app.clone();
-        servers.spawn(async move {
-            if let Err(error) = axum::serve(listener, uds_app)
-                .with_graceful_shutdown(async move { uds_shutdown.cancelled().await })
-                .await
+            vouch::prepare_unix_socket_path(path)?;
+            let listener = tokio::net::UnixListener::bind(path).map_err(|error| {
+                GatewayError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("cannot bind Unix socket {}: {error}", path.display()),
+                ))
+            })?;
             {
-                error!(error = %error, "Unix socket server failed");
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+                    |error| {
+                        GatewayError::Io(std::io::Error::new(
+                            error.kind(),
+                            format!("cannot chmod {}: {error}", path.display()),
+                        ))
+                    },
+                )?;
             }
-        });
+            info!(path = %path.display(), "Unix socket listener ready");
+            let uds_shutdown = listener_shutdown.clone();
+            let uds_app = app.clone();
+            servers.spawn(async move {
+                if let Err(error) = axum::serve(listener, uds_app)
+                    .with_graceful_shutdown(async move { uds_shutdown.cancelled().await })
+                    .await
+                {
+                    error!(error = %error, "Unix socket server failed");
+                }
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(GatewayError::Config(format!(
+                "server.unix_socket {:?} is only supported on Unix hosts",
+                path.display()
+            )));
+        }
     }
 
     let reload = start_reload_task(state.clone());
@@ -222,9 +228,7 @@ async fn wait_for_termination() -> Result<()> {
 
 #[cfg(not(unix))]
 async fn wait_for_termination() -> Result<()> {
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|error| GatewayError::Io(error))
+    tokio::signal::ctrl_c().await.map_err(GatewayError::Io)
 }
 
 /// Spawn the hot-reload supervisor.
