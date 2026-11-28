@@ -71,6 +71,66 @@ impl TokenConcurrencyGuard {
     }
 }
 
+/// Combined mutable quota state guarded by a single lock so pre-execution
+/// reservations and post-execution reconciliations are atomic.
+#[derive(Debug)]
+struct TokenBudgetState {
+    daily: DailyTokenCounter,
+    tpm_window: VecDeque<(Instant, u64)>,
+    reserved_tokens: u64,
+}
+
+/// RAII token reservation acquired prior to dispatching an upstream backend call.
+///
+/// Reconciles reserved prompt BPE tokens against actual total (prompt +
+/// completion) tokens via [`TokenBudgetReservation::settle`]. If dropped
+/// unsettled (for example when pre-execution validation or setup fails), the
+/// reserved tokens are released without debiting consumed usage.
+#[derive(Debug)]
+pub struct TokenBudgetReservation {
+    policy: Option<Arc<TokenPolicy>>,
+    reserved: u64,
+    settled: bool,
+}
+
+impl TokenBudgetReservation {
+    /// Empty reservation for callers with no configured token policy.
+    pub fn none() -> Self {
+        Self {
+            policy: None,
+            reserved: 0,
+            settled: true,
+        }
+    }
+
+    /// Reserved prompt token count.
+    pub fn reserved_tokens(&self) -> u64 {
+        self.reserved
+    }
+
+    /// Reconcile the reservation against actual consumed total tokens (`prompt + completion`).
+    pub fn settle(&mut self, actual_total: u64) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        if let Some(policy) = &self.policy {
+            policy.settle_tokens(self.reserved, actual_total);
+        }
+    }
+}
+
+impl Drop for TokenBudgetReservation {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settled = true;
+            if let Some(policy) = &self.policy {
+                policy.release_reservation(self.reserved);
+            }
+        }
+    }
+}
+
 /// One configured credential.
 #[derive(Debug)]
 pub struct TokenPolicy {
@@ -97,8 +157,7 @@ pub struct TokenPolicy {
     /// Compiled model allowlist; `None` means every model.
     allowlist: Option<ModelAllowlist>,
     window: Mutex<VecDeque<Instant>>,
-    tpm_window: Mutex<VecDeque<(Instant, u64)>>,
-    daily_usage: Mutex<DailyTokenCounter>,
+    budget_state: Mutex<TokenBudgetState>,
     concurrency: Option<Arc<Semaphore>>,
 }
 
@@ -139,10 +198,13 @@ impl TokenPolicy {
             admin: config.admin,
             allowlist,
             window: Mutex::new(VecDeque::new()),
-            tpm_window: Mutex::new(VecDeque::new()),
-            daily_usage: Mutex::new(DailyTokenCounter {
-                utc_day: utc_day_for(SystemTime::now()),
-                tokens: 0,
+            budget_state: Mutex::new(TokenBudgetState {
+                daily: DailyTokenCounter {
+                    utc_day: utc_day_for(SystemTime::now()),
+                    tokens: 0,
+                },
+                tpm_window: VecDeque::new(),
+                reserved_tokens: 0,
             }),
             concurrency,
         })
@@ -199,62 +261,117 @@ impl TokenPolicy {
         }
     }
 
-    /// Enforce sliding 60-second tokens-per-minute quota when configured.
-    fn check_tpm(&self, now: Instant) -> Result<()> {
-        let Some(tpm) = self.tpm else {
-            return Ok(());
-        };
-        let mut window = self.tpm_window.lock();
-        while let Some((ts, _)) = window.front() {
-            if now.duration_since(*ts) >= WINDOW {
-                window.pop_front();
+    fn roll_and_prune(state: &mut TokenBudgetState, now_sys: SystemTime, now_inst: Instant) -> u64 {
+        let today = utc_day_for(now_sys);
+        if state.daily.utc_day != today {
+            state.daily.utc_day = today;
+            state.daily.tokens = 0;
+        }
+        while let Some((ts, _)) = state.tpm_window.front() {
+            if now_inst.duration_since(*ts) >= WINDOW {
+                state.tpm_window.pop_front();
             } else {
                 break;
             }
         }
-        let used: u64 = window.iter().map(|(_, toks)| *toks).sum();
-        if used >= tpm {
-            let retry_after_secs = window
-                .front()
-                .map(|(front, _)| WINDOW.saturating_sub(now.duration_since(*front)).as_secs())
-                .unwrap_or(1)
-                .max(1);
-            metrics::record_token_rate_limited(&self.name);
-            return Err(GatewayError::RateLimited {
-                retry_after_secs,
-                message: format!(
-                    "token {:?} exceeded its {tpm} tokens-per-minute limit ({used} used in last 60s)",
-                    self.name
-                ),
-            });
+        state.tpm_window.iter().map(|(_, toks)| *toks).sum()
+    }
+
+    fn check_quotas_locked(
+        &self,
+        state: &TokenBudgetState,
+        tpm_used: u64,
+        reserve_tokens: u64,
+        now_sys: SystemTime,
+        now_inst: Instant,
+    ) -> Result<()> {
+        if let Some(budget) = self.daily_token_budget {
+            let projected = state.daily.tokens.saturating_add(state.reserved_tokens);
+            if projected >= budget
+                || (reserve_tokens > 0 && projected.saturating_add(reserve_tokens) > budget)
+            {
+                let retry_after_secs = seconds_until_utc_midnight(now_sys);
+                metrics::record_token_rate_limited(&self.name);
+                return Err(GatewayError::DailyTokenBudgetExceeded {
+                    retry_after_secs,
+                    message: format!(
+                        "token {:?} exceeded its daily BPE budget of {budget} tokens ({} used, {} reserved today)",
+                        self.name, state.daily.tokens, state.reserved_tokens
+                    ),
+                });
+            }
+        }
+        if let Some(tpm) = self.tpm {
+            let projected_tpm = tpm_used.saturating_add(state.reserved_tokens);
+            if projected_tpm >= tpm
+                || (reserve_tokens > 0 && projected_tpm.saturating_add(reserve_tokens) > tpm)
+            {
+                let retry_after_secs = state
+                    .tpm_window
+                    .front()
+                    .map(|(front, _)| {
+                        WINDOW
+                            .saturating_sub(now_inst.duration_since(*front))
+                            .as_secs()
+                    })
+                    .unwrap_or(1)
+                    .max(1);
+                metrics::record_token_rate_limited(&self.name);
+                return Err(GatewayError::RateLimited {
+                    retry_after_secs,
+                    message: format!(
+                        "token {:?} exceeded its {tpm} tokens-per-minute limit ({tpm_used} used, {} reserved in last 60s)",
+                        self.name, state.reserved_tokens
+                    ),
+                });
+            }
         }
         Ok(())
     }
 
-    /// Consume daily BPE budget quota before checking RPM so rejected calls do not burn RPM.
-    fn check_daily_budget(&self) -> Result<()> {
-        let Some(budget) = self.daily_token_budget else {
-            return Ok(());
-        };
-        let now = SystemTime::now();
-        let today = utc_day_for(now);
-        let mut daily = self.daily_usage.lock();
-        if daily.utc_day != today {
-            daily.utc_day = today;
-            daily.tokens = 0;
+    /// Atomically verify daily BPE budget and sliding 60-second TPM quota and
+    /// reserve `estimated_prompt_tokens` while the request executes.
+    pub fn check_and_reserve_tokens(
+        self: &Arc<Self>,
+        estimated_prompt_tokens: u64,
+    ) -> Result<TokenBudgetReservation> {
+        let now_sys = SystemTime::now();
+        let now_inst = Instant::now();
+        let mut state = self.budget_state.lock();
+        let tpm_used = Self::roll_and_prune(&mut state, now_sys, now_inst);
+        self.check_quotas_locked(&state, tpm_used, estimated_prompt_tokens, now_sys, now_inst)?;
+        state.reserved_tokens = state
+            .reserved_tokens
+            .saturating_add(estimated_prompt_tokens);
+        Ok(TokenBudgetReservation {
+            policy: Some(self.clone()),
+            reserved: estimated_prompt_tokens,
+            settled: false,
+        })
+    }
+
+    /// Release an unsettled prompt reservation without crediting usage.
+    pub fn release_reservation(&self, reserved: u64) {
+        if reserved == 0 {
+            return;
         }
-        if daily.tokens >= budget {
-            let retry_after_secs = seconds_until_utc_midnight(now);
-            metrics::record_token_rate_limited(&self.name);
-            return Err(GatewayError::DailyTokenBudgetExceeded {
-                retry_after_secs,
-                message: format!(
-                    "token {:?} exceeded its daily BPE budget of {budget} tokens ({} used today)",
-                    self.name, daily.tokens
-                ),
-            });
+        let mut state = self.budget_state.lock();
+        state.reserved_tokens = state.reserved_tokens.saturating_sub(reserved);
+    }
+
+    /// Release `reserved` in-flight tokens and record `actual_total` consumed BPE tokens.
+    pub fn settle_tokens(&self, reserved: u64, actual_total: u64) {
+        let now_sys = SystemTime::now();
+        let now_inst = Instant::now();
+        let mut state = self.budget_state.lock();
+        state.reserved_tokens = state.reserved_tokens.saturating_sub(reserved);
+        Self::roll_and_prune(&mut state, now_sys, now_inst);
+        if actual_total > 0 {
+            state.daily.tokens = state.daily.tokens.saturating_add(actual_total);
+            if self.tpm.is_some() {
+                state.tpm_window.push_back((now_inst, actual_total));
+            }
         }
-        Ok(())
     }
 
     /// Record consumed prompt + completion BPE tokens against both the daily day bucket and 60s TPM window.
@@ -262,39 +379,18 @@ impl TokenPolicy {
         if tokens == 0 {
             return;
         }
-        let now_sys = SystemTime::now();
-        let today = utc_day_for(now_sys);
-        {
-            let mut daily = self.daily_usage.lock();
-            if daily.utc_day != today {
-                daily.utc_day = today;
-                daily.tokens = 0;
-            }
-            daily.tokens = daily.tokens.saturating_add(tokens);
-        }
-        if self.tpm.is_some() {
-            let now = Instant::now();
-            let mut tpm = self.tpm_window.lock();
-            while let Some((ts, _)) = tpm.front() {
-                if now.duration_since(*ts) >= WINDOW {
-                    tpm.pop_front();
-                } else {
-                    break;
-                }
-            }
-            tpm.push_back((now, tokens));
-        }
+        self.settle_tokens(0, tokens);
     }
 
     /// Snapshot current UTC day token consumption.
     pub fn daily_counter(&self) -> DailyTokenCounter {
         let today = utc_day_for(SystemTime::now());
-        let mut daily = self.daily_usage.lock();
-        if daily.utc_day != today {
-            daily.utc_day = today;
-            daily.tokens = 0;
+        let mut state = self.budget_state.lock();
+        if state.daily.utc_day != today {
+            state.daily.utc_day = today;
+            state.daily.tokens = 0;
         }
-        *daily
+        state.daily
     }
 
     fn set_daily_counter_if_today(&self, saved: DailyTokenCounter) {
@@ -302,19 +398,23 @@ impl TokenPolicy {
         if saved.utc_day != today {
             return;
         }
-        let mut daily = self.daily_usage.lock();
-        if daily.utc_day != today {
-            *daily = saved;
+        let mut state = self.budget_state.lock();
+        if state.daily.utc_day != today {
+            state.daily = saved;
         } else {
-            daily.tokens = daily.tokens.max(saved.tokens);
+            state.daily.tokens = state.daily.tokens.max(saved.tokens);
         }
     }
 
     fn check_rate_limit(&self) -> Result<()> {
-        self.check_expiry(SystemTime::now())?;
-        self.check_daily_budget()?;
+        let now_sys = SystemTime::now();
+        self.check_expiry(now_sys)?;
         let now = Instant::now();
-        self.check_tpm(now)?;
+        {
+            let mut state = self.budget_state.lock();
+            let tpm_used = Self::roll_and_prune(&mut state, now_sys, now);
+            self.check_quotas_locked(&state, tpm_used, 0, now_sys, now)?;
+        }
         let Some(rpm) = self.rpm else {
             return Ok(());
         };
@@ -405,6 +505,14 @@ impl Principal {
         match &self.policy {
             Some(policy) => Ok(Arc::new(policy.acquire_concurrency_permit()?)),
             None => Ok(Self::unlimited_permit()),
+        }
+    }
+
+    /// Atomically reserve estimated prompt BPE tokens against daily and TPM budgets.
+    pub fn reserve_tokens(&self, estimated_prompt_tokens: u64) -> Result<TokenBudgetReservation> {
+        match &self.policy {
+            Some(policy) => policy.check_and_reserve_tokens(estimated_prompt_tokens),
+            None => Ok(TokenBudgetReservation::none()),
         }
     }
 
@@ -772,5 +880,35 @@ mod tests {
             .authenticate(&headers("vouch-expired-token"))
             .expect_err("expired");
         assert!(matches!(err, GatewayError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn atomic_pre_execution_reservation_prevents_concurrent_budget_overshoot() {
+        let mut cfg = token_cfg("vouch-reserve-token");
+        cfg.daily_token_budget = Some(100);
+        cfg.tpm = Some(100);
+        let registry = TokenRegistry::new(&[cfg]).expect("registry");
+
+        let p = registry
+            .authenticate(&headers("vouch-reserve-token"))
+            .expect("auth");
+        // First request reserves 70 estimated prompt tokens.
+        let mut res1 = p.reserve_tokens(70).expect("reserve 70");
+        // Concurrent second request asking for 50 projected tokens must be rejected (70 + 50 > 100).
+        let err = p.reserve_tokens(50).expect_err("must prevent overshoot");
+        assert!(matches!(err, GatewayError::DailyTokenBudgetExceeded { .. }));
+
+        // Settle res1 with only 60 actual total tokens; freeing 10 reserved headroom.
+        res1.settle(60);
+        // Now 40 remaining tokens fit cleanly, and dropping unsettled releases reservation.
+        let res2 = p.reserve_tokens(40).expect("reserve 40");
+        drop(res2);
+        // Since res2 dropped unsettled, 40 tokens remain available again.
+        let mut res3 = p.reserve_tokens(40).expect("reserve 40 after drop release");
+        res3.settle(40);
+        assert_eq!(
+            p.policy.as_ref().expect("policy").daily_counter().tokens,
+            100
+        );
     }
 }
