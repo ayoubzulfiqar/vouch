@@ -14,11 +14,13 @@ pub mod ollama;
 pub mod openai;
 pub mod ops;
 pub mod responses;
+pub mod sessions;
 pub mod ui;
 
 use std::{
     collections::BTreeMap,
     convert::Infallible,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -81,6 +83,10 @@ pub(crate) struct DispatchMeta {
     pub cache_outcome: String,
     pub ttft_ms: u64,
     pub flight_snapshot: Option<FlightSnapshot>,
+    pub handoff_from: Option<String>,
+    pub user_turn_text: String,
+    pub tool_path_hints: Vec<String>,
+    pub workspace_root: Option<PathBuf>,
 }
 
 /// Per-request context resolved before dispatch.
@@ -98,6 +104,8 @@ pub(crate) struct RequestContext {
     pub session_key: String,
     /// Requested workspace isolation.
     pub workspace_mode: WorkspaceMode,
+    /// Validated per-request workspace root override (`X-Workspace-Root`), if supplied.
+    pub workspace_root: Option<PathBuf>,
     /// Propagated W3C trace context for spans and upstream headers.
     pub trace_context: TraceContext,
     /// Estimated prompt BPE tokens computed at ingress.
@@ -143,6 +151,20 @@ impl RequestContext {
         if flight_snapshot.is_some() {
             meta.flight_snapshot = flight_snapshot;
         }
+    }
+
+    pub(crate) fn set_handoff(&self, handoff_from: Option<String>) {
+        self.meta.lock().handoff_from = handoff_from;
+    }
+
+    pub(crate) fn handoff_from(&self) -> Option<String> {
+        self.meta.lock().handoff_from.clone()
+    }
+
+    pub(crate) fn set_turn_input(&self, user_turn_text: String, tool_path_hints: Vec<String>) {
+        let mut meta = self.meta.lock();
+        meta.user_turn_text = user_turn_text;
+        meta.tool_path_hints = tool_path_hints;
     }
 
     pub(crate) fn is_coalesced(&self) -> bool {
@@ -307,13 +329,22 @@ impl StreamUsageGuard {
             self.started.elapsed(),
             self.ingress_span.take(),
         );
+        let emitted_tool_calls: Vec<ToolCall> = self.emitted_tool_calls.values().cloned().collect();
+        record_memory_turn(
+            &self.state,
+            &self.context,
+            &self.backend_id,
+            effective,
+            &self.emitted_text,
+            &emitted_tool_calls,
+        );
         if let Some(key) = self.cache_miss_key.take() {
             let cached = Completion {
                 content: self.emitted_text.clone(),
                 finish_reason: finish_reason.to_string(),
                 usage: effective,
                 raw: None,
-                tool_calls: self.emitted_tool_calls.values().cloned().collect(),
+                tool_calls: emitted_tool_calls,
                 thinking: self.emitted_thinking.clone(),
             };
             self.state.cache().store(key, &self.backend_id, &cached);
@@ -440,6 +471,15 @@ pub fn build_router(state: Arc<AppState>) -> AxumRouter {
         .route("/admin/cache", delete(admin::purge_cache))
         .route("/v1/usage", get(ops::usage))
         .route("/v1/traces", get(ops::traces))
+        .route("/v1/sessions", get(sessions::list))
+        .route(
+            "/v1/sessions/{session_id}",
+            get(sessions::get).delete(sessions::delete),
+        )
+        .route(
+            "/v1/sessions/{session_id}/checkpoint",
+            post(sessions::checkpoint),
+        )
         .route("/mcp", post(crate::cli::mcp::http_mcp))
         .route("/ui", get(ui::dashboard))
         .route("/healthz", get(ops::healthz))
@@ -528,6 +568,12 @@ pub(crate) fn prepare_routed_with_key_hint(
         })?,
         None => WorkspaceMode::Auto,
     };
+    let config = state.config();
+    let workspace_root = crate::memory::resolve_workspace_root_header(
+        &config.trace,
+        &config.workspace,
+        header_text(headers, "x-workspace-root"),
+    )?;
     let trace_context = TraceContext::from_headers(headers);
 
     tracing::debug!(
@@ -545,11 +591,15 @@ pub(crate) fn prepare_routed_with_key_hint(
         request_id,
         session_key,
         workspace_mode,
+        workspace_root: workspace_root.clone(),
         trace_context,
         prompt_tokens,
         concurrency_guard,
         reservation: Arc::new(parking_lot::Mutex::new(Some(reservation))),
-        meta: Arc::new(parking_lot::Mutex::new(DispatchMeta::default())),
+        meta: Arc::new(parking_lot::Mutex::new(DispatchMeta {
+            workspace_root,
+            ..DispatchMeta::default()
+        })),
     })
 }
 
@@ -763,6 +813,7 @@ pub(crate) fn execution_request(
         max_tokens,
         workspace_mode: context.workspace_mode,
         workdir: None,
+        workspace_root: context.workspace_root.clone(),
         cancel,
         tools,
         tool_choice,
@@ -787,6 +838,9 @@ pub(crate) async fn execute_or_cached(
     mut request: ExecutionRequest,
 ) -> Result<DispatchedExecution> {
     state.egress_guard().inspect_request(&mut request)?;
+    let user_turn_text = latest_user_text(&request.messages);
+    let tool_path_hints = collect_message_path_hints(&request.messages);
+    context.set_turn_input(user_turn_text, tool_path_hints);
 
     let flight_snapshot = state
         .flight_recorder()
@@ -828,6 +882,7 @@ pub(crate) async fn execute_or_cached(
                 0,
                 flight_snapshot,
             );
+            context.set_handoff(None);
             let response = if request.stream {
                 DriverResponse::Stream(synthesize_stream_from_completion(&cached.completion))
             } else {
@@ -840,6 +895,8 @@ pub(crate) async fn execute_or_cached(
                     fallback_used: false,
                     response,
                     attempts: Vec::new(),
+                    handoff_from: None,
+                    handoff_reason: None,
                 },
                 cache_status,
                 cache_miss_key: None,
@@ -887,6 +944,7 @@ pub(crate) async fn execute_or_cached(
                             0,
                             flight_snapshot,
                         );
+                        context.set_handoff(None);
                         return Ok(DispatchedExecution {
                             routed: RoutedResponse {
                                 backend_id: cached.backend_id,
@@ -894,6 +952,8 @@ pub(crate) async fn execute_or_cached(
                                 fallback_used: false,
                                 response: DriverResponse::Complete(cached.completion),
                                 attempts: Vec::new(),
+                                handoff_from: None,
+                                handoff_reason: None,
                             },
                             cache_status,
                             cache_miss_key: None,
@@ -917,6 +977,7 @@ pub(crate) async fn execute_or_cached(
                         started.elapsed().as_millis() as u64,
                         flight_snapshot,
                     );
+                    context.set_handoff(routed.handoff_from.clone());
                     Ok(DispatchedExecution {
                         routed,
                         cache_status,
@@ -951,6 +1012,7 @@ pub(crate) async fn execute_or_cached(
                         ttft_ms,
                         flight_snapshot,
                     );
+                    context.set_handoff(routed.handoff_from.clone());
                     Ok(DispatchedExecution {
                         routed: RoutedResponse {
                             backend_id: routed.backend_id,
@@ -958,6 +1020,8 @@ pub(crate) async fn execute_or_cached(
                             fallback_used: routed.fallback_used,
                             response: DriverResponse::Complete(completed),
                             attempts: routed.attempts,
+                            handoff_from: routed.handoff_from,
+                            handoff_reason: routed.handoff_reason,
                         },
                         cache_status,
                         cache_miss_key: None,
@@ -981,6 +1045,7 @@ pub(crate) async fn execute_or_cached(
                         started.elapsed().as_millis() as u64,
                         flight_snapshot,
                     );
+                    context.set_handoff(routed.handoff_from.clone());
                     Ok(DispatchedExecution {
                         routed,
                         cache_status,
@@ -1038,6 +1103,133 @@ pub(crate) fn insert_dispatched_headers(
 ) {
     insert_routing_headers(response, backend, fallback, request_id, cache_status);
     insert_coalesced_header(response, coalesced);
+}
+
+/// Attach `X-Vouch-Handoff: true` and `X-Vouch-Handoff-From` when `[shared_memory]`
+/// transitioned execution from a prior backend.
+pub(crate) fn insert_handoff_headers(response: &mut Response, handoff_from: Option<&str>) {
+    if let Some(prev) = handoff_from {
+        insert_header(response, "x-vouch-handoff", "true");
+        insert_header(response, "x-vouch-handoff-from", prev);
+    }
+}
+
+/// Latest user turn plain text, used to record canonical conversation history.
+pub(crate) fn latest_user_text(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.as_plain_text())
+        .unwrap_or_default()
+}
+
+fn collect_json_string_leaves(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => {
+            if !s.is_empty() && s.len() <= 512 {
+                out.push(s.clone());
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_json_string_leaves(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values() {
+                collect_json_string_leaves(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect string hints from message tool calls for sanitized repo path extraction.
+pub(crate) fn collect_message_path_hints(messages: &[ChatMessage]) -> Vec<String> {
+    let mut out = Vec::new();
+    for msg in messages {
+        for call in &msg.tool_calls {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                collect_json_string_leaves(&val, &mut out);
+            } else if !call.arguments.is_empty() {
+                out.push(call.arguments.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Record a completed conversational turn into `[shared_memory]` and asynchronously
+/// checkpoint to `[trace]` when a cross-agent handoff occurred.
+pub(crate) fn record_memory_turn(
+    state: &AppState,
+    context: &RequestContext,
+    backend_id: &str,
+    usage: Usage,
+    assistant_text: &str,
+    tool_calls: &[ToolCall],
+) {
+    let mem_cfg = state.memory().config();
+    if !mem_cfg.enabled {
+        return;
+    }
+    let (user_text, tool_path_hints, workspace_root, profile_id, handoff_from) = {
+        let meta = context.meta.lock();
+        (
+            meta.user_turn_text.clone(),
+            meta.tool_path_hints.clone(),
+            meta.workspace_root.clone(),
+            meta.profile_id.clone(),
+            meta.handoff_from.clone(),
+        )
+    };
+    let tool_summary = if tool_calls.is_empty() {
+        None
+    } else {
+        Some(
+            tool_calls
+                .iter()
+                .map(|call| format!("{}({})", call.name, call.arguments))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    };
+    let mut raw_hints = tool_path_hints;
+    for call in tool_calls {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+            collect_json_string_leaves(&val, &mut raw_hints);
+        } else if !call.arguments.is_empty() {
+            raw_hints.push(call.arguments.clone());
+        }
+    }
+    state
+        .memory()
+        .ledger()
+        .record_turn(crate::memory::RecordTurnInput {
+            session_id: context.session_key.clone(),
+            model: context.model.clone(),
+            backend_id: backend_id.to_string(),
+            profile_id,
+            user_text,
+            assistant_text: assistant_text.to_string(),
+            tool_summary,
+            raw_path_hints: raw_hints,
+            workspace_root: workspace_root.clone(),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+        });
+    if mem_cfg.sync_to_trace && handoff_from.is_some() && state.memory().trace().config().enabled {
+        let ttl = Duration::from_secs(state.config().defaults.session_ttl_secs.max(1));
+        if let Some(entry) = state.memory().ledger().get(&context.session_key, ttl) {
+            let summary = crate::memory::ledger::format_trace_session_summary(&entry);
+            state.memory().trace().record_session_checkpoint_async(
+                workspace_root,
+                summary,
+                entry.touched_files,
+            );
+        }
+    }
 }
 
 /// Parse an RFC-3339-like UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp for current time.
