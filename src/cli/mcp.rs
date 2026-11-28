@@ -343,7 +343,14 @@ pub async fn http_mcp(
         return (StatusCode::BAD_REQUEST, Json(err_reply)).into_response();
     }
     match handle_rpc_with_headers(&state, &principal, Some(&headers), payload).await {
-        Some(reply) => (StatusCode::OK, Json(reply)).into_response(),
+        Some(reply) => {
+            let status = if reply.pointer("/error/code").and_then(Value::as_i64) == Some(-32003) {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(reply)).into_response()
+        }
         None => StatusCode::ACCEPTED.into_response(),
     }
 }
@@ -775,6 +782,16 @@ async fn handle_tool_call(
         .and_then(Value::as_object)
         .ok_or_else(|| (-32602, "tools/call requires object `arguments`".to_string()))?;
 
+    if !principal.allows_mcp_tool(tool_name) {
+        return Err((
+            -32003,
+            format!(
+                "token {:?} is not allowed to invoke MCP tool {tool_name:?}",
+                principal.name
+            ),
+        ));
+    }
+
     if let Some((upstream_id, remote_tool)) = tool_name.split_once("__") {
         let upstream = state
             .config()
@@ -883,6 +900,24 @@ fn handle_task_create(
     params: &Value,
     trace_ctx: TraceContext,
 ) -> std::result::Result<Value, (i32, String)> {
+    let tool_params = params.pointer("/request/params").unwrap_or(params);
+    let requested_tool = tool_params
+        .get("name")
+        .or_else(|| tool_params.get("tool"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("vouch_ask");
+    if !principal.allows_mcp_tool(requested_tool) {
+        return Err((
+            -32003,
+            format!(
+                "token {:?} is not allowed to invoke MCP tool {requested_tool:?}",
+                principal.name
+            ),
+        ));
+    }
+
     let cancel = CancellationToken::new();
     let (request, workspace_mode) =
         prepare_tool_execution(state, principal, params, cancel.clone(), trace_ctx.clone())?;
@@ -1379,15 +1414,8 @@ async fn call_upstream_mcp(
                 ))
             })?;
             let pid = child.id().unwrap_or(0);
-            #[cfg(unix)]
-            let guard = if pid > 0 {
-                Some(crate::driver::ProcessGroupGuard::new(
-                    pid,
-                    upstream.id.clone(),
-                ))
-            } else {
-                None
-            };
+            let guard =
+                (pid > 0).then(|| crate::driver::ProcessGroupGuard::new(pid, upstream.id.clone()));
 
             let req_future = async {
                 let mut stdin = child
@@ -1460,8 +1488,17 @@ fn extract_rpc_result(upstream_id: &str, response: Value) -> Result<Value> {
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("unknown MCP error");
+        let detail = match error.get("data") {
+            Some(Value::String(data)) if !data.trim().is_empty() => {
+                format!(" ({})", telemetry::redact_text(data))
+            }
+            Some(data) if !data.is_null() => {
+                format!(" ({})", telemetry::redact_text(&data.to_string()))
+            }
+            _ => String::new(),
+        };
         return Err(GatewayError::Upstream(format!(
-            "mcp_upstream {upstream_id:?} returned error: {}",
+            "mcp_upstream {upstream_id:?} returned error: {}{detail}",
             telemetry::redact_text(msg)
         )));
     }
