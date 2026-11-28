@@ -84,6 +84,19 @@ impl CompiledRespondRule {
     }
 }
 
+/// True when an I/O read error on a PTY primary fd represents normal child-close EOF (`EIO` on Linux/macOS/BSD).
+pub fn is_pty_eof_error(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(nix::errno::Errno::EIO as i32)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 struct SpawnedPty {
     data: mpsc::Receiver<Result<Vec<u8>>>,
     exit: oneshot::Receiver<PtyExit>,
@@ -136,9 +149,13 @@ impl PtyRunnerDriver {
         })?;
         let (full_prompt, attachments) =
             materialize_prompt_with_config(request, &self.attachments).await?;
-        let spill = if !self.config.stdin
-            && full_prompt.len() > self.config.max_inline_prompt_bytes.max(1)
-        {
+        let spill = if crate::driver::cli_pipe::should_spill_prompt_to_file(
+            self.config.stdin,
+            full_prompt.len(),
+            self.config.max_inline_prompt_bytes,
+            cfg!(windows),
+            &command,
+        ) {
             Some(PromptSpillFile::create(&full_prompt)?)
         } else {
             None
@@ -323,6 +340,9 @@ impl PtyRunnerDriver {
                         }
                     }
                     Err(error) => {
+                        if is_pty_eof_error(&error) {
+                            break;
+                        }
                         let _ = data_sender
                             .blocking_send(Err(io_error("cannot read pty output", error)));
                         guard.terminate();
@@ -389,6 +409,7 @@ impl PtyRunnerDriver {
             spill: _spill,
         } = self.spawn_session(request).await?;
 
+        tokio::pin!(exit);
         let collect: Result<(Vec<u8>, PtyExit)> = async {
             let mut raw = Vec::new();
             let total_deadline = tokio::time::Instant::now() + timeout;
@@ -431,7 +452,7 @@ impl PtyRunnerDriver {
             let exit = tokio::select! {
                 _ = request.cancel.cancelled() => return Err(GatewayError::ClientDisconnected),
                 _ = tokio::time::sleep_until(total_deadline) => return Err(GatewayError::Timeout(timeout)),
-                res = exit => res.map_err(|_| GatewayError::Upstream("pty exit channel closed".into()))?,
+                res = &mut exit => res.map_err(|_| GatewayError::Upstream("pty exit channel closed".into()))?,
             };
             Ok((raw, exit))
         }
@@ -466,6 +487,8 @@ impl PtyRunnerDriver {
             }
             Err(error) => {
                 guard.terminate();
+                drop(data);
+                let _ = tokio::time::timeout(Duration::from_secs(2), &mut exit).await;
                 metrics::record_child_exit(&self.config.id, "killed");
                 Err(error)
             }
@@ -516,6 +539,7 @@ impl PtyRunnerDriver {
             let mut json_buffer = String::new();
             let mut line_buffer = String::new();
             let mut produced = String::new();
+            tokio::pin!(exit);
 
             loop {
                 let effective_deadline = match idle_timeout {
@@ -525,6 +549,8 @@ impl PtyRunnerDriver {
                 let item = tokio::select! {
                     _ = cancel.cancelled() => {
                         guard.terminate();
+                        drop(data);
+                        let _ = tokio::time::timeout(Duration::from_secs(2), &mut exit).await;
                         let _ = sender.send(Err(GatewayError::ClientDisconnected)).await;
                         return;
                     }
@@ -535,6 +561,8 @@ impl PtyRunnerDriver {
                             idle_timeout.unwrap_or(timeout)
                         };
                         guard.terminate();
+                        drop(data);
+                        let _ = tokio::time::timeout(Duration::from_secs(2), &mut exit).await;
                         metrics::record_child_exit(&backend, "killed");
                         let _ = sender.send(Err(GatewayError::Timeout(fired))).await;
                         return;
@@ -548,6 +576,8 @@ impl PtyRunnerDriver {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         guard.terminate();
+                        drop(data);
+                        let _ = tokio::time::timeout(Duration::from_secs(2), &mut exit).await;
                         let _ = sender.send(Err(error)).await;
                         return;
                     }
@@ -562,6 +592,8 @@ impl PtyRunnerDriver {
                 }
                 if produced.len() + stripped.len() > MAX_OUTPUT_BYTES {
                     guard.terminate();
+                    drop(data);
+                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut exit).await;
                     let _ = sender
                         .send(Err(GatewayError::Upstream(format!(
                             "backend {backend} exceeded the {MAX_OUTPUT_BYTES} byte output limit"
@@ -574,9 +606,22 @@ impl PtyRunnerDriver {
                     OutputMode::Text => {
                         let filtered = out_filter.push(&stripped);
                         if !filtered.is_empty() {
-                            let chunks = filter.push(&filtered);
+                            let chunks = match filter.push(&filtered) {
+                                Ok(chunks) => chunks,
+                                Err(error) => {
+                                    guard.terminate();
+                                    drop(data);
+                                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut exit)
+                                        .await;
+                                    let _ = sender.send(Err(error)).await;
+                                    return;
+                                }
+                            };
                             if !dispatch_stream_chunks(&sender, chunks).await {
                                 guard.terminate();
+                                drop(data);
+                                let _ =
+                                    tokio::time::timeout(Duration::from_secs(2), &mut exit).await;
                                 return;
                             }
                         }
@@ -584,6 +629,18 @@ impl PtyRunnerDriver {
                     OutputMode::Json => json_buffer.push_str(&stripped),
                     OutputMode::JsonLines => {
                         line_buffer.push_str(&stripped);
+                        let max_line = crate::driver::cli_pipe::MAX_LINE_BUFFER_BYTES;
+                        if line_buffer.split('\n').any(|seg| seg.len() > max_line) {
+                            guard.terminate();
+                            drop(data);
+                            let _ = tokio::time::timeout(Duration::from_secs(2), &mut exit).await;
+                            let _ = sender
+                                .send(Err(GatewayError::ProcessFailure(format!(
+                                    "backend {backend} exceeded {max_line} byte single-line limit"
+                                ))))
+                                .await;
+                            return;
+                        }
                         while let Some(position) = line_buffer.find('\n') {
                             let line: String = line_buffer.drain(..=position).collect();
                             let line = line.trim_end_matches(['\n', '\r']);
@@ -596,6 +653,9 @@ impl PtyRunnerDriver {
                                 && sender.send(Ok(StreamChunk::delta(delta))).await.is_err()
                             {
                                 guard.terminate();
+                                drop(data);
+                                let _ =
+                                    tokio::time::timeout(Duration::from_secs(2), &mut exit).await;
                                 return;
                             }
                         }
@@ -621,9 +681,20 @@ impl PtyRunnerDriver {
             if output_mode == OutputMode::Text {
                 tail_combined.push_str(&out_filter.finish());
                 if !tail_combined.is_empty() {
-                    let chunks = filter.push(&tail_combined);
+                    let chunks = match filter.push(&tail_combined) {
+                        Ok(chunks) => chunks,
+                        Err(error) => {
+                            guard.terminate();
+                            drop(data);
+                            let _ = tokio::time::timeout(Duration::from_secs(2), &mut exit).await;
+                            let _ = sender.send(Err(error)).await;
+                            return;
+                        }
+                    };
                     if !dispatch_stream_chunks(&sender, chunks).await {
                         guard.terminate();
+                        drop(data);
+                        let _ = tokio::time::timeout(Duration::from_secs(2), &mut exit).await;
                         return;
                     }
                 }
@@ -632,16 +703,20 @@ impl PtyRunnerDriver {
             let exit = tokio::select! {
                 _ = cancel.cancelled() => {
                     guard.terminate();
+                    drop(data);
+                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut exit).await;
                     let _ = sender.send(Err(GatewayError::ClientDisconnected)).await;
                     return;
                 }
                 _ = tokio::time::sleep_until(total_deadline) => {
                     guard.terminate();
+                    drop(data);
+                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut exit).await;
                     metrics::record_child_exit(&backend, "killed");
                     let _ = sender.send(Err(GatewayError::Timeout(timeout))).await;
                     return;
                 }
-                res = exit => res.map_err(|_| GatewayError::Upstream("pty exit channel closed".into())),
+                res = &mut exit => res.map_err(|_| GatewayError::Upstream("pty exit channel closed".into())),
             };
             let exit = match exit {
                 Ok(exit) => exit,
