@@ -2,6 +2,36 @@
 
 All notable changes to `vouch` are documented in this file.
 
+## [4.0.0] - 2026-11-27
+
+### Added
+- **Speculative Hedged Routing & EWMA Latency Scheduling (`[route_policies.<model>]`, `src/router/mod.rs`):**
+  - Added `strategy = "ordered" | "least_latency" | "hedged"` and `hedge_delay_ms` (default `2500`).
+  - `least_latency` dynamically ranks healthy backends using per-backend EWMA Time-To-First-Token measurements (`alpha = 0.3`).
+  - `hedged` speculatively dispatches the backup candidate after `hedge_delay_ms` if the primary has not returned content, cancels/reaps the slower loser via its PGID without faulting its circuit breaker, and exports `vouch_hedged_wins_total{winner,loser}`.
+- **Deterministic SHA-256 Response Cache (`[cache]`, `src/cache.rs`):**
+  - Added `ResponseCache` with `enabled` (default `false`), `max_entries` (default `1000`), `ttl_secs` (default `3600`), `max_temperature` (default `0.2`), and optional `state_dir` snapshot `persist` (`false`).
+  - Keys normalized `(route, system, messages, tools, response_format, temperature, max_tokens)`, bypasses on `Cache-Control: no-cache` / `no-store`, high temperature, or git worktree isolation, replays buffered or synthesized SSE/NDJSON streams cleanly (`X-Vouch-Cache: HIT|MISS|BYPASS`), and emits `vouch_cache_requests_total{outcome}`.
+- **Google Gemini & Ollama Ingress Compatibility (`src/ingress/gemini.rs`, `src/ingress/ollama.rs`):**
+  - Added `POST /v1beta/models/{model}:generateContent` and `:streamGenerateContent` (supporting `?alt=sse`, chunked JSON arrays, `x-goog-api-key`, `?key=`, `systemInstruction`, `inlineData`, `functionCall`/`functionResponse`, and `generationConfig`).
+  - Added `GET /api/tags`, `POST /api/chat`, and `POST /api/generate` with NDJSON streaming (`stream: true` default), `images`, `format`, `options`, and `tools`.
+- **Multi-Profile Credential Rotation (`[[backends.profiles]]`):**
+  - Supports multiple credential profiles (`id`, `env`, `weight`) per `cli`/`pty` backend with weighted round-robin, sticky session profile affinity, `VOUCH_PROFILE_ID` / `{profile_id}` injection, and independent per-profile circuit breakers failing over cleanly on `429`/auth expiry before tripping the parent backend.
+- **Per-Token TPM, Expiry, Concurrency Caps, Backend Allowlists & Pricing (`[pricing.<id>]`):**
+  - Added `tpm`, `max_concurrent` (`TokenConcurrencyGuard`), `expires_at` (RFC-3339), `allowed_backends`, and `admin` on `[[tokens]]`.
+  - Added `[pricing.<route_or_backend>]` (`input_per_1m_usd`, `output_per_1m_usd`) computing cumulative `total_cost_usd` in `GET /v1/usage`, `vouch stats`, and `vouch top [--token]`.
+- **Opt-In Runtime Admin Plane (`server.enable_admin`, `src/ingress/admin.rs`):**
+  - Added `POST /admin/reload`, `POST /admin/circuits/{backend}/reset`, and `DELETE /admin/cache` gated behind `server.enable_admin` and restricted to `admin = true` tokens (or loopback TCP / Unix sockets when tokens are disabled).
+- **MCP Resources, Prompts & Upstream Aggregation (`src/cli/mcp.rs`):**
+  - Added `resources/list` + `resources/read` (`vouch://health`, `vouch://routes`, `vouch://usage`), configurable `prompts/list` + `prompts/get` (`[[mcp_prompts]]`), and `[[mcp_upstreams]]` (`stdio`/`http`) tool discovery & proxying under `<upstream>__<tool>`.
+
+### Fixed
+- **Stream-Drop Token Accounting Guard (`StreamUsageGuard`):** Wrapped every OpenAI, Anthropic, Responses (HTTP + WS), Gemini, and Ollama stream in an RAII `Drop` guard so mid-stream client disconnects and stream timeouts count emitted tokens with `tiktoken` and debit `UsageTracker`, UTC daily budgets, and 60 s TPM windows exactly once.
+- **Extended JSON Schema Validation & Auto-Repair Retries:** Validates nested `type` (single/union), `required`, `properties`, `enum`, `items`, and `additionalProperties`; added `defaults.schema_repair_retries` (`0..=2`, default `0`) for automated CLI/PTY validation feedback retries.
+- **Parallel Multi-Tool Call Streaming:** Verified `StreamingToolParser` streams back-to-back, chunk-split, and array `<vouch_tool_call>` blocks with distinct `call_...` IDs and sequential indices (`0`, `1`, ...).
+- **Advisory File Locking & Crash-Safe `state_dir` Writes:** Serialized snapshot reads/writes via `gateway_state.lock` (`lock_shared` / exclusive `lock`) alongside `File::sync_all` + parent directory `sync_all`.
+- **Hardened Secret & Multimodal Payload Redaction:** Scrubs `vouch_live_` keys, credentials inside JSON-escaped quotes (`\"...\"`), and truncates `data:image/<subtype>;base64,<payload>` blobs to `[REDACTED_BYTES]`.
+
 ## [3.0.0] - 2026-11-27
 
 ### Added
