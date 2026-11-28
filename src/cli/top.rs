@@ -36,6 +36,10 @@ struct HealthzPayload {
     backends: usize,
     tokens_enforced: bool,
     workspace_enabled: bool,
+    #[serde(default)]
+    shared_sessions: usize,
+    #[serde(default)]
+    handoffs_total: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -77,6 +81,8 @@ pub struct MetricsSnapshot {
     pub hedged_wins_total: u64,
     /// Total deterministic response cache hits.
     pub cache_hits_total: u64,
+    /// Total cross-agent shared memory handoffs.
+    pub handoffs_total: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -314,9 +320,11 @@ fn render_dashboard(frame: &mut Frame<'_>, data: &DashboardData) {
                     )),
                 ]),
                 Line::from(format!(
-                    " routes={}  backends={}  tokens={}  worktree={}  cost=${:.4}   [q / Ctrl+C to quit]",
+                    " routes={}  backends={}  sessions={}  handoffs={}  tokens={}  worktree={}  cost=${:.4}   [q / Ctrl+C to quit]",
                     health.models,
                     health.backends,
+                    health.shared_sessions,
+                    health.handoffs_total,
                     token_badge,
                     ws_badge,
                     data.total_cost_usd.unwrap_or(0.0)
@@ -462,8 +470,9 @@ fn render_dashboard(frame: &mut Frame<'_>, data: &DashboardData) {
     let footer_lines = vec![
         Line::from(format!(" Requests: {req_summary}")),
         Line::from(format!(
-            " Fallbacks: {}   Token rate limits: {}   Hedged wins: {}   Cache hits: {}",
+            " Fallbacks: {}   Handoffs: {}   Rate limits: {}   Hedged wins: {}   Cache hits: {}",
             data.metrics.fallbacks_total,
+            data.metrics.handoffs_total,
             data.metrics.rate_limited_total,
             data.metrics.hedged_wins_total,
             data.metrics.cache_hits_total
@@ -531,6 +540,9 @@ pub fn parse_metrics_snapshot(text: &str) -> MetricsSnapshot {
             }
             "vouch_hedged_wins_total" => {
                 snap.hedged_wins_total = snap.hedged_wins_total.saturating_add(value);
+            }
+            "vouch_handoffs_total" => {
+                snap.handoffs_total = snap.handoffs_total.saturating_add(value);
             }
             "vouch_cache_requests_total"
                 if labels.get("outcome").map(String::as_str) == Some("hit") =>
