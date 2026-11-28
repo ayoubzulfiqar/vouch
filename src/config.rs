@@ -71,6 +71,12 @@ pub struct GatewayConfig {
     /// Optional OpenTelemetry OTLP/HTTP trace export configuration.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// Outbound security controls (`[security]`).
+    #[serde(default)]
+    pub security: SecurityConfig,
+    /// Opt-in redacted JSONL flight recorder (`[flight_recorder]`).
+    #[serde(default)]
+    pub flight_recorder: FlightRecorderConfig,
     /// Optional virtual ingress tokens.
     #[serde(default)]
     pub tokens: Vec<TokenConfig>,
@@ -92,6 +98,10 @@ pub struct ServerConfig {
     /// Maximum lifetime of a single streaming response.
     #[serde(default = "default_stream_timeout_secs")]
     pub stream_timeout_secs: u64,
+    /// Maximum time `vouch serve` waits for in-flight connections to drain on
+    /// `SIGINT`/`SIGTERM` before forcibly cancelling active tasks. Default: `15`.
+    #[serde(default = "default_shutdown_drain_secs")]
+    pub shutdown_drain_secs: u64,
     /// Interval between SSE keep-alive comments. Zero disables keep-alives.
     #[serde(default = "default_keep_alive_secs")]
     pub keep_alive_interval_secs: u64,
@@ -185,6 +195,20 @@ pub struct CacheConfig {
     /// Persist cache entries into `defaults.state_dir` when set. Default: `false`.
     #[serde(default)]
     pub persist: bool,
+    /// Deduplicate concurrent identical deterministic non-streaming requests via
+    /// in-flight singleflight coalescing. Defaults to `true` when `cache.enabled = true`.
+    #[serde(default)]
+    pub coalesce_inflight: Option<bool>,
+    /// Collapse consecutive whitespace in prompt text before hashing cache/singleflight keys.
+    #[serde(default)]
+    pub normalize_whitespace: bool,
+}
+
+impl CacheConfig {
+    /// Whether in-flight singleflight coalescing is enabled.
+    pub fn coalesce_enabled(&self) -> bool {
+        self.coalesce_inflight.unwrap_or(self.enabled)
+    }
 }
 
 /// USD pricing per million tokens for `[pricing.<route_or_backend>]`.
@@ -483,6 +507,73 @@ pub struct BackendConfig {
     /// Optional per-profile credential/environment rotation pool for `cli`/`pty` backends.
     #[serde(default)]
     pub profiles: Vec<BackendProfileConfig>,
+    /// Regex output filters applied to `cli`/`pty` output before yielding downstream.
+    #[serde(default)]
+    pub output_filters: Vec<OutputFilterConfig>,
+}
+
+/// Regex replacement rule applied to `cli`/`pty` backend text output (`[[backends.output_filters]]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputFilterConfig {
+    /// Regular expression pattern matched against backend output.
+    pub pattern: String,
+    /// Replacement string (`regex::Regex::replace_all` syntax). Default: `""`.
+    #[serde(default)]
+    pub replace: String,
+}
+
+/// Action taken when the outbound egress guardrail detects a secret or credential.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressGuardMode {
+    /// Disable outbound egress secret inspection.
+    #[default]
+    Off,
+    /// Replace detected secret patterns with `[REDACTED_EGRESS_SECRET]` before dispatching.
+    Redact,
+    /// Reject matching requests with HTTP `403` (`egress_policy_blocked`) before dispatching.
+    Block,
+}
+
+/// Outbound security controls (`[security]`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// Outbound prompt/message secret & credential scanner (`[security.egress_guard]`).
+    #[serde(default)]
+    pub egress_guard: EgressGuardConfig,
+}
+
+/// Outbound secret/PII egress guardrail settings (`[security.egress_guard]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressGuardConfig {
+    /// Enforcement mode (`off`, `redact`, or `block`). Default: `"off"`.
+    #[serde(default)]
+    pub mode: EgressGuardMode,
+    /// Enable built-in detectors for PEM private keys, AWS `AKIA`, GitHub tokens, and Stripe live keys. Default: `true`.
+    #[serde(default = "default_true")]
+    pub block_private_keys: bool,
+    /// Additional custom regular expressions flagged as egress secrets.
+    #[serde(default)]
+    pub extra_patterns: Vec<String>,
+}
+
+/// Opt-in redacted JSONL flight recorder settings (`[flight_recorder]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlightRecorderConfig {
+    /// Enable asynchronous redacted JSONL flight recording. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum records retained in the flight log file (rotates/truncates oldest entries when exceeded). Default: `500`.
+    #[serde(default = "default_flight_recorder_max_records")]
+    pub max_records: usize,
+    /// Custom JSONL path. Defaults to `<defaults.state_dir>/flight.jsonl` when `state_dir` is configured,
+    /// or `std::env::temp_dir().join("vouch-flight.jsonl")`.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
 }
 
 /// One credential profile in a `cli` or `pty` backend rotation pool.
@@ -1027,14 +1118,32 @@ impl GatewayConfig {
                 )));
             }
         }
-        for header_name in self.telemetry.otlp_headers.keys() {
-            if header_name.trim().is_empty()
-                || axum::http::header::HeaderName::from_bytes(header_name.as_bytes()).is_err()
+        for header_name in &self.telemetry.otlp_headers {
+            if header_name.0.trim().is_empty()
+                || axum::http::header::HeaderName::from_bytes(header_name.0.as_bytes()).is_err()
             {
                 return Err(GatewayError::Config(format!(
-                    "telemetry.otlp_headers contains invalid header name {header_name:?}"
+                    "telemetry.otlp_headers contains invalid header name {:?}",
+                    header_name.0
                 )));
             }
+        }
+        for pattern in &self.security.egress_guard.extra_patterns {
+            if pattern.is_empty() {
+                return Err(GatewayError::Config(
+                    "security.egress_guard.extra_patterns must not contain empty patterns".into(),
+                ));
+            }
+            regex::Regex::new(pattern).map_err(|error| {
+                GatewayError::Config(format!(
+                    "security.egress_guard.extra_patterns invalid regex {pattern:?}: {error}"
+                ))
+            })?;
+        }
+        if self.flight_recorder.max_records == 0 {
+            return Err(GatewayError::Config(
+                "flight_recorder.max_records must be greater than zero".into(),
+            ));
         }
 
         Ok(())
@@ -1312,6 +1421,20 @@ impl BackendConfig {
                 ))
             })?;
         }
+        for filter in &self.output_filters {
+            if filter.pattern.is_empty() {
+                return Err(GatewayError::Config(format!(
+                    "backend {:?}: output_filters.pattern must not be empty",
+                    self.id
+                )));
+            }
+            regex::Regex::new(&filter.pattern).map_err(|error| {
+                GatewayError::Config(format!(
+                    "backend {:?}: invalid output_filters regex {:?}: {error}",
+                    self.id, filter.pattern
+                ))
+            })?;
+        }
         if !self.profiles.is_empty() {
             if self.kind == BackendKind::Http {
                 return Err(GatewayError::Config(format!(
@@ -1557,6 +1680,12 @@ fn default_profile_weight() -> u32 {
 fn default_mcp_upstream_timeout_secs() -> u64 {
     30
 }
+fn default_shutdown_drain_secs() -> u64 {
+    15
+}
+fn default_flight_recorder_max_records() -> usize {
+    500
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -1565,6 +1694,7 @@ impl Default for ServerConfig {
             unix_socket: None,
             request_timeout_secs: default_request_timeout_secs(),
             stream_timeout_secs: default_stream_timeout_secs(),
+            shutdown_drain_secs: default_shutdown_drain_secs(),
             keep_alive_interval_secs: default_keep_alive_secs(),
             max_body_bytes: default_max_body_bytes(),
             log_level: default_log_level(),
@@ -1606,6 +1736,28 @@ impl Default for CacheConfig {
             ttl_secs: default_cache_ttl_secs(),
             max_temperature: default_cache_max_temperature(),
             persist: false,
+            coalesce_inflight: None,
+            normalize_whitespace: false,
+        }
+    }
+}
+
+impl Default for EgressGuardConfig {
+    fn default() -> Self {
+        Self {
+            mode: EgressGuardMode::Off,
+            block_private_keys: true,
+            extra_patterns: Vec::new(),
+        }
+    }
+}
+
+impl Default for FlightRecorderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_records: default_flight_recorder_max_records(),
+            path: None,
         }
     }
 }
