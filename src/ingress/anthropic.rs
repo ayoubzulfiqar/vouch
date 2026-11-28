@@ -27,9 +27,9 @@ use crate::{
     error::{GatewayError, Result},
     ingress::{
         CancelOnDrop, StreamUsageGuard, completion, execute_or_cached, execution_request,
-        insert_dispatched_headers, insert_routing_headers, into_chunk_stream, parse_json_content,
-        prepare_routed, record_completion_outcome, record_error_outcome, sse_response,
-        start_ingress_span,
+        insert_dispatched_headers, insert_handoff_headers, insert_routing_headers,
+        into_chunk_stream, parse_json_content, prepare_routed, record_completion_outcome,
+        record_error_outcome, record_memory_turn, sse_response, start_ingress_span,
     },
     state::AppState,
 };
@@ -174,6 +174,7 @@ async fn messages_inner(
         let mut chunks = into_chunk_stream(driver_response);
         let model = context.model.clone();
         let request_id = context.request_id.clone();
+        let handoff_from = context.handoff_from();
         let stream_cancel = cancel.clone();
         let stream_backend = backend.clone();
         let mut usage_guard = StreamUsageGuard::new(
@@ -508,9 +509,11 @@ async fn messages_inner(
 
         let mut response = sse_response(stream, keep_alive);
         insert_routing_headers(&mut response, &backend, fallback, &request_id, cache_status);
+        insert_handoff_headers(&mut response, handoff_from.as_deref());
         return Ok(response);
     }
 
+    let handoff_from = context.handoff_from();
     let completion = match completion(driver_response).await {
         Ok(c) => {
             record_completion_outcome(
@@ -521,6 +524,14 @@ async fn messages_inner(
                 c.usage,
                 started.elapsed(),
                 Some(ingress_span),
+            );
+            record_memory_turn(
+                &state,
+                &context,
+                &backend,
+                c.usage,
+                &c.content,
+                &c.tool_calls,
             );
             if let Some(key) = cache_miss_key {
                 state.cache().store(key, &backend, &c);
@@ -603,6 +614,7 @@ async fn messages_inner(
         cache_status,
         coalesced,
     );
+    insert_handoff_headers(&mut response, handoff_from.as_deref());
     Ok(response)
 }
 
