@@ -26,6 +26,8 @@ pub async fn healthz(State(state): State<Arc<AppState>>) -> Response {
         "backends": state.router().backends().len(),
         "tokens_enforced": state.tokens().enabled(),
         "workspace_enabled": config.workspace.enabled,
+        "shared_sessions": state.memory().ledger().len(),
+        "handoffs_total": state.memory().ledger().total_handoffs(),
     }))
     .into_response()
 }
