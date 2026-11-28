@@ -1753,7 +1753,11 @@ impl Router {
                             s.finish_err("cancelled (hedged race lost)");
                         }
                         tokio::spawn(async move {
-                            let _ = tokio::time::timeout(Duration::from_secs(3), h2).await;
+                            if let Ok(Ok((Ok(loser_response), _))) =
+                                tokio::time::timeout(Duration::from_secs(5), h2).await
+                            {
+                                drop(loser_response);
+                            }
                         });
                         metrics::record_hedged_win(&c1.config.id, &c2.config.id);
                     }
@@ -1782,7 +1786,11 @@ impl Router {
                             s.finish_err("cancelled (hedged race lost)");
                         }
                         tokio::spawn(async move {
-                            let _ = tokio::time::timeout(Duration::from_secs(3), h1).await;
+                            if let Ok(Ok((Ok(loser_response), _))) =
+                                tokio::time::timeout(Duration::from_secs(5), h1).await
+                            {
+                                drop(loser_response);
+                            }
                         });
                         metrics::record_hedged_win(&c2.config.id, &c1.config.id);
                     }
