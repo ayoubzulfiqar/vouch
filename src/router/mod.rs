@@ -534,11 +534,27 @@ pub struct ReadinessReport {
 pub struct RoutedResponse {
     /// Backend that accepted the request.
     pub backend_id: String,
+    /// Credential profile selected for the winning execution, if any.
+    pub profile_id: Option<String>,
     /// True when an earlier candidate was skipped or failed.
     pub fallback_used: bool,
     /// Driver response.
     pub response: DriverResponse,
     /// Human-readable attempt log.
+    pub attempts: Vec<String>,
+}
+
+/// Result of a routed `POST /v1/embeddings` execution.
+pub struct RoutedEmbeddings {
+    /// Backend that produced the embeddings.
+    pub backend_id: String,
+    /// Credential profile used, if any.
+    pub profile_id: Option<String>,
+    /// True when an earlier candidate failed or was skipped.
+    pub fallback_used: bool,
+    /// Embedding vectors and usage.
+    pub result: crate::driver::EmbeddingResult,
+    /// Human-readable attempt summary.
     pub attempts: Vec<String>,
 }
 
@@ -1289,6 +1305,7 @@ impl Router {
                     }
                     return Ok(CandidateOutcome {
                         backend: backend.clone(),
+                        profile_id: slot.id.clone(),
                         response,
                         capture,
                         exec_span,
@@ -1504,6 +1521,7 @@ impl Router {
                 }
                 return Ok(Some(CandidateOutcome {
                     backend: c1,
+                    profile_id: slot1.id.clone(),
                     response,
                     capture: capture1,
                     exec_span: exec_span1,
@@ -1576,8 +1594,16 @@ impl Router {
                         self.record_ttft(&c1.config.id, elapsed);
                         slot1.breaker.record_success();
                         c1.breaker.record_success();
+                        if let Some(pid) = &slot1.id {
+                            self.sessions.set_profile(
+                                &base_request.session_key,
+                                &c1.config.id,
+                                pid,
+                            );
+                        }
                         return Ok(Some(CandidateOutcome {
                             backend: c1,
+                            profile_id: slot1.id.clone(),
                             response,
                             capture: capture1,
                             exec_span: exec_span1,
@@ -1622,8 +1648,16 @@ impl Router {
                         self.record_ttft(&c1.config.id, elapsed);
                         slot1.breaker.record_success();
                         c1.breaker.record_success();
+                        if let Some(pid) = &slot1.id {
+                            self.sessions.set_profile(
+                                &base_request.session_key,
+                                &c1.config.id,
+                                pid,
+                            );
+                        }
                         return Ok(Some(CandidateOutcome {
                             backend: c1,
+                            profile_id: slot1.id.clone(),
                             response,
                             capture: capture1,
                             exec_span: exec_span1,
@@ -1635,7 +1669,7 @@ impl Router {
                             span.finish_err(&e.to_string());
                         }
                         record_candidate_failure(&c1, Some(&slot1), &e, attempts);
-                        *previous_backend = Some(c2.config.id.clone());
+                        *previous_backend = Some(c1.config.id.clone());
                         *last_error = Some(e);
                         return Ok(None);
                     }
@@ -1643,7 +1677,7 @@ impl Router {
                         if let Some(span) = exec_span1 {
                             span.finish_err(&e.to_string());
                         }
-                        *previous_backend = Some(c2.config.id.clone());
+                        *previous_backend = Some(c1.config.id.clone());
                         *last_error =
                             Some(GatewayError::Internal(format!("hedged task panicked: {e}")));
                         return Ok(None);
@@ -1725,6 +1759,7 @@ impl Router {
                     }
                     return Ok(Some(CandidateOutcome {
                         backend: c1,
+                        profile_id: slot1.id.clone(),
                         response,
                         capture: capture1,
                         exec_span: span1.take(),
@@ -1753,6 +1788,7 @@ impl Router {
                     }
                     return Ok(Some(CandidateOutcome {
                         backend: c2,
+                        profile_id: slot2.id.clone(),
                         response,
                         capture: capture2,
                         exec_span: span2.take(),
@@ -1811,15 +1847,22 @@ impl Router {
         dispatch_span: Option<ActiveSpan>,
     ) -> RoutedResponse {
         let backend_id = outcome.backend.config.id.clone();
+        let profile_id = outcome.profile_id;
         let fallback_used = outcome.fallback_used;
         let mut exec_span = outcome.exec_span;
         let mut dispatch_span = dispatch_span;
         if let Some(span) = &mut exec_span {
             span.set_bool("vouch.fallback", fallback_used);
+            if let Some(pid) = &profile_id {
+                span.set_str("vouch.profile", pid);
+            }
         }
         if let Some(span) = &mut dispatch_span {
             span.set_str("vouch.backend", &backend_id);
             span.set_bool("vouch.fallback", fallback_used);
+            if let Some(pid) = &profile_id {
+                span.set_str("vouch.profile", pid);
+            }
         }
 
         let final_response = match outcome.response {
@@ -1867,10 +1910,92 @@ impl Router {
         }
         RoutedResponse {
             backend_id,
+            profile_id,
             fallback_used,
             response: final_response,
             attempts,
         }
+    }
+
+    /// Execute an embeddings request across the resolved candidate chain with
+    /// circuit-breaker awareness and fallback.
+    pub async fn execute_embeddings(
+        &self,
+        model: &str,
+        allowed_backends: Option<&[String]>,
+        request: crate::driver::EmbeddingRequest,
+    ) -> Result<RoutedEmbeddings> {
+        let table = self.table.load_full();
+        let entry = table
+            .routes
+            .get(model)
+            .ok_or_else(|| GatewayError::NotFound(format!("unknown model route {model:?}")))?;
+        let candidates: Vec<Arc<BackendHandle>> = if let Some(allowed) = allowed_backends {
+            let compiled = crate::config::ModelAllowlist::compile(allowed)?;
+            entry
+                .iter()
+                .filter(|b| compiled.matches(&b.config.id))
+                .cloned()
+                .collect()
+        } else {
+            entry.clone()
+        };
+        if candidates.is_empty() {
+            return Err(GatewayError::Forbidden(format!(
+                "token is not allowed to access any backend for model {model:?}"
+            )));
+        }
+
+        let mut attempts = Vec::new();
+        let mut last_error: Option<GatewayError> = None;
+        let mut fallback_used = false;
+        let mut previous_backend: Option<String> = None;
+
+        for (index, backend) in candidates.iter().enumerate() {
+            if !backend.breaker.allow_request() {
+                attempts.push(format!(
+                    "{}: circuit {}",
+                    backend.config.id,
+                    backend.breaker.state().as_str()
+                ));
+                fallback_used = true;
+                continue;
+            }
+            let started = Instant::now();
+            match backend.driver.embed(request.clone()).await {
+                Ok(result) => {
+                    self.record_ttft(&backend.config.id, started.elapsed());
+                    backend.breaker.record_success();
+                    if let Some(prev) = previous_backend.as_deref() {
+                        metrics::record_fallback(prev, &backend.config.id);
+                    }
+                    return Ok(RoutedEmbeddings {
+                        backend_id: backend.config.id.clone(),
+                        profile_id: None,
+                        fallback_used: fallback_used || index > 0,
+                        result,
+                        attempts,
+                    });
+                }
+                Err(error) => {
+                    record_candidate_failure(backend, None, &error, &mut attempts);
+                    let retryable = error.is_retryable();
+                    last_error = Some(error);
+                    if !retryable {
+                        break;
+                    }
+                    previous_backend = Some(backend.config.id.clone());
+                    fallback_used = true;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            GatewayError::NoHealthyBackend(format!(
+                "all backends for embeddings model {model:?} failed ({})",
+                attempts.join("; ")
+            ))
+        }))
     }
 
     /// Default model, when configured or unambiguous.
@@ -1966,6 +2091,7 @@ struct ProfileSlot {
 
 struct CandidateOutcome {
     backend: Arc<BackendHandle>,
+    profile_id: Option<String>,
     response: DriverResponse,
     capture: Arc<parking_lot::Mutex<Option<String>>>,
     exec_span: Option<ActiveSpan>,
