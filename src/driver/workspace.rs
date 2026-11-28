@@ -163,6 +163,15 @@ impl WorkspaceManager {
 
     /// Get or create a worktree for a session.
     pub async fn acquire(&self, session_key: &str) -> Result<Arc<WorkspaceEntry>> {
+        if session_key.is_empty()
+            || session_key == "."
+            || session_key == ".."
+            || session_key.contains(['/', '\\', '\0'])
+        {
+            return Err(GatewayError::BadRequest(format!(
+                "invalid workspace session identifier {session_key:?}"
+            )));
+        }
         let config = self.config.load_full();
         if !config.enabled {
             return Err(GatewayError::BadRequest(
