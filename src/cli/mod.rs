@@ -1,9 +1,11 @@
 //! Operator-facing command line.
 
 pub mod bench;
+pub mod config_cmd;
 pub mod doctor;
 pub mod init;
 pub mod mcp;
+pub mod replay;
 pub mod service;
 pub mod stats;
 pub mod token;
@@ -59,6 +61,10 @@ pub enum Command {
     Stats(StatsArgs),
     /// Auto-discover local AI CLIs and scaffold a validated `vouch.toml`.
     Init(InitArgs),
+    /// Replay sanitized `[flight_recorder]` JSONL logs against current routes.
+    Replay(ReplayArgs),
+    /// Inspect or diff gateway configurations (`vouch config diff`).
+    Config(ConfigArgs),
 }
 
 /// Arguments for `vouch serve`.
@@ -92,6 +98,12 @@ pub struct DoctorArgs {
     /// Path to the TOML configuration.
     #[arg(short, long, default_value = "vouch.toml")]
     pub config: PathBuf,
+    /// Re-scan PATH/user bins and local daemon ports to propose safe config repairs.
+    #[arg(long)]
+    pub fix: bool,
+    /// Apply proposed fixes without interactive confirmation when `--fix` is set.
+    #[arg(long)]
+    pub yes: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     pub json: bool,
@@ -260,6 +272,55 @@ pub struct InitArgs {
     /// Overwrite `--output` if it already exists.
     #[arg(long)]
     pub force: bool,
+}
+
+/// Arguments for `vouch replay`.
+#[derive(Debug, Args)]
+pub struct ReplayArgs {
+    /// Path to the TOML configuration.
+    #[arg(short, long, default_value = "vouch.toml")]
+    pub config: PathBuf,
+    /// Path to the recorded JSONL flight log (defaults to `flight_recorder.path` or `<state_dir>/flight.jsonl`).
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+    /// Override target route/model when replaying prompts.
+    #[arg(long)]
+    pub route: Option<String>,
+    /// Maximum number of most-recent records to replay.
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Emit machine-readable JSON comparison output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `vouch config`.
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    /// Config action.
+    #[command(subcommand)]
+    pub command: ConfigCommand,
+}
+
+/// Subcommands under `vouch config`.
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Compare two TOML configuration files semantically.
+    Diff(ConfigDiffArgs),
+}
+
+/// Arguments for `vouch config diff`.
+#[derive(Debug, Args)]
+pub struct ConfigDiffArgs {
+    /// Baseline configuration file.
+    #[arg(long)]
+    pub current: PathBuf,
+    /// Candidate configuration file.
+    #[arg(long)]
+    pub candidate: PathBuf,
+    /// Emit machine-readable JSON report.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Build an HTTP/Unix-socket client targeting the local `vouch` daemon.
