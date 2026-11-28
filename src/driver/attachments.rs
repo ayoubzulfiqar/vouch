@@ -35,7 +35,7 @@ pub struct PromptSpillFile {
 impl PromptSpillFile {
     /// Persist `contents` into a private `0600` file under `std::env::temp_dir()`.
     pub fn create(contents: &str) -> Result<Self> {
-        let filename = format!("vouch_prompt_{}.txt", Uuid::new_v4().simple());
+        let filename = pid_temp_filename("vouch_prompt", "txt");
         let path = write_private_temp_file(&filename, contents.as_bytes())?;
         Ok(Self { path })
     }
@@ -111,7 +111,7 @@ pub fn write_base64_attachment(media_type: &str, data: &str) -> Result<PathBuf> 
         .decode(cleaned.as_bytes())
         .map_err(|error| GatewayError::BadRequest(format!("invalid base64 attachment: {error}")))?;
     let ext = extension_for_media_type(media_type);
-    let filename = format!("vouch_att_{}.{ext}", Uuid::new_v4().simple());
+    let filename = pid_temp_filename("vouch_att", ext);
     write_private_temp_file(&filename, &decoded)
 }
 
@@ -205,10 +205,9 @@ async fn render_message_with_attachments_async(
                             );
                         } else if config.fetch_remote_urls {
                             let (bytes, media_type) = fetch_remote_image(url, config).await?;
-                            let filename = format!(
-                                "vouch_att_{}.{}",
-                                Uuid::new_v4().simple(),
-                                extension_for_media_type(media_type)
+                            let filename = pid_temp_filename(
+                                "vouch_att",
+                                extension_for_media_type(media_type),
                             );
                             let path = write_private_temp_file(&filename, &bytes)?;
                             guard.push(path.clone());
@@ -531,6 +530,88 @@ fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+fn pid_temp_filename(prefix: &str, ext: &str) -> String {
+    format!(
+        "{prefix}_{}_{}.{ext}",
+        std::process::id(),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn parse_temp_pid(name: &str) -> Option<u32> {
+    let rest = name
+        .strip_prefix("vouch_att_")
+        .or_else(|| name.strip_prefix("vouch_prompt_"))?;
+    let (pid_part, _) = rest.split_once('_')?;
+    pid_part.parse::<u32>().ok()
+}
+
+/// Check whether a process ID is currently alive on this host.
+#[cfg(unix)]
+pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    !matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
+}
+
+#[cfg(not(unix))]
+pub fn is_process_alive(_pid: u32) -> bool {
+    false
+}
+
+/// Sweep orphaned `vouch_att_*` and `vouch_prompt_*` temp files left behind by
+/// crashed daemon instances or aged past `max_age`.
+pub fn sweep_orphaned_temp_files(max_age: Duration) -> usize {
+    sweep_orphaned_temp_files_in(&std::env::temp_dir(), max_age)
+}
+
+/// Sweep orphaned `vouch_att_*` and `vouch_prompt_*` temp files inside a target directory.
+pub fn sweep_orphaned_temp_files_in(dir: &Path, max_age: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    let current_pid = std::process::id();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        if !name.starts_with("vouch_att_") && !name.starts_with("vouch_prompt_") {
+            continue;
+        }
+        let age_exceeded = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+
+        let should_remove = match parse_temp_pid(name) {
+            Some(pid) if pid == current_pid => false,
+            Some(pid) => !is_process_alive(pid) || age_exceeded,
+            None => age_exceeded,
+        };
+        if should_remove && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 fn write_private_temp_file(filename: &str, bytes: &[u8]) -> Result<PathBuf> {
     let path = std::env::temp_dir().join(filename);
     let mut options = OpenOptions::new();
@@ -614,5 +695,24 @@ mod tests {
         assert!(!is_forbidden_ip(
             "2606:4700:4700::1111".parse().expect("ip")
         ));
+    }
+
+    #[test]
+    fn sweeps_dead_pid_orphans_while_preserving_live_pid_files() {
+        let dir = tempfile::tempdir().expect("temp");
+        let dead_prompt = dir.path().join("vouch_prompt_99999999_deadbeef.txt");
+        let dead_att = dir.path().join("vouch_att_99999999_deadbeef.png");
+        let live_prompt = dir
+            .path()
+            .join(format!("vouch_prompt_{}_alive123.txt", std::process::id()));
+        std::fs::write(&dead_prompt, "orphan").expect("write dead prompt");
+        std::fs::write(&dead_att, "orphan").expect("write dead att");
+        std::fs::write(&live_prompt, "active").expect("write live prompt");
+
+        let removed = sweep_orphaned_temp_files_in(dir.path(), Duration::from_secs(3600));
+        assert_eq!(removed, 2);
+        assert!(!dead_prompt.exists());
+        assert!(!dead_att.exists());
+        assert!(live_prompt.exists());
     }
 }
