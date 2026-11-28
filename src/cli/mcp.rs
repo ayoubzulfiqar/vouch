@@ -565,6 +565,48 @@ async fn tools_list_payload(state: &AppState) -> Value {
         }
     }));
 
+    tools.push(json!({
+        "name": "vouch_session_status",
+        "description": "Inspect shared cross-agent session ledger state, backend handoff history, touched files, and checkpoints.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional session identifier to inspect; omit to list all live sessions."
+                }
+            }
+        }
+    }));
+
+    tools.push(json!({
+        "name": "vouch_checkpoint",
+        "description": "Record a deterministic checkpoint note and file list on a shared session ledger (and optionally sync to trace).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Shared session identifier"
+                },
+                "note": {
+                    "type": "string",
+                    "description": "Factual progress summary or checkpoint note"
+                },
+                "files": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional relative repository paths touched"
+                },
+                "workspace_root": {
+                    "type": "string",
+                    "description": "Optional workspace root subdirectory override"
+                }
+            },
+            "required": ["session_id", "note"]
+        }
+    }));
+
     for (tool_name, route_name) in route_tools {
         tools.push(json!({
             "name": tool_name,
@@ -749,6 +791,7 @@ fn prepare_tool_execution(
         max_tokens: None,
         workspace_mode,
         workdir: None,
+        workspace_root: None,
         cancel,
         tools: Vec::new(),
         tool_choice: None,
@@ -792,6 +835,13 @@ async fn handle_tool_call(
         ));
     }
 
+    if tool_name == "vouch_session_status" {
+        return handle_vouch_session_status(state, arguments);
+    }
+    if tool_name == "vouch_checkpoint" {
+        return handle_vouch_checkpoint(state, arguments).await;
+    }
+
     if let Some((upstream_id, remote_tool)) = tool_name.split_once("__") {
         let upstream = state
             .config()
@@ -813,6 +863,13 @@ async fn handle_tool_call(
         CancellationToken::new(),
         trace_ctx.clone(),
     )?;
+    let mcp_session = request.session_key.clone();
+    let mcp_model = request.model.clone();
+    let mcp_user_prompt = request
+        .messages
+        .last()
+        .map(|m| m.content.as_plain_text())
+        .unwrap_or_default();
     let mut ingress_span = state
         .otel()
         .start_span(trace_ctx, "ingress", SpanKind::Server);
@@ -822,13 +879,29 @@ async fn handle_tool_call(
     let outcome = execute_mcp_request(state, request, workspace_mode).await;
 
     match outcome {
-        Ok((backend_id, fallback, done)) => {
+        Ok(out) => {
             let elapsed = started.elapsed();
+            let backend_id = out.backend_id;
+            let profile_id = out.profile_id;
+            let fallback = out.fallback_used;
+            let handoff_from = out.handoff_from;
+            let done = out.completion;
             metrics::record_request("mcp", "/mcp", 200, elapsed);
             principal.record_tokens(done.usage.total_tokens);
             state
                 .usage()
                 .record_success(&principal.name, &backend_id, done.usage, elapsed);
+            record_mcp_memory_turn(
+                state,
+                &mcp_session,
+                &mcp_model,
+                &backend_id,
+                profile_id,
+                handoff_from.as_deref(),
+                mcp_user_prompt,
+                &done.content,
+                done.usage,
+            );
             ingress_span.set_str("vouch.backend", &backend_id);
             ingress_span.set_bool("vouch.fallback", fallback);
             ingress_span.set_int("gen_ai.usage.input_tokens", done.usage.prompt_tokens as i64);
@@ -837,20 +910,27 @@ async fn handle_tool_call(
                 done.usage.completion_tokens as i64,
             );
             ingress_span.finish_ok();
+            let mut meta = json!({
+                "backend": backend_id,
+                "usage": {
+                    "prompt_tokens": done.usage.prompt_tokens,
+                    "completion_tokens": done.usage.completion_tokens,
+                    "total_tokens": done.usage.total_tokens,
+                }
+            });
+            if let Some(prev) = handoff_from
+                && let Some(obj) = meta.as_object_mut()
+            {
+                obj.insert("handoff".into(), json!(true));
+                obj.insert("handoff_from".into(), json!(prev));
+            }
             Ok(json!({
                 "content": [{
                     "type": "text",
                     "text": done.content,
                 }],
                 "isError": false,
-                "_meta": {
-                    "backend": backend_id,
-                    "usage": {
-                        "prompt_tokens": done.usage.prompt_tokens,
-                        "completion_tokens": done.usage.completion_tokens,
-                        "total_tokens": done.usage.total_tokens,
-                    }
-                }
+                "_meta": meta,
             }))
         }
         Err(error) => {
@@ -870,11 +950,172 @@ async fn handle_tool_call(
     }
 }
 
+struct McpExecutionOutcome {
+    backend_id: String,
+    profile_id: Option<String>,
+    fallback_used: bool,
+    handoff_from: Option<String>,
+    completion: crate::driver::Completion,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_mcp_memory_turn(
+    state: &AppState,
+    session_id: &str,
+    model: &str,
+    backend_id: &str,
+    profile_id: Option<String>,
+    handoff_from: Option<&str>,
+    user_text: String,
+    assistant_text: &str,
+    usage: crate::driver::Usage,
+) {
+    let mem_cfg = state.memory().config();
+    if !mem_cfg.enabled {
+        return;
+    }
+    state
+        .memory()
+        .ledger()
+        .record_turn(crate::memory::RecordTurnInput {
+            session_id: session_id.to_string(),
+            model: model.to_string(),
+            backend_id: backend_id.to_string(),
+            profile_id,
+            user_text,
+            assistant_text: assistant_text.to_string(),
+            tool_summary: None,
+            raw_path_hints: Vec::new(),
+            workspace_root: None,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+        });
+    if mem_cfg.sync_to_trace && handoff_from.is_some() && state.memory().trace().config().enabled {
+        let ttl = Duration::from_secs(state.config().defaults.session_ttl_secs.max(1));
+        if let Some(entry) = state.memory().ledger().get(session_id, ttl) {
+            let summary = crate::memory::ledger::format_trace_session_summary(&entry);
+            state.memory().trace().record_session_checkpoint_async(
+                None,
+                summary,
+                entry.touched_files,
+            );
+        }
+    }
+}
+
+fn handle_vouch_session_status(
+    state: &AppState,
+    arguments: &Map<String, Value>,
+) -> std::result::Result<Value, (i32, String)> {
+    let ttl = Duration::from_secs(state.config().defaults.session_ttl_secs.max(1));
+    let session_id = arguments
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let payload = if let Some(sid) = session_id {
+        let entry = state.memory().ledger().get(sid, ttl);
+        json!({
+            "found": entry.is_some(),
+            "session_id": sid,
+            "session": entry,
+        })
+    } else {
+        json!({
+            "sessions": state.memory().ledger().list(ttl),
+            "handoffs_total": state.memory().ledger().total_handoffs(),
+        })
+    };
+    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": text,
+        }],
+        "isError": false,
+    }))
+}
+
+async fn handle_vouch_checkpoint(
+    state: &AppState,
+    arguments: &Map<String, Value>,
+) -> std::result::Result<Value, (i32, String)> {
+    let session_id = arguments
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            (
+                -32602,
+                "vouch_checkpoint requires non-empty `arguments.session_id`".to_string(),
+            )
+        })?;
+    let note = arguments
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            (
+                -32602,
+                "vouch_checkpoint requires non-empty `arguments.note`".to_string(),
+            )
+        })?;
+    let files: Vec<String> = arguments
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let cfg = state.config();
+    let ws_override = crate::memory::resolve_workspace_root_header(
+        &cfg.trace,
+        &cfg.workspace,
+        arguments.get("workspace_root").and_then(Value::as_str),
+    )
+    .map_err(|err| (-32003, telemetry::redact_text(&err.to_string())))?;
+    let effective_ws = ws_override
+        .clone()
+        .unwrap_or_else(|| state.memory().trace().default_workspace_root());
+    let entry =
+        state
+            .memory()
+            .ledger()
+            .add_checkpoint(session_id, note, &files, Some(&effective_ws));
+    let synced_to_trace = if cfg.shared_memory.sync_to_trace && cfg.trace.enabled {
+        let summary = crate::memory::ledger::format_trace_session_summary(&entry);
+        state
+            .memory()
+            .trace()
+            .record_session_checkpoint_now(ws_override.as_deref(), &summary, &entry.touched_files)
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let payload = json!({
+        "session": entry,
+        "synced_to_trace": synced_to_trace,
+    });
+    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": text,
+        }],
+        "isError": false,
+    }))
+}
+
 async fn execute_mcp_request(
     state: &AppState,
     request: ExecutionRequest,
     workspace_mode: WorkspaceMode,
-) -> Result<(String, bool, crate::driver::Completion)> {
+) -> Result<McpExecutionOutcome> {
     let timeout = Duration::from_secs(state.config().server.request_timeout_secs.max(1));
     let routed = tokio::time::timeout(
         timeout,
@@ -887,7 +1128,13 @@ async fn execute_mcp_request(
     match routed {
         Ok(Ok(routed)) => {
             let done = completion(routed.response).await?;
-            Ok((routed.backend_id, routed.fallback_used, done))
+            Ok(McpExecutionOutcome {
+                backend_id: routed.backend_id,
+                profile_id: routed.profile_id,
+                fallback_used: routed.fallback_used,
+                handoff_from: routed.handoff_from,
+                completion: done,
+            })
         }
         Ok(Err(error)) => Err(error),
         Err(_) => Err(GatewayError::Timeout(timeout)),
@@ -921,6 +1168,13 @@ fn handle_task_create(
     let cancel = CancellationToken::new();
     let (request, workspace_mode) =
         prepare_tool_execution(state, principal, params, cancel.clone(), trace_ctx.clone())?;
+    let mcp_session = request.session_key.clone();
+    let mcp_model = request.model.clone();
+    let mcp_user_prompt = request
+        .messages
+        .last()
+        .map(|m| m.content.as_plain_text())
+        .unwrap_or_default();
     let mut ingress_span = state
         .otel()
         .start_span(trace_ctx, "ingress", SpanKind::Server);
@@ -934,8 +1188,13 @@ fn handle_task_create(
     tokio::spawn(async move {
         let started = Instant::now();
         match execute_mcp_request(&bg_state, request, workspace_mode).await {
-            Ok((backend_id, fallback, done)) => {
+            Ok(out) => {
                 let elapsed = started.elapsed();
+                let backend_id = out.backend_id;
+                let profile_id = out.profile_id;
+                let fallback = out.fallback_used;
+                let handoff_from = out.handoff_from;
+                let done = out.completion;
                 metrics::record_request("mcp", "/mcp#tasks", 200, elapsed);
                 bg_principal.record_tokens(done.usage.total_tokens);
                 bg_state.usage().record_success(
@@ -943,6 +1202,17 @@ fn handle_task_create(
                     &backend_id,
                     done.usage,
                     elapsed,
+                );
+                record_mcp_memory_turn(
+                    &bg_state,
+                    &mcp_session,
+                    &mcp_model,
+                    &backend_id,
+                    profile_id,
+                    handoff_from.as_deref(),
+                    mcp_user_prompt,
+                    &done.content,
+                    done.usage,
                 );
                 ingress_span.set_str("vouch.backend", &backend_id);
                 ingress_span.set_bool("vouch.fallback", fallback);
@@ -952,6 +1222,20 @@ fn handle_task_create(
                     done.usage.completion_tokens as i64,
                 );
                 ingress_span.finish_ok();
+                let mut meta = json!({
+                    "backend": backend_id,
+                    "usage": {
+                        "prompt_tokens": done.usage.prompt_tokens,
+                        "completion_tokens": done.usage.completion_tokens,
+                        "total_tokens": done.usage.total_tokens,
+                    }
+                });
+                if let Some(prev) = handoff_from
+                    && let Some(obj) = meta.as_object_mut()
+                {
+                    obj.insert("handoff".into(), json!(true));
+                    obj.insert("handoff_from".into(), json!(prev));
+                }
                 bg_state.mcp_tasks().finish_success(
                     &bg_task_id,
                     json!({
@@ -960,14 +1244,7 @@ fn handle_task_create(
                             "text": done.content,
                         }],
                         "isError": false,
-                        "_meta": {
-                            "backend": backend_id,
-                            "usage": {
-                                "prompt_tokens": done.usage.prompt_tokens,
-                                "completion_tokens": done.usage.completion_tokens,
-                                "total_tokens": done.usage.total_tokens,
-                            }
-                        }
+                        "_meta": meta,
                     }),
                 );
             }
