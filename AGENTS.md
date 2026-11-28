@@ -18,22 +18,27 @@ state is the TOML file plus ephemeral worktrees.
 | `src/cache.rs` | Deterministic SHA-256 response cache (`ResponseCache`) with TTL, eviction, & persistence |
 | `src/usage.rs` | `tiktoken-rs` BPE token counter (`cl100k_base` / `o200k_base`), usage, cost & latency analytics |
 | `src/persistence.rs` | Lock-guarded atomic `0600` snapshots for sessions, responses, cache, budgets, and usage |
-| `src/cli/mod.rs` | clap definitions for `serve`, `routes`, `doctor`, `service`, `mcp`, `top`, `token`, `bench`, `stats`, `init` |
+| `src/recorder.rs` | Opt-in bounded redacted JSONL flight recorder (`[flight_recorder]`) |
+| `src/security/` | Outbound secret/PII egress guardrails (`[security.egress_guard]`) |
+| `src/cli/mod.rs` | clap definitions for `serve`, `routes`, `doctor`, `service`, `mcp`, `top`, `token`, `bench`, `stats`, `init`, `replay`, `config` |
+| `src/cli/config_cmd.rs` | Semantic config diff subcommand (`vouch config diff`) |
+| `src/cli/replay.rs` | Offline flight-log replay & schema benchmark runner (`vouch replay`) |
 | `src/cli/mcp.rs` | Dual-spec MCP JSON-RPC 2.0 server (`2024-11-05` + `2026-07-28`, `resources/*`, `prompts/*`, upstreams, async `tasks/*`) |
 | `src/cli/top.rs` | Live terminal TUI (`vouch top`) polling `/healthz`, `/readyz`, `/metrics`, and `/v1/usage` |
 | `src/cli/token.rs` | CSPRNG virtual token generator (`vouch token create`) |
 | `src/cli/bench.rs` | End-to-end route latency/TTFT benchmark runner (`vouch bench`) |
 | `src/cli/stats.rs` | CLI query & formatter for `GET /v1/usage` (`vouch stats`) |
 | `src/cli/init.rs` | Host CLI/port/docker0 auto-discovery & config scaffolder (`vouch init`) |
-| `src/ingress/mod.rs` | Shared auth/caching/`StreamUsageGuard`/routing/affinity/trace/multimodal/SSE plumbing and router |
+| `src/ingress/mod.rs` | Shared auth/egress-guard/singleflight/caching/`StreamUsageGuard`/routing/affinity/trace/multimodal/SSE plumbing |
 | `src/ingress/openai.rs` | OpenAI Chat Completions wire-format adapter (`tools`, `response_format`, multimodal) |
+| `src/ingress/embeddings.rs` | OpenAI `POST /v1/embeddings` (`float` & `base64` vectors) adapter |
 | `src/ingress/responses.rs` | OpenAI Responses (`POST` + `WS /v1/responses`) adapter with stateful `previous_response_id` store |
 | `src/ingress/anthropic.rs` | Anthropic Messages adapter (`tools`, `tool_use`, `thinking`, `cache_control`, multimodal) |
-| `src/ingress/gemini.rs` | Google Gemini API adapter (`POST /v1beta/models/{model}:{generateContent,streamGenerateContent}`) |
-| `src/ingress/ollama.rs` | Ollama API adapter (`GET /api/tags`, `POST /api/chat`, `POST /api/generate`) |
+| `src/ingress/gemini.rs` | Google Gemini API adapter (`POST /v1beta/models/{model}:{generateContent,streamGenerateContent}`, `thought` & streaming `functionCall`) |
+| `src/ingress/ollama.rs` | Ollama API adapter (`GET /api/tags`, `POST /api/chat`, `POST /api/generate`, `tool_calls` & `options`) |
 | `src/ingress/admin.rs` | Opt-in `server.enable_admin` control plane (`POST /admin/reload`, circuit reset, `DELETE /admin/cache`) |
-| `src/ingress/ui.rs` | Optional `server.enable_ui`-gated embedded read-only HTML dashboard (`GET /ui`) |
-| `src/ingress/ops.rs` | `/healthz`, `/readyz`, `/metrics` (unauthenticated) and `/v1/usage` (authenticated) |
+| `src/ingress/ui.rs` | Optional `server.enable_ui`-gated embedded Console v2 (`GET /ui`: topology, playground, waterfall) |
+| `src/ingress/ops.rs` | `/healthz`, `/readyz`, `/metrics` (unauthenticated) and `/v1/usage`, `/v1/traces` (authenticated) |
 | `src/auth/tokens.rs` | Virtual tokens, constant-time compare, RPM/TPM/concurrency limits, expiry, model/backend allowlists, budgets |
 | `src/auth/discovery.rs` | Read-only local binary/auth-file/daemon discovery for `doctor` |
 | `src/router/mod.rs` | Route table, policies (`ordered`/`least_latency`/`hedged`), profiles, repair retries, sticky sessions |
