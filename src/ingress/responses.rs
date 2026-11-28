@@ -43,10 +43,10 @@ use crate::{
     error::{GatewayError, Result},
     ingress::{
         CancelOnDrop, RequestContext, StreamUsageGuard, completion, execute_or_cached,
-        execution_request, insert_dispatched_headers, into_chunk_stream,
+        execution_request, insert_dispatched_headers, insert_handoff_headers, into_chunk_stream,
         openai::parse_openai_response_format, parse_json_content, prepare_routed,
-        record_completion_outcome, record_error_outcome, sse_response, start_ingress_span,
-        unix_now,
+        record_completion_outcome, record_error_outcome, record_memory_turn, sse_response,
+        start_ingress_span, unix_now,
     },
     persistence::{PersistedResponse, evict_oldest_if_full, instant_from_unix, unix_now_secs},
     state::AppState,
@@ -502,6 +502,7 @@ async fn responses_inner(
         let model = context.model.clone();
         let request_id = context.request_id.clone();
         let coalesced = context.is_coalesced();
+        let handoff_from = context.handoff_from();
         let stream_cancel = cancel.clone();
         let created_at = unix_now();
         let store = state.responses().clone();
@@ -773,10 +774,12 @@ async fn responses_inner(
             cache_status,
             coalesced,
         );
+        insert_handoff_headers(&mut response, handoff_from.as_deref());
         return Ok(response);
     }
 
     let coalesced = context.is_coalesced();
+    let handoff_from = context.handoff_from();
 
     let completion = match completion(driver_response).await {
         Ok(c) => {
@@ -788,6 +791,14 @@ async fn responses_inner(
                 c.usage,
                 started.elapsed(),
                 Some(ingress_span),
+            );
+            record_memory_turn(
+                &state,
+                &context,
+                &backend,
+                c.usage,
+                &c.content,
+                &c.tool_calls,
             );
             if let Some(key) = cache_miss_key {
                 state.cache().store(key, &backend, &c);
@@ -843,6 +854,7 @@ async fn responses_inner(
         cache_status,
         coalesced,
     );
+    insert_handoff_headers(&mut response, handoff_from.as_deref());
     Ok(response)
 }
 
