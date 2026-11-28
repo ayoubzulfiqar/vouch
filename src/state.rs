@@ -24,6 +24,9 @@ use crate::{
     driver::{Usage, workspace::WorkspaceManager},
     error::{GatewayError, Result},
     ingress::responses::ResponseStore,
+    memory::{
+        SessionLedgerStore, SharedMemoryEngine, TraceBridge, ledger::format_trace_session_summary,
+    },
     metrics::Metrics,
     persistence::{GatewaySnapshot, load_snapshot, save_snapshot},
     recorder::FlightRecorder,
@@ -48,6 +51,7 @@ pub struct AppState {
     egress_guard: Arc<EgressGuard>,
     flight_recorder: Arc<FlightRecorder>,
     traces: Arc<TraceRingBuffer>,
+    memory: Arc<SharedMemoryEngine>,
     shutdown_token: CancellationToken,
     reload_lock: tokio::sync::Mutex<()>,
     started_at: Instant,
@@ -92,6 +96,20 @@ impl AppState {
             config.defaults.state_dir.clone(),
         );
         let traces = Arc::new(TraceRingBuffer::new(100));
+        let shared_ledger = Arc::new(SessionLedgerStore::new(
+            max_entries,
+            config.shared_memory.max_turns_per_session,
+        ));
+        let trace_bridge = Arc::new(TraceBridge::new(
+            config.trace.clone(),
+            config.workspace.clone(),
+        ));
+        let memory = Arc::new(SharedMemoryEngine::new(
+            config.shared_memory.clone(),
+            shared_ledger,
+            trace_bridge,
+        ));
+        router.set_memory(memory.clone());
 
         if let Some(state_dir) = config.defaults.state_dir.as_deref()
             && let Some(snapshot) = load_snapshot(state_dir)
@@ -101,11 +119,17 @@ impl AppState {
             tokens.restore_daily_state(&snapshot.daily_token_budgets);
             usage.restore(&snapshot.usage);
             cache.restore_snapshot(&snapshot.cached_responses);
+            memory.ledger().restore_snapshot(
+                &snapshot.shared_sessions,
+                snapshot.total_handoffs,
+                ttl,
+            );
             tracing::info!(
                 dir = %state_dir.display(),
                 sessions = sessions.len(),
                 responses = responses.len(),
                 cached = cache.len(),
+                shared_sessions = memory.ledger().len(),
                 "restored persistent state snapshot"
             );
         }
@@ -126,6 +150,7 @@ impl AppState {
             egress_guard,
             flight_recorder,
             traces,
+            memory,
             shutdown_token: CancellationToken::new(),
             reload_lock: tokio::sync::Mutex::new(()),
             started_at: Instant::now(),
@@ -183,6 +208,11 @@ impl AppState {
     /// Bounded ring buffer of recent completed request traces (`GET /v1/traces`).
     pub fn traces(&self) -> &Arc<TraceRingBuffer> {
         &self.traces
+    }
+
+    /// Cross-agent shared memory ledger and model-free `trace` bridge.
+    pub fn memory(&self) -> &Arc<SharedMemoryEngine> {
+        &self.memory
     }
 
     /// Stateful `/v1/responses` chaining store.
@@ -287,6 +317,12 @@ impl AppState {
             next.defaults.state_dir.clone(),
         );
         self.otel.reconfigure(&next.telemetry);
+        self.memory.update_config(
+            next.shared_memory.clone(),
+            next.trace.clone(),
+            next.workspace.clone(),
+            next.defaults.max_session_entries,
+        );
         telemetry::set_global_secrets(next.secrets());
 
         if next.server.tcp_listen != previous.server.tcp_listen {
@@ -339,6 +375,24 @@ impl AppState {
                 .spawn_eviction_task(self.shutdown_token.clone()),
         );
         background.push(self.cache.spawn_eviction_task(self.shutdown_token.clone()));
+        let memory_for_evict = self.memory.clone();
+        background.push(self.memory.ledger().spawn_eviction_task(
+            self.router.ttl_handle(),
+            self.shutdown_token.clone(),
+            move |evicted| {
+                if !memory_for_evict.config().sync_to_trace {
+                    return;
+                }
+                for entry in evicted {
+                    let summary = format_trace_session_summary(&entry);
+                    memory_for_evict.trace().record_session_checkpoint_async(
+                        None,
+                        summary,
+                        entry.touched_files,
+                    );
+                }
+            },
+        ));
         if let Some(otel_handle) = self.otel.start_worker(self.shutdown_token.clone()) {
             background.push(otel_handle);
         }
@@ -379,8 +433,10 @@ impl AppState {
         let budgets = self.tokens.export_daily_state();
         let usage = self.usage.snapshot();
         let cached = self.cache.export_snapshot();
+        let (shared_sessions, total_handoffs) = self.memory.ledger().export_snapshot(ttl);
         let snapshot = GatewaySnapshot::new(affinity, backend_sessions, responses, budgets, usage)
-            .with_cached_responses(cached);
+            .with_cached_responses(cached)
+            .with_shared_sessions(shared_sessions, total_handoffs);
         save_snapshot(state_dir, &snapshot)
     }
 
@@ -396,6 +452,7 @@ impl AppState {
         for handle in handles {
             let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         }
+        self.memory.trace().shutdown().await;
         if self.config.load().workspace.cleanup_on_shutdown {
             self.workspaces.cleanup_all().await;
         }
