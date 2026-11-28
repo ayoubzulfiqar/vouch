@@ -126,6 +126,27 @@ fn render_launchd(binary: &str, config: &str) -> String {
     )
 }
 
+/// Render actionable Windows Task Scheduler (`schtasks.exe`) and Windows
+/// Service (`sc.exe`) setup instructions for running `vouch serve` cleanly.
+pub fn render_windows_service_instructions(binary: &Path, config: &Path) -> String {
+    let bin_escaped = binary.display();
+    let cfg_escaped = config.display();
+    format!(
+        "Windows does not use systemd or launchd. Use Task Scheduler (schtasks.exe) or Service Control (sc.exe):\n\
+         \n\
+         # Option 1: Per-user startup task (no administrator privileges required for current user):\n\
+         schtasks.exe /Create /TN \"{SERVICE_NAME}\" /SC ONLOGON /TR \"\\\"{bin_escaped}\\\" serve --config \\\"{cfg_escaped}\\\"\" /F\n\
+         schtasks.exe /Run /TN \"{SERVICE_NAME}\"\n\
+         schtasks.exe /Delete /TN \"{SERVICE_NAME}\" /F\n\
+         \n\
+         # Option 2: Native Windows Service via sc.exe (run from elevated Administrator prompt):\n\
+         sc.exe create {SERVICE_NAME} binPath= \"\\\"{bin_escaped}\\\" serve --config \\\"{cfg_escaped}\\\"\" start= auto\n\
+         sc.exe start {SERVICE_NAME}\n\
+         sc.exe stop {SERVICE_NAME}\n\
+         sc.exe delete {SERVICE_NAME}\n"
+    )
+}
+
 fn install_service(args: &ServiceInstallArgs) -> Result<()> {
     let config = &args.config;
     if !config.is_file() {
@@ -140,6 +161,11 @@ fn install_service(args: &ServiceInstallArgs) -> Result<()> {
             GatewayError::Config(format!("cannot find current executable: {error}"))
         })?,
     };
+
+    if cfg!(target_os = "windows") {
+        print!("{}", render_windows_service_instructions(&binary, config));
+        return Ok(());
+    }
 
     let unit = render_unit(&binary, config)?;
     let path = unit_path()?;
@@ -178,6 +204,17 @@ fn install_service(args: &ServiceInstallArgs) -> Result<()> {
 }
 
 fn uninstall_service(args: &ServiceUninstallArgs) -> Result<()> {
+    if cfg!(target_os = "windows") {
+        println!(
+            "Windows does not use systemd or launchd unit files. Remove your Task Scheduler or Service registration with:\n\
+             schtasks.exe /Delete /TN \"{SERVICE_NAME}\" /F\n\
+             # or, if registered with sc.exe:\n\
+             sc.exe stop {SERVICE_NAME}\n\
+             sc.exe delete {SERVICE_NAME}"
+        );
+        return Ok(());
+    }
+
     let path = unit_path()?;
     if std::env::consts::OS == "macos" {
         if !args.no_stop && path.exists() {
