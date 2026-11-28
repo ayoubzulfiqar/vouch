@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to package and publish (e.g. v5.0.0); defaults to Cargo.toml version"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -12,8 +18,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    name: Resolve Release Tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Determine release tag
+        id: meta
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+            TAG="v${VERSION}"
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -62,11 +92,12 @@ jobs:
       - name: Package release archive
         shell: bash
         run: |
+          TAG="${{ needs.prepare.outputs.tag }}"
           mkdir -p dist staging
           ${{ matrix.strip }} "target/${{ matrix.target }}/release/vouch"
           cp "target/${{ matrix.target }}/release/vouch" staging/
           cp LICENSE NOTICE README.md CHANGELOG.md vouch.example.toml staging/
-          tar -czf "dist/vouch-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" -C staging .
+          tar -czf "dist/vouch-${TAG}-${{ matrix.target }}.tar.gz" -C staging .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -76,7 +107,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
 
     steps:
@@ -89,25 +120,34 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Generate SHA256SUMS and update Homebrew formula
+      - name: Generate SHA256SUMS, Release Notes, and Homebrew Formula
         shell: bash
         run: |
+          TAG="${{ needs.prepare.outputs.tag }}"
+          VERSION="${TAG#v}"
           cd dist
           sha256sum vouch-*.tar.gz > SHA256SUMS.txt
-          TAG="${GITHUB_REF_NAME#v}"
           cp ../packaging/homebrew/vouch.rb vouch.rb
-          sed -i "s/version \".*\"/version \"${TAG}\"/" vouch.rb
+          sed -i "s/version \".*\"/version \"${VERSION}\"/" vouch.rb
           for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
-            SUM="$(grep "vouch-${GITHUB_REF_NAME}-${target}.tar.gz" SHA256SUMS.txt | awk '{print $1}')"
+            SUM="$(grep "vouch-${TAG}-${target}.tar.gz" SHA256SUMS.txt | awk '{print $1}')"
             PLACEHOLDER="REPLACE_WITH_$(echo "${target}" | tr '[:lower:]-' '[:upper:]_')_SHA256"
             if [ -n "${SUM}" ]; then
               sed -i "s/${PLACEHOLDER}/${SUM}/g" vouch.rb
             fi
           done
           cd ..
+          awk -v ver="${VERSION}" '
+            $0 ~ "^## \\[" ver "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Release ${{ needs.prepare.outputs.tag }}
+          body_path: release-notes.md
           files: dist/*
           generate_release_notes: true
