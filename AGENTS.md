@@ -15,35 +15,39 @@ state is the TOML file plus ephemeral worktrees.
 | --- | --- |
 | `src/config.rs` | Typed TOML schema, validation, `ConfigStore` (ArcSwap snapshot) |
 | `src/error.rs` | The single `GatewayError` type and `Result` alias |
-| `src/usage.rs` | `tiktoken-rs` BPE token counter (`cl100k_base` / `o200k_base`), usage & latency analytics |
-| `src/persistence.rs` | Atomic `0600` JSON snapshots for sessions, responses, budgets, and usage in `state_dir` |
+| `src/cache.rs` | Deterministic SHA-256 response cache (`ResponseCache`) with TTL, eviction, & persistence |
+| `src/usage.rs` | `tiktoken-rs` BPE token counter (`cl100k_base` / `o200k_base`), usage, cost & latency analytics |
+| `src/persistence.rs` | Lock-guarded atomic `0600` snapshots for sessions, responses, cache, budgets, and usage |
 | `src/cli/mod.rs` | clap definitions for `serve`, `routes`, `doctor`, `service`, `mcp`, `top`, `token`, `bench`, `stats`, `init` |
-| `src/cli/mcp.rs` | Dual-spec MCP JSON-RPC 2.0 server (`2024-11-05` + `2026-07-28`, async `tasks/*`) |
-| `src/cli/top.rs` | Live terminal TUI (`vouch top`) polling `/healthz`, `/readyz`, `/metrics` |
+| `src/cli/mcp.rs` | Dual-spec MCP JSON-RPC 2.0 server (`2024-11-05` + `2026-07-28`, `resources/*`, `prompts/*`, upstreams, async `tasks/*`) |
+| `src/cli/top.rs` | Live terminal TUI (`vouch top`) polling `/healthz`, `/readyz`, `/metrics`, and `/v1/usage` |
 | `src/cli/token.rs` | CSPRNG virtual token generator (`vouch token create`) |
 | `src/cli/bench.rs` | End-to-end route latency/TTFT benchmark runner (`vouch bench`) |
 | `src/cli/stats.rs` | CLI query & formatter for `GET /v1/usage` (`vouch stats`) |
 | `src/cli/init.rs` | Host CLI/port/docker0 auto-discovery & config scaffolder (`vouch init`) |
-| `src/ingress/mod.rs` | Shared auth/routing/affinity/trace/multimodal/SSE plumbing and the axum router |
+| `src/ingress/mod.rs` | Shared auth/caching/`StreamUsageGuard`/routing/affinity/trace/multimodal/SSE plumbing and router |
 | `src/ingress/openai.rs` | OpenAI Chat Completions wire-format adapter (`tools`, `response_format`, multimodal) |
 | `src/ingress/responses.rs` | OpenAI Responses (`POST` + `WS /v1/responses`) adapter with stateful `previous_response_id` store |
 | `src/ingress/anthropic.rs` | Anthropic Messages adapter (`tools`, `tool_use`, `thinking`, `cache_control`, multimodal) |
+| `src/ingress/gemini.rs` | Google Gemini API adapter (`POST /v1beta/models/{model}:{generateContent,streamGenerateContent}`) |
+| `src/ingress/ollama.rs` | Ollama API adapter (`GET /api/tags`, `POST /api/chat`, `POST /api/generate`) |
+| `src/ingress/admin.rs` | Opt-in `server.enable_admin` control plane (`POST /admin/reload`, circuit reset, `DELETE /admin/cache`) |
 | `src/ingress/ui.rs` | Optional `server.enable_ui`-gated embedded read-only HTML dashboard (`GET /ui`) |
 | `src/ingress/ops.rs` | `/healthz`, `/readyz`, `/metrics` (unauthenticated) and `/v1/usage` (authenticated) |
-| `src/auth/tokens.rs` | Virtual tokens, constant-time compare, RPM window, UTC daily budgets, model globs |
+| `src/auth/tokens.rs` | Virtual tokens, constant-time compare, RPM/TPM/concurrency limits, expiry, model/backend allowlists, budgets |
 | `src/auth/discovery.rs` | Read-only local binary/auth-file/daemon discovery for `doctor` |
-| `src/router/mod.rs` | Route table, aliases, `[[routing_rules]]`, sticky sessions, delta continuation, pre-content failover |
-| `src/router/circuit_breaker.rs` | Per-backend closed/half-open/open state machine with `auth_expired` and `Retry-After` support |
+| `src/router/mod.rs` | Route table, policies (`ordered`/`least_latency`/`hedged`), profiles, repair retries, sticky sessions |
+| `src/router/circuit_breaker.rs` | Per-backend and per-profile closed/half-open/open state machine (`auth_expired`, `Retry-After`) |
 | `src/driver/mod.rs` | `Driver` trait, `Utf8ChunkDecoder`, multimodal `MessageContent`, `prime_stream`, permits, PGID guard |
 | `src/driver/attachments.rs` | RAII `0600` temp spillover, SSRF-safe remote image fetch, & multimodal image cleanup |
-| `src/driver/tool_bridge.rs` | `StreamingToolParser`, `StreamingJsonFenceStripper`, JSON Schema validator |
+| `src/driver/tool_bridge.rs` | Parallel `StreamingToolParser`, `StreamingJsonFenceStripper`, extended JSON Schema validator |
 | `src/driver/http_proxy.rs` | HTTP/SSE proxy backend |
-| `src/driver/cli_pipe.rs` | stdin/stdout subprocess backend (`read_mode` chunk/line, stall watchdog, spill files) |
-| `src/driver/pty_runner.rs` | `portable-pty` subprocess backend with configurable dimensions and auto-respond rules |
+| `src/driver/cli_pipe.rs` | stdin/stdout subprocess backend (`read_mode` chunk/line, stall watchdog, spill files, profile env) |
+| `src/driver/pty_runner.rs` | `portable-pty` subprocess backend with configurable dimensions, auto-respond rules, and profile env |
 | `src/driver/workspace.rs` | git worktree lifecycle |
-| `src/telemetry.rs` | JSON tracing, secret redaction, W3C `TraceContext`, and OTLP/HTTP trace exporter |
+| `src/telemetry.rs` | JSON tracing, escaped-quote/base64 secret redaction, W3C `TraceContext`, and OTLP/HTTP exporter |
 | `src/metrics.rs` | Prometheus recorder and all `vouch_*` instruments |
-| `src/state.rs` | `AppState`: config, router, tokens, workspaces, usage, otel, persistence, shutdown, reload |
+| `src/state.rs` | `AppState`: config, router, cache, tokens, workspaces, usage, otel, persistence, shutdown, reload |
 
 ### Request lifecycle
 
