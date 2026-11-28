@@ -18,8 +18,8 @@ use tracing::{error, info, warn};
 
 use vouch::{
     cli::{
-        Cli, Command, ServeArgs, ServiceCommand, bench, doctor, init, mcp, print_routes, service,
-        stats, token, top,
+        Cli, Command, ServeArgs, ServiceCommand, bench, config_cmd, doctor, init, mcp,
+        print_routes, replay, service, stats, token, top,
     },
     config::GatewayConfig,
     error::{GatewayError, Result},
@@ -60,6 +60,8 @@ async fn real_main() -> Result<()> {
         Command::Bench(args) => bench::run(&args).await,
         Command::Stats(args) => stats::run(&args).await,
         Command::Init(args) => init::run(&args).await,
+        Command::Replay(args) => replay::run(&args).await,
+        Command::Config(args) => config_cmd::run(&args),
     }
 }
 
@@ -78,9 +80,18 @@ async fn serve(args: ServeArgs) -> Result<()> {
     telemetry::init(&log_level, secrets)?;
 
     let state = AppState::new(args.config, config)?;
+    let orphan_ttl = Duration::from_secs(state.config().defaults.session_ttl_secs.max(1));
+    let swept_files = vouch::driver::attachments::sweep_orphaned_temp_files(orphan_ttl);
+    let swept_worktrees = state.workspaces().sweep_orphans(orphan_ttl).await;
+    if swept_files > 0 || swept_worktrees > 0 {
+        info!(
+            swept_files,
+            swept_worktrees, "swept orphaned state on startup"
+        );
+    }
     state.start_background_tasks();
     let app = build_router(state.clone());
-    let shutdown = state.shutdown_token();
+    let listener_shutdown = tokio_util::sync::CancellationToken::new();
 
     let mut servers = JoinSet::new();
     let tcp = TcpListener::bind(state.config().server.tcp_listen)
@@ -93,7 +104,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         })?;
     let tcp_addr = tcp.local_addr().map_err(GatewayError::Io)?;
     info!(address = %tcp_addr, "TCP listener ready");
-    let tcp_shutdown = shutdown.clone();
+    let tcp_shutdown = listener_shutdown.clone();
     let tcp_app = app.clone();
     servers.spawn(async move {
         if let Err(error) = axum::serve(
@@ -129,7 +140,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
             )?;
         }
         info!(path = %path.display(), "Unix socket listener ready");
-        let uds_shutdown = shutdown.clone();
+        let uds_shutdown = listener_shutdown.clone();
         let uds_app = app.clone();
         servers.spawn(async move {
             if let Err(error) = axum::serve(listener, uds_app)
@@ -144,10 +155,34 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let reload = start_reload_task(state.clone());
 
     wait_for_termination().await?;
-    info!("shutdown requested; draining in-flight requests");
-    state.shutdown_token().cancel();
+    let drain_secs = state.config().server.shutdown_drain_secs;
+    info!(
+        drain_secs,
+        "shutdown requested; stopping listeners and draining in-flight requests"
+    );
+    listener_shutdown.cancel();
     reload.abort();
-    while servers.join_next().await.is_some() {}
+    if drain_secs > 0 {
+        let drained = tokio::time::timeout(Duration::from_secs(drain_secs), async {
+            while servers.join_next().await.is_some() {}
+        })
+        .await;
+        state.shutdown_token().cancel();
+        if drained.is_err() {
+            warn!(
+                drain_secs,
+                "graceful drain timeout elapsed; aborting remaining active connections"
+            );
+            let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                while servers.join_next().await.is_some() {}
+            })
+            .await;
+            servers.abort_all();
+        }
+    } else {
+        state.shutdown_token().cancel();
+        while servers.join_next().await.is_some() {}
+    }
     state.shutdown().await;
 
     if let Some(path) = &socket_path {
