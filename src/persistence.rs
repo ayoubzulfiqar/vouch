@@ -59,6 +59,9 @@ pub struct PersistedBackendSession {
 pub struct PersistedResponse {
     /// Response identifier (`resp_...`).
     pub id: String,
+    /// Previous response id in the conversation chain, if any.
+    #[serde(default)]
+    pub parent_id: Option<String>,
     /// Active system prompt at completion.
     pub system: Option<String>,
     /// Full message history including assistant output and tool calls.
@@ -263,6 +266,7 @@ pub fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<()> {
             ),
         )));
     }
+    #[cfg(unix)]
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
         && let Ok(dir) = std::fs::File::open(parent)
