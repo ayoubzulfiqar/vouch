@@ -177,8 +177,8 @@ idle_timeout_secs = 120
 queue_timeout_ms = 1000
 isolate_workspace = false
 command = "opencode"
-args = ["run", "{prompt}"]
-resume_args = ["run", "--session", "{backend_session_id}", "{prompt}"]
+args = ["run", "--", "{prompt}"]
+resume_args = ["run", "--session", "{backend_session_id}", "--", "{prompt}"]
 session_id_regex = "session_id=([A-Za-z0-9_-]+)"
 stdin = false
 max_inline_prompt_bytes = 65536
@@ -255,6 +255,8 @@ persist = false
 # Deduplicate concurrent identical deterministic non-streaming requests via singleflight.
 # Defaults to `true` when `cache.enabled = true`.
 # coalesce_inflight = true
+# Maximum concurrent callers queued behind a singleflight leader before returning 503. Default: 64.
+max_coalesce_waiters = 64
 # Collapse consecutive whitespace before hashing cache/singleflight keys. Default: false.
 normalize_whitespace = false
 
@@ -338,6 +340,8 @@ daily_token_budget = 2000000
 max_concurrent = 4
 # Optional RFC-3339 expiration timestamp: expires_at = "2030-01-01T00:00:00Z"
 allowed_models = ["coding/*", "general", "gpt-4o"]
+# Optional MCP tool glob allowlist (defaults to built-in routes when `allowed_models` is restricted).
+# allowed_mcp_tools = ["vouch_ask", "route_*", "fs__*"]
 admin = true
 
 [[tokens]]
