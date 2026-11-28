@@ -8,6 +8,7 @@
 
 pub mod admin;
 pub mod anthropic;
+pub mod embeddings;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
@@ -40,8 +41,14 @@ use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 use crate::{
-    auth::{Principal, tokens::TokenConcurrencyGuard},
-    cache::{CACHE_STATUS_HEADER, CacheLookup, synthesize_stream_from_completion},
+    auth::{
+        Principal,
+        tokens::{TokenBudgetReservation, TokenConcurrencyGuard},
+    },
+    cache::{
+        CACHE_STATUS_HEADER, COALESCED_HEADER, CacheLookup, CachedCompletion, CoalesceRole,
+        InflightResult, synthesize_stream_from_completion,
+    },
     driver::{
         ChatMessage, ChunkStream, Completion, ContentPart, DriverResponse, ExecutionRequest,
         MessageContent, ResponseFormat, StreamChunk, ThinkingBlock, ToolCall, ToolCallDelta, Usage,
@@ -49,11 +56,32 @@ use crate::{
     },
     error::{GatewayError, Result},
     metrics,
+    recorder::FlightRecord,
     router::{RoutedResponse, RoutingInput, derive_session_key},
     state::AppState,
-    telemetry::{ActiveSpan, SpanKind, TraceContext},
+    telemetry::{ActiveSpan, RecentTraceEntry, SpanKind, TraceContext},
     usage::count_tokens,
 };
+
+#[derive(Debug, Clone)]
+pub(crate) struct FlightSnapshot {
+    pub system: Option<String>,
+    pub normalized_messages: Vec<ChatMessage>,
+    pub tools: Vec<serde_json::Value>,
+    pub response_format: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DispatchMeta {
+    pub protocol: &'static str,
+    pub backend_id: String,
+    pub profile_id: Option<String>,
+    pub fallback_used: bool,
+    pub coalesced: bool,
+    pub cache_outcome: String,
+    pub ttft_ms: u64,
+    pub flight_snapshot: Option<FlightSnapshot>,
+}
 
 /// Per-request context resolved before dispatch.
 #[derive(Debug, Clone)]
@@ -77,6 +105,49 @@ pub(crate) struct RequestContext {
     /// Per-token concurrency permit released when response/stream drops.
     #[allow(dead_code)]
     pub concurrency_guard: Arc<TokenConcurrencyGuard>,
+    /// Atomic pre-execution quota reservation settled when request finishes or drops.
+    pub reservation: Arc<parking_lot::Mutex<Option<TokenBudgetReservation>>>,
+    /// Mutable metadata collected across dispatch for telemetry, traces & flight recorder.
+    pub meta: Arc<parking_lot::Mutex<DispatchMeta>>,
+}
+
+impl RequestContext {
+    pub(crate) fn settle_tokens(&self, actual_total: u64) {
+        if let Some(mut res) = self.reservation.lock().take() {
+            res.settle(actual_total);
+        }
+    }
+
+    pub(crate) fn set_protocol(&self, protocol: &'static str) {
+        self.meta.lock().protocol = protocol;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn set_backend_meta(
+        &self,
+        backend_id: String,
+        profile_id: Option<String>,
+        fallback_used: bool,
+        coalesced: bool,
+        cache_outcome: &str,
+        ttft_ms: u64,
+        flight_snapshot: Option<FlightSnapshot>,
+    ) {
+        let mut meta = self.meta.lock();
+        meta.backend_id = backend_id;
+        meta.profile_id = profile_id;
+        meta.fallback_used = fallback_used;
+        meta.coalesced = coalesced;
+        meta.cache_outcome = cache_outcome.to_string();
+        meta.ttft_ms = ttft_ms;
+        if flight_snapshot.is_some() {
+            meta.flight_snapshot = flight_snapshot;
+        }
+    }
+
+    pub(crate) fn is_coalesced(&self) -> bool {
+        self.meta.lock().coalesced
+    }
 }
 
 /// Dispatched route result paired with optional `X-Vouch-Cache` header and miss key.
@@ -84,6 +155,7 @@ pub(crate) struct DispatchedExecution {
     pub routed: RoutedResponse,
     pub cache_status: Option<HeaderValue>,
     pub cache_miss_key: Option<String>,
+    pub coalesced: bool,
 }
 
 /// RAII accounting guard for streaming responses (SSE, WS, NDJSON, Gemini JSON array).
@@ -258,10 +330,14 @@ impl StreamUsageGuard {
         let usage = self.estimate_emitted_usage();
         let has_emitted = !self.emitted_text.is_empty() || !self.emitted_tool_bytes.is_empty();
         if has_emitted && usage.total_tokens > 0 {
-            self.context.principal.record_tokens(usage.total_tokens);
-            let cost = self
-                .state
-                .calculate_cost_usd(&self.context.model, &self.backend_id, usage);
+            self.context.settle_tokens(usage.total_tokens);
+            let profile_id = self.context.meta.lock().profile_id.clone();
+            let cost = self.state.calculate_cost_usd_for_profile(
+                &self.context.model,
+                &self.backend_id,
+                profile_id.as_deref(),
+                usage,
+            );
             self.state.usage().record_outcome_with_cost(
                 &self.context.principal.name,
                 &self.backend_id,
@@ -271,12 +347,23 @@ impl StreamUsageGuard {
                 true,
             );
         } else {
+            self.context.settle_tokens(0);
             self.state.usage().record_error(
                 &self.context.principal.name,
                 Some(&self.backend_id),
                 self.started.elapsed(),
             );
         }
+        emit_trace_and_flight(
+            &self.state,
+            &self.context,
+            &self.backend_id,
+            self.fallback,
+            usage,
+            self.started.elapsed(),
+            502,
+            Some(error),
+        );
         if let Some(span) = self.ingress_span.take() {
             span.finish_err(error);
         }
@@ -293,10 +380,14 @@ impl Drop for StreamUsageGuard {
             } else {
                 Usage::new(self.context.prompt_tokens, 0)
             };
-            self.context.principal.record_tokens(usage.total_tokens);
-            let cost = self
-                .state
-                .calculate_cost_usd(&self.context.model, &self.backend_id, usage);
+            self.context.settle_tokens(usage.total_tokens);
+            let profile_id = self.context.meta.lock().profile_id.clone();
+            let cost = self.state.calculate_cost_usd_for_profile(
+                &self.context.model,
+                &self.backend_id,
+                profile_id.as_deref(),
+                usage,
+            );
             self.state.usage().record_outcome_with_cost(
                 &self.context.principal.name,
                 &self.backend_id,
@@ -304,6 +395,16 @@ impl Drop for StreamUsageGuard {
                 self.started.elapsed(),
                 cost,
                 true,
+            );
+            emit_trace_and_flight(
+                &self.state,
+                &self.context,
+                &self.backend_id,
+                self.fallback,
+                usage,
+                self.started.elapsed(),
+                408,
+                Some("stream dropped before completion"),
             );
             if let Some(span) = self.ingress_span.take() {
                 span.finish_err("stream dropped before completion");
@@ -321,6 +422,7 @@ pub fn build_router(state: Arc<AppState>) -> AxumRouter {
     let mut router = AxumRouter::new()
         .route("/v1/models", get(openai::models))
         .route("/v1/chat/completions", post(openai::chat_completions))
+        .route("/v1/embeddings", post(embeddings::embeddings))
         .route(
             "/v1/responses",
             post(responses::responses).get(responses::responses_ws),
@@ -337,6 +439,7 @@ pub fn build_router(state: Arc<AppState>) -> AxumRouter {
         )
         .route("/admin/cache", delete(admin::purge_cache))
         .route("/v1/usage", get(ops::usage))
+        .route("/v1/traces", get(ops::traces))
         .route("/mcp", post(crate::cli::mcp::http_mcp))
         .route("/ui", get(ui::dashboard))
         .route("/healthz", get(ops::healthz))
@@ -407,6 +510,7 @@ pub(crate) fn prepare_routed_with_key_hint(
         &resolved.route,
     )?;
     let concurrency_guard = principal.acquire_concurrency_permit()?;
+    let reservation = principal.reserve_tokens(prompt_tokens)?;
 
     let request_id = header_text(headers, "x-request-id")
         .filter(|value| value.len() <= 128 && is_safe_id(value))
@@ -443,6 +547,8 @@ pub(crate) fn prepare_routed_with_key_hint(
         trace_context,
         prompt_tokens,
         concurrency_guard,
+        reservation: Arc::new(parking_lot::Mutex::new(Some(reservation))),
+        meta: Arc::new(parking_lot::Mutex::new(DispatchMeta::default())),
     })
 }
 
@@ -464,6 +570,7 @@ pub(crate) fn start_ingress_span(
     context: &RequestContext,
     endpoint: &'static str,
 ) -> ActiveSpan {
+    context.set_protocol(endpoint);
     let mut span =
         state
             .otel()
@@ -474,7 +581,7 @@ pub(crate) fn start_ingress_span(
     span
 }
 
-/// Record token daily budget + usage analytics + OTLP span completion on success.
+/// Record token daily budget + usage analytics + OTLP span completion + trace/flight logs on success.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_completion_outcome(
     state: &AppState,
@@ -490,8 +597,14 @@ pub(crate) fn record_completion_outcome(
     } else {
         usage
     };
-    context.principal.record_tokens(effective.total_tokens);
-    let cost_usd = state.calculate_cost_usd(&context.model, backend, effective);
+    context.settle_tokens(effective.total_tokens);
+    let profile_id = context.meta.lock().profile_id.clone();
+    let cost_usd = state.calculate_cost_usd_for_profile(
+        &context.model,
+        backend,
+        profile_id.as_deref(),
+        effective,
+    );
     state.usage().record_success_with_cost(
         &context.principal.name,
         backend,
@@ -499,10 +612,16 @@ pub(crate) fn record_completion_outcome(
         elapsed,
         cost_usd,
     );
+    emit_trace_and_flight(
+        state, context, backend, fallback, effective, elapsed, 200, None,
+    );
     if let Some(mut span) = span {
         span.set_str("vouch.route", &context.model);
         span.set_str("vouch.backend", backend);
         span.set_bool("vouch.fallback", fallback);
+        if let Some(pid) = profile_id {
+            span.set_str("vouch.profile", &pid);
+        }
         span.set_int("gen_ai.usage.input_tokens", effective.prompt_tokens as i64);
         span.set_int(
             "gen_ai.usage.output_tokens",
@@ -512,7 +631,7 @@ pub(crate) fn record_completion_outcome(
     }
 }
 
-/// Record failure analytics + OTLP span error cleanly.
+/// Record failure analytics + trace/flight entry + OTLP span error cleanly.
 pub(crate) fn record_error_outcome(
     state: &AppState,
     context: &RequestContext,
@@ -521,11 +640,96 @@ pub(crate) fn record_error_outcome(
     error: &str,
     span: Option<ActiveSpan>,
 ) {
+    context.settle_tokens(0);
     state
         .usage()
         .record_error(&context.principal.name, backend, elapsed);
+    emit_trace_and_flight(
+        state,
+        context,
+        backend.unwrap_or("none"),
+        false,
+        Usage::new(0, 0),
+        elapsed,
+        502,
+        Some(error),
+    );
     if let Some(span) = span {
         span.finish_err(error);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_trace_and_flight(
+    state: &AppState,
+    context: &RequestContext,
+    backend: &str,
+    fallback: bool,
+    usage: Usage,
+    elapsed: Duration,
+    status: u16,
+    error: Option<&str>,
+) {
+    let meta = context.meta.lock().clone();
+    let total_ms = elapsed.as_millis() as u64;
+    let ttft_ms = if meta.ttft_ms > 0 {
+        meta.ttft_ms
+    } else {
+        total_ms
+    };
+    let timestamp = iso8601_utc_now();
+    let cache = if meta.cache_outcome.is_empty() {
+        "disabled".to_string()
+    } else {
+        meta.cache_outcome
+    };
+    let protocol = if meta.protocol.is_empty() {
+        "/v1/chat/completions"
+    } else {
+        meta.protocol
+    };
+
+    state.traces().push(RecentTraceEntry {
+        request_id: context.request_id.clone(),
+        timestamp: timestamp.clone(),
+        protocol: protocol.to_string(),
+        route: context.model.clone(),
+        requested_model: context.requested_model.clone(),
+        backend: backend.to_string(),
+        profile_id: meta.profile_id.clone(),
+        fallback,
+        cache: cache.clone(),
+        coalesced: meta.coalesced,
+        ttft_ms,
+        total_ms,
+        status,
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        error: error.map(ToString::to_string),
+    });
+
+    if state.flight_recorder().is_enabled()
+        && let Some(snapshot) = meta.flight_snapshot
+    {
+        state.flight_recorder().record(FlightRecord {
+            timestamp,
+            protocol: protocol.to_string(),
+            requested_model: context.requested_model.clone(),
+            resolved_route: context.model.clone(),
+            winning_backend: backend.to_string(),
+            profile_id: meta.profile_id,
+            fallback_used: fallback,
+            cache_outcome: cache,
+            ttft_ms,
+            total_ms,
+            status,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            system: snapshot.system,
+            normalized_messages: snapshot.normalized_messages,
+            tools: snapshot.tools,
+            response_format: snapshot.response_format,
+        });
     }
 }
 
@@ -573,13 +777,29 @@ pub(crate) fn execution_request(
     }
 }
 
-/// Dispatch a request with deterministic response cache lookup and router deadline.
+/// Dispatch a request with egress guardrail enforcement, deterministic response cache
+/// lookup, singleflight in-flight request coalescing, and router deadline.
 pub(crate) async fn execute_or_cached(
     state: &AppState,
     context: &RequestContext,
     headers: &HeaderMap,
-    request: ExecutionRequest,
+    mut request: ExecutionRequest,
 ) -> Result<DispatchedExecution> {
+    state.egress_guard().inspect_request(&mut request)?;
+
+    let flight_snapshot = state
+        .flight_recorder()
+        .is_enabled()
+        .then(|| FlightSnapshot {
+            system: request.system.clone(),
+            normalized_messages: request.messages.clone(),
+            tools: request.tools.clone(),
+            response_format: request
+                .response_format
+                .as_ref()
+                .map(|rf| rf.to_openai_json()),
+        });
+
     let workspace_isolated = match context.workspace_mode {
         WorkspaceMode::Worktree => true,
         WorkspaceMode::None => false,
@@ -588,11 +808,25 @@ pub(crate) async fn execute_or_cached(
     let lookup = state
         .cache()
         .lookup(&context.model, &request, headers, workspace_isolated);
-    let cache_status = lookup.header_value();
+    let cache_enabled = state.cache().enabled();
+    let cache_status = if cache_enabled {
+        lookup.header_value()
+    } else {
+        None
+    };
     let cache_miss_key = lookup.miss_key().map(ToString::to_string);
 
     match lookup {
         CacheLookup::Hit(cached) => {
+            context.set_backend_meta(
+                cached.backend_id.clone(),
+                None,
+                false,
+                false,
+                "hit",
+                0,
+                flight_snapshot,
+            );
             let response = if request.stream {
                 DriverResponse::Stream(synthesize_stream_from_completion(&cached.completion))
             } else {
@@ -601,21 +835,155 @@ pub(crate) async fn execute_or_cached(
             Ok(DispatchedExecution {
                 routed: RoutedResponse {
                     backend_id: cached.backend_id,
+                    profile_id: None,
                     fallback_used: false,
                     response,
                     attempts: Vec::new(),
                 },
                 cache_status,
                 cache_miss_key: None,
+                coalesced: false,
             })
         }
         CacheLookup::Miss(_) | CacheLookup::Bypass | CacheLookup::Disabled => {
-            let routed = execute(state, request).await?;
-            Ok(DispatchedExecution {
-                routed,
-                cache_status,
-                cache_miss_key,
-            })
+            let role = state
+                .cache()
+                .begin_or_join_inflight(cache_miss_key.as_deref(), request.stream);
+            match role {
+                CoalesceRole::Waiter(mut rx) => {
+                    let cancel = request.cancel.clone();
+                    let timeout =
+                        Duration::from_secs(state.config().server.request_timeout_secs.max(1));
+                    let waited = tokio::time::timeout(timeout, async {
+                        loop {
+                            if let Some(res) = rx.borrow().clone() {
+                                return Ok(res);
+                            }
+                            tokio::select! {
+                                _ = cancel.cancelled() => return Err(GatewayError::ClientDisconnected),
+                                changed = rx.changed() => {
+                                    if changed.is_err() {
+                                        return Ok(InflightResult::Aborted);
+                                    }
+                                }
+                            }
+                        }
+                    })
+                    .await;
+
+                    if let Ok(Ok(InflightResult::Ready(cached))) = waited {
+                        metrics::record_coalesced_request();
+                        context.set_backend_meta(
+                            cached.backend_id.clone(),
+                            None,
+                            false,
+                            true,
+                            "coalesced",
+                            0,
+                            flight_snapshot,
+                        );
+                        return Ok(DispatchedExecution {
+                            routed: RoutedResponse {
+                                backend_id: cached.backend_id,
+                                profile_id: None,
+                                fallback_used: false,
+                                response: DriverResponse::Complete(cached.completion),
+                                attempts: Vec::new(),
+                            },
+                            cache_status,
+                            cache_miss_key: None,
+                            coalesced: true,
+                        });
+                    }
+                    // Leader aborted or waiter timed out waiting on slot: execute directly.
+                    let started = Instant::now();
+                    let routed = execute(state, request).await?;
+                    let cache_label = match &cache_miss_key {
+                        Some(_) if cache_enabled => "miss",
+                        _ if matches!(lookup, CacheLookup::Bypass) => "bypass",
+                        _ => "disabled",
+                    };
+                    context.set_backend_meta(
+                        routed.backend_id.clone(),
+                        routed.profile_id.clone(),
+                        routed.fallback_used,
+                        false,
+                        cache_label,
+                        started.elapsed().as_millis() as u64,
+                        flight_snapshot,
+                    );
+                    Ok(DispatchedExecution {
+                        routed,
+                        cache_status,
+                        cache_miss_key: if cache_enabled { cache_miss_key } else { None },
+                        coalesced: false,
+                    })
+                }
+                CoalesceRole::Leader(leader_guard) => {
+                    let started = Instant::now();
+                    let routed = execute(state, request).await?;
+                    let ttft_ms = started.elapsed().as_millis() as u64;
+                    let completed = completion(routed.response).await?;
+                    if cache_enabled && let Some(key) = &cache_miss_key {
+                        state
+                            .cache()
+                            .store(key.clone(), &routed.backend_id, &completed);
+                    }
+                    leader_guard.complete(CachedCompletion {
+                        completion: completed.clone(),
+                        backend_id: routed.backend_id.clone(),
+                    });
+                    context.set_backend_meta(
+                        routed.backend_id.clone(),
+                        routed.profile_id.clone(),
+                        routed.fallback_used,
+                        false,
+                        if cache_enabled {
+                            "miss"
+                        } else {
+                            "coalesce_leader"
+                        },
+                        ttft_ms,
+                        flight_snapshot,
+                    );
+                    Ok(DispatchedExecution {
+                        routed: RoutedResponse {
+                            backend_id: routed.backend_id,
+                            profile_id: routed.profile_id,
+                            fallback_used: routed.fallback_used,
+                            response: DriverResponse::Complete(completed),
+                            attempts: routed.attempts,
+                        },
+                        cache_status,
+                        cache_miss_key: None,
+                        coalesced: false,
+                    })
+                }
+                CoalesceRole::Direct => {
+                    let started = Instant::now();
+                    let routed = execute(state, request).await?;
+                    let cache_label = match (&cache_miss_key, cache_enabled) {
+                        (Some(_), true) => "miss",
+                        _ if matches!(lookup, CacheLookup::Bypass) => "bypass",
+                        _ => "disabled",
+                    };
+                    context.set_backend_meta(
+                        routed.backend_id.clone(),
+                        routed.profile_id.clone(),
+                        routed.fallback_used,
+                        false,
+                        cache_label,
+                        started.elapsed().as_millis() as u64,
+                        flight_snapshot,
+                    );
+                    Ok(DispatchedExecution {
+                        routed,
+                        cache_status,
+                        cache_miss_key: if cache_enabled { cache_miss_key } else { None },
+                        coalesced: false,
+                    })
+                }
+            }
         }
     }
 }
@@ -624,6 +992,15 @@ pub(crate) async fn execute_or_cached(
 pub(crate) fn insert_cache_header(response: &mut Response, status: Option<HeaderValue>) {
     if let Some(value) = status {
         response.headers_mut().insert(CACHE_STATUS_HEADER, value);
+    }
+}
+
+/// Attach `X-Vouch-Coalesced: true` when satisfied by in-flight singleflight coalescing.
+pub(crate) fn insert_coalesced_header(response: &mut Response, coalesced: bool) {
+    if coalesced {
+        response
+            .headers_mut()
+            .insert(COALESCED_HEADER, HeaderValue::from_static("true"));
     }
 }
 
@@ -643,6 +1020,19 @@ pub(crate) fn insert_routing_headers(
     );
     insert_header(response, "x-vouch-request-id", request_id);
     insert_cache_header(response, cache_status);
+}
+
+/// Attach standard routing headers plus `X-Vouch-Coalesced` when coalesced.
+pub(crate) fn insert_dispatched_headers(
+    response: &mut Response,
+    backend: &str,
+    fallback: bool,
+    request_id: &str,
+    cache_status: Option<HeaderValue>,
+    coalesced: bool,
+) {
+    insert_routing_headers(response, backend, fallback, request_id, cache_status);
+    insert_coalesced_header(response, coalesced);
 }
 
 /// Parse an RFC-3339-like UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp for current time.
