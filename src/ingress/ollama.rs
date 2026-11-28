@@ -29,9 +29,9 @@ use crate::{
     error::{GatewayError, Result},
     ingress::{
         CancelOnDrop, RequestContext, StreamUsageGuard, completion, execute_or_cached,
-        execution_request, insert_dispatched_headers, insert_routing_headers, into_chunk_stream,
-        iso8601_utc_now, prepare_routed, record_completion_outcome, record_error_outcome,
-        start_ingress_span,
+        execution_request, insert_dispatched_headers, insert_handoff_headers,
+        insert_routing_headers, into_chunk_stream, iso8601_utc_now, prepare_routed,
+        record_completion_outcome, record_error_outcome, record_memory_turn, start_ingress_span,
     },
     state::AppState,
     telemetry::redact_text,
@@ -370,6 +370,7 @@ async fn dispatch_ollama(
     let cache_miss_key = dispatched.cache_miss_key;
     let coalesced = dispatched.coalesced;
     let request_id = context.request_id.clone();
+    let handoff_from = context.handoff_from();
 
     if stream {
         let resp = build_ollama_ndjson_stream(
@@ -386,6 +387,7 @@ async fn dispatch_ollama(
         );
         let mut response = resp;
         insert_routing_headers(&mut response, &backend, fallback, &request_id, cache_status);
+        insert_handoff_headers(&mut response, handoff_from.as_deref());
         return Ok(response);
     }
 
@@ -399,6 +401,14 @@ async fn dispatch_ollama(
                 c.usage,
                 started.elapsed(),
                 Some(ingress_span),
+            );
+            record_memory_turn(
+                &state,
+                &context,
+                &backend,
+                c.usage,
+                &c.content,
+                &c.tool_calls,
             );
             if let Some(key) = cache_miss_key {
                 state.cache().store(key, &backend, &c);
@@ -445,6 +455,7 @@ async fn dispatch_ollama(
         cache_status,
         coalesced,
     );
+    insert_handoff_headers(&mut response, handoff_from.as_deref());
     Ok(response)
 }
 
