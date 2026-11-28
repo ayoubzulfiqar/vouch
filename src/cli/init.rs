@@ -187,7 +187,8 @@ pub async fn generate_config(docker_bridge: bool) -> Result<InitScaffold> {
     })
 }
 
-fn extra_user_bin_dirs() -> Vec<PathBuf> {
+/// Common user-local CLI binary directories scanned by `vouch init` and `vouch doctor --fix`.
+pub fn extra_user_bin_dirs() -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
@@ -214,7 +215,8 @@ pub fn find_cli_binary(name: &str, extra_dirs: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
-async fn tcp_probe(host: &str, port: u16) -> bool {
+/// Quick TCP connectivity probe used by `vouch init` and `vouch doctor --fix`.
+pub async fn tcp_probe(host: &str, port: u16) -> bool {
     tokio::time::timeout(Duration::from_millis(250), TcpStream::connect((host, port)))
         .await
         .is_ok_and(|res| res.is_ok())
