@@ -1,7 +1,7 @@
 class Vouch < Formula
   desc "Local authentication multiplexer and process-supervised gateway for AI orchestrators"
   homepage "https://github.com/ayoubzulfiqar/vouch"
-  version "5.0.0"
+  version "6.0.0"
   license "GPL-3.0-or-later"
 
   on_macos do
