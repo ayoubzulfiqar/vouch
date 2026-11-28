@@ -8,8 +8,9 @@
 //! execution).
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     net::SocketAddr,
+    process::Stdio,
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -18,13 +19,17 @@ use axum::{
     Json, Router as AxumRouter,
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{
+        HeaderMap, StatusCode,
+        header::{CONTENT_TYPE, HeaderName, HeaderValue},
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use dashmap::DashMap;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use uuid::Uuid;
@@ -32,7 +37,7 @@ use uuid::Uuid;
 use crate::{
     auth::Principal,
     cli::{McpArgs, McpTransport},
-    config::GatewayConfig,
+    config::{GatewayConfig, McpUpstreamConfig, McpUpstreamTransport},
     driver::{ChatMessage, ExecutionRequest, WorkspaceMode, render_prompt},
     error::{GatewayError, Result},
     ingress::{completion, ops},
@@ -446,6 +451,8 @@ pub async fn handle_rpc_with_headers(
                     "protocolVersion": protocol,
                     "capabilities": {
                         "tools": { "listChanged": false },
+                        "resources": { "subscribe": false, "listChanged": false },
+                        "prompts": { "listChanged": false },
                         "tasks": { "list": true, "cancel": true }
                     },
                     "serverInfo": {
@@ -462,12 +469,14 @@ pub async fn handle_rpc_with_headers(
                 },
                 "capabilities": {
                     "tools": { "listChanged": false },
+                    "resources": { "subscribe": false, "listChanged": false },
+                    "prompts": { "listChanged": false },
                     "tasks": { "list": true, "cancel": true }
                 },
                 "stateless": true,
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(tools_list_payload(state)),
+            "tools/list" => Ok(tools_list_payload(state).await),
             "tools/call" => {
                 if params.get("task").is_some()
                     || params.pointer("/_meta/task").and_then(Value::as_bool) == Some(true)
@@ -477,6 +486,10 @@ pub async fn handle_rpc_with_headers(
                     handle_tool_call(state, principal, &params, trace_ctx).await
                 }
             }
+            "resources/list" => Ok(resources_list_payload()),
+            "resources/read" => handle_resources_read(state, &params),
+            "prompts/list" => Ok(prompts_list_payload(state)),
+            "prompts/get" => handle_prompts_get(state, &params),
             "tasks/create" => handle_task_create(state, principal, &params, trace_ctx),
             "tasks/get" => handle_task_get(state, principal, &params),
             "tasks/result" => handle_task_result(state, principal, &params).await,
@@ -497,7 +510,7 @@ pub async fn handle_rpc_with_headers(
     .await
 }
 
-fn tools_list_payload(state: &AppState) -> Value {
+async fn tools_list_payload(state: &AppState) -> Value {
     let models = state.router().models();
     let route_tools = build_route_tool_map(&models);
 
@@ -573,6 +586,48 @@ fn tools_list_payload(state: &AppState) -> Value {
                 "required": ["prompt"]
             }
         }));
+    }
+
+    let upstreams = state.config().mcp_upstreams.clone();
+    for upstream in &upstreams {
+        match fetch_upstream_tools(upstream).await {
+            Ok(remote_tools) => {
+                for mut tool in remote_tools {
+                    let Some(obj) = tool.as_object_mut() else {
+                        continue;
+                    };
+                    let Some(orig_name) = obj
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                    else {
+                        continue;
+                    };
+                    obj.insert(
+                        "name".into(),
+                        json!(format!("{}__{orig_name}", upstream.id)),
+                    );
+                    if let Some(desc) = obj
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                    {
+                        obj.insert(
+                            "description".into(),
+                            json!(format!("[{}] {desc}", upstream.id)),
+                        );
+                    }
+                    tools.push(tool);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    upstream = %upstream.id,
+                    error = %error,
+                    "failed discovering upstream MCP tools"
+                );
+            }
+        }
     }
 
     json!({
@@ -695,6 +750,9 @@ fn prepare_tool_execution(
         delta_messages: None,
         session_capture: Arc::new(parking_lot::Mutex::new(None)),
         trace_context: Some(trace_ctx),
+        profile_id: None,
+        profile_env: BTreeMap::new(),
+        allowed_backends: None,
         extra: Map::new(),
     };
     Ok((request, workspace_mode))
@@ -706,14 +764,29 @@ async fn handle_tool_call(
     params: &Value,
     trace_ctx: TraceContext,
 ) -> std::result::Result<Value, (i32, String)> {
-    let _tool_name = params
+    let tool_name = params
         .get("name")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| (-32602, "tools/call requires non-empty `name`".to_string()))?;
-    if params.get("arguments").and_then(Value::as_object).is_none() {
-        return Err((-32602, "tools/call requires object `arguments`".to_string()));
+    let arguments = params
+        .get("arguments")
+        .and_then(Value::as_object)
+        .ok_or_else(|| (-32602, "tools/call requires object `arguments`".to_string()))?;
+
+    if let Some((upstream_id, remote_tool)) = tool_name.split_once("__") {
+        let upstream = state
+            .config()
+            .mcp_upstreams
+            .iter()
+            .find(|u| u.id == upstream_id)
+            .cloned();
+        if let Some(upstream) = upstream {
+            return proxy_upstream_tool_call(&upstream, remote_tool, arguments)
+                .await
+                .map_err(|error| (-32001, telemetry::redact_text(&error.to_string())));
+        }
     }
 
     let (request, workspace_mode) = prepare_tool_execution(
@@ -1015,6 +1088,388 @@ fn handle_task_cancel(
         })?;
 
     state.mcp_tasks().cancel_task(task_id, &principal.name)
+}
+
+fn resources_list_payload() -> Value {
+    json!({
+        "resources": [
+            {
+                "uri": "vouch://health",
+                "name": "Gateway Health",
+                "description": "Live daemon readiness, circuit breaker status, version, and uptime.",
+                "mimeType": "application/json",
+            },
+            {
+                "uri": "vouch://routes",
+                "name": "Configured Model Routes",
+                "description": "Public model routes, aliases, scheduling policies, and backend chains.",
+                "mimeType": "application/json",
+            },
+            {
+                "uri": "vouch://usage",
+                "name": "Usage & Cost Analytics",
+                "description": "Cumulative per-token and per-backend BPE tokens, latency percentiles, and estimated USD spend.",
+                "mimeType": "application/json",
+            }
+        ]
+    })
+}
+
+fn handle_resources_read(
+    state: &AppState,
+    params: &Value,
+) -> std::result::Result<Value, (i32, String)> {
+    let uri = params
+        .get("uri")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| {
+            (
+                -32602,
+                "resources/read requires non-empty `uri`".to_string(),
+            )
+        })?;
+
+    let payload = match uri {
+        "vouch://health" => {
+            let config = state.config();
+            let readiness = state.router().readiness();
+            json!({
+                "status": "ok",
+                "version": crate::VERSION,
+                "uptime_secs": state.uptime_secs(),
+                "ready": readiness.ready,
+                "tokens_enforced": state.tokens().enabled(),
+                "workspace_enabled": config.workspace.enabled,
+                "backends": readiness.backends,
+            })
+        }
+        "vouch://routes" => {
+            let config = state.config();
+            let models = state.router().model_info();
+            json!({
+                "models": models,
+                "aliases": config.aliases,
+                "route_policies": config.route_policies,
+            })
+        }
+        "vouch://usage" => {
+            let budgets = state.tokens().budget_statuses();
+            let report = state.usage().report(state.uptime_secs(), &budgets);
+            serde_json::to_value(&report)
+                .map_err(|error| (-32603, format!("cannot serialize usage report: {error}")))?
+        }
+        other => return Err((-32602, format!("unknown resource uri: {other:?}"))),
+    };
+
+    let text = serde_json::to_string_pretty(&payload)
+        .map_err(|error| (-32603, format!("cannot encode resource JSON: {error}")))?;
+    Ok(json!({
+        "contents": [{
+            "uri": uri,
+            "mimeType": "application/json",
+            "text": text,
+        }]
+    }))
+}
+
+fn prompts_list_payload(state: &AppState) -> Value {
+    let prompts: Vec<Value> = state
+        .config()
+        .mcp_prompts
+        .iter()
+        .map(|prompt| {
+            let args: Vec<Value> = prompt
+                .arguments
+                .iter()
+                .map(|arg| {
+                    json!({
+                        "name": arg.name,
+                        "description": arg.description,
+                        "required": arg.required,
+                    })
+                })
+                .collect();
+            json!({
+                "name": prompt.name,
+                "description": prompt.description,
+                "arguments": args,
+            })
+        })
+        .collect();
+    json!({ "prompts": prompts })
+}
+
+fn handle_prompts_get(
+    state: &AppState,
+    params: &Value,
+) -> std::result::Result<Value, (i32, String)> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| (-32602, "prompts/get requires non-empty `name`".to_string()))?;
+
+    let cfg = state.config();
+    let Some(prompt) = cfg.mcp_prompts.iter().find(|p| p.name == name) else {
+        return Err((-32602, format!("unknown MCP prompt {name:?}")));
+    };
+    let supplied = params
+        .get("arguments")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    for decl in &prompt.arguments {
+        if decl.required {
+            let present = supplied
+                .get(&decl.name)
+                .is_some_and(|v| !v.is_null() && v.as_str().map(|s| !s.is_empty()).unwrap_or(true));
+            if !present {
+                return Err((
+                    -32602,
+                    format!("prompt {name:?} missing required argument {:?}", decl.name),
+                ));
+            }
+        }
+    }
+
+    let mut rendered = prompt.template.clone();
+    for (k, v) in &supplied {
+        let replacement = match v {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        };
+        rendered = rendered.replace(&format!("{{{{{k}}}}}"), &replacement);
+    }
+
+    Ok(json!({
+        "description": prompt.description,
+        "messages": [{
+            "role": "user",
+            "content": {
+                "type": "text",
+                "text": rendered,
+            }
+        }]
+    }))
+}
+
+async fn fetch_upstream_tools(upstream: &McpUpstreamConfig) -> Result<Vec<Value>> {
+    let resp = call_upstream_mcp(upstream, "tools/list", json!({})).await?;
+    let tools = resp
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(tools)
+}
+
+async fn proxy_upstream_tool_call(
+    upstream: &McpUpstreamConfig,
+    tool_name: &str,
+    arguments: &Map<String, Value>,
+) -> Result<Value> {
+    call_upstream_mcp(
+        upstream,
+        "tools/call",
+        json!({
+            "name": tool_name,
+            "arguments": arguments,
+        }),
+    )
+    .await
+}
+
+async fn call_upstream_mcp(
+    upstream: &McpUpstreamConfig,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    let timeout = Duration::from_secs(upstream.timeout_secs.max(1));
+    match upstream.transport {
+        McpUpstreamTransport::Http => {
+            let base_url = upstream.base_url.as_deref().ok_or_else(|| {
+                GatewayError::Config(format!("mcp_upstream {:?} missing base_url", upstream.id))
+            })?;
+            let client = reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .map_err(|error| {
+                    GatewayError::Internal(format!("cannot build MCP HTTP client: {error}"))
+                })?;
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            for (k, v) in &upstream.extra_headers {
+                let name = HeaderName::from_bytes(k.as_bytes()).map_err(|error| {
+                    GatewayError::Config(format!(
+                        "mcp_upstream {:?} invalid header {k:?}: {error}",
+                        upstream.id
+                    ))
+                })?;
+                let val = HeaderValue::from_str(v).map_err(|error| {
+                    GatewayError::Config(format!(
+                        "mcp_upstream {:?} invalid header value for {k:?}: {error}",
+                        upstream.id
+                    ))
+                })?;
+                headers.insert(name, val);
+            }
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params,
+            });
+            let response = client
+                .post(base_url)
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| {
+                    GatewayError::Upstream(format!(
+                        "mcp_upstream {:?} HTTP call failed: {error}",
+                        upstream.id
+                    ))
+                })?;
+            let status = response.status();
+            let text = response.text().await.map_err(|error| {
+                GatewayError::Upstream(format!(
+                    "mcp_upstream {:?} read failed: {error}",
+                    upstream.id
+                ))
+            })?;
+            if !status.is_success() {
+                return Err(GatewayError::Upstream(format!(
+                    "mcp_upstream {:?} returned HTTP {status}: {}",
+                    upstream.id,
+                    telemetry::redact_text(&text)
+                )));
+            }
+            let parsed: Value = serde_json::from_str(&text).map_err(|error| {
+                GatewayError::Upstream(format!(
+                    "mcp_upstream {:?} returned invalid JSON: {error}",
+                    upstream.id
+                ))
+            })?;
+            extract_rpc_result(&upstream.id, parsed)
+        }
+        McpUpstreamTransport::Stdio => {
+            let command = upstream.command.as_deref().ok_or_else(|| {
+                GatewayError::Config(format!("mcp_upstream {:?} missing command", upstream.id))
+            })?;
+            let mut cmd = Command::new(command);
+            cmd.args(&upstream.args)
+                .envs(&upstream.env)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            cmd.process_group(0);
+
+            let mut child = cmd.spawn().map_err(|error| {
+                GatewayError::Upstream(format!(
+                    "cannot spawn mcp_upstream {:?}: {error}",
+                    upstream.id
+                ))
+            })?;
+            let pid = child.id().unwrap_or(0);
+            #[cfg(unix)]
+            let guard = if pid > 0 {
+                Some(crate::driver::ProcessGroupGuard::new(
+                    pid,
+                    upstream.id.clone(),
+                ))
+            } else {
+                None
+            };
+
+            let req_future = async {
+                let mut stdin = child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| GatewayError::Internal("upstream stdio missing stdin".into()))?;
+                let stdout = child.stdout.take().ok_or_else(|| {
+                    GatewayError::Internal("upstream stdio missing stdout".into())
+                })?;
+
+                let init_msg = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": MCP_PROTOCOL_LEGACY,
+                        "capabilities": {},
+                        "clientInfo": { "name": "vouch", "version": crate::VERSION }
+                    }
+                });
+                let notify_msg = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                });
+                let call_msg = json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": method,
+                    "params": params,
+                });
+                let payload = format!("{init_msg}\n{notify_msg}\n{call_msg}\n");
+                stdin.write_all(payload.as_bytes()).await?;
+                let _ = stdin.shutdown().await;
+
+                let mut lines = BufReader::new(stdout).lines();
+                while let Some(line) = lines.next_line().await? {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Ok(val) = serde_json::from_str::<Value>(trimmed)
+                        && val.get("id").and_then(Value::as_i64) == Some(2)
+                    {
+                        return extract_rpc_result(&upstream.id, val);
+                    }
+                }
+                Err(GatewayError::Upstream(format!(
+                    "mcp_upstream {:?} closed stdout before responding to {method}",
+                    upstream.id
+                )))
+            };
+
+            let res = tokio::time::timeout(timeout, req_future).await;
+            #[cfg(unix)]
+            if let Some(g) = guard {
+                g.terminate();
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+            match res {
+                Ok(inner) => inner,
+                Err(_) => Err(GatewayError::Timeout(timeout)),
+            }
+        }
+    }
+}
+
+fn extract_rpc_result(upstream_id: &str, response: Value) -> Result<Value> {
+    if let Some(error) = response.get("error") {
+        let msg = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown MCP error");
+        return Err(GatewayError::Upstream(format!(
+            "mcp_upstream {upstream_id:?} returned error: {}",
+            telemetry::redact_text(msg)
+        )));
+    }
+    response.get("result").cloned().ok_or_else(|| {
+        GatewayError::Upstream(format!(
+            "mcp_upstream {upstream_id:?} response missing `result`"
+        ))
+    })
 }
 
 /// Build deterministic, collision-free `route_<sanitized>` tool names.
