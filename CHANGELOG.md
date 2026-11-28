@@ -2,6 +2,32 @@
 
 All notable changes to `vouch` are documented in this file.
 
+## [5.0.0] - 2026-11-28
+
+### Added
+- **Singleflight In-Flight Request Coalescing (`src/cache.rs`, `src/ingress/mod.rs`):**
+  - Added `cache.coalesce_inflight` (defaults to `true` when `cache.enabled = true`, configurable independently) and `cache.normalize_whitespace` (default `false`).
+  - Deduplicates concurrent identical deterministic non-streaming requests through a `tokio::sync::watch` singleflight slot so only one backend execution runs; secondary callers receive the shared response with `X-Vouch-Coalesced: true` and increment `vouch_coalesced_requests_total`.
+- **Outbound Egress Secret Guardrails & Output Filters (`src/security/egress_guard.rs`, `src/driver/`):**
+  - Added `[security.egress_guard]` (`mode = "off" | "redact" | "block"`, `block_private_keys = true`, `extra_patterns`) inspecting prompts, messages, tool arguments, and `/v1/embeddings` inputs before dispatching upstream, emitting `vouch_egress_guard_actions_total{action}` and returning `403 egress_policy_blocked` on `block`.
+  - Added `[[backends.output_filters]]` (`pattern`, `replace`) regex filtering across buffered and streaming `cli`/`pty` outputs.
+- **OpenAI `/v1/embeddings` Ingress (`src/ingress/embeddings.rs`):**
+  - Added `POST /v1/embeddings` (`string` / `string[]` inputs, `"float"` and IEEE-754 little-endian `"base64"` formats) backed by `Driver::embed` across OpenAI `/v1/embeddings`, Ollama `/api/embed`, and `cli` JSON vector backends.
+- **Opt-In Redacted Flight Recorder & `vouch replay` (`src/recorder.rs`, `src/cli/replay.rs`):**
+  - Added `[flight_recorder]` (`enabled`, `max_records = 500`, `path`) asynchronously writing secret-scrubbed JSONL logs with rotation.
+  - Added `vouch replay --config vouch.toml [--file ...] [--route ...] [--limit 20] [--json]` to replay captured requests and validate schema/tool contracts.
+- **Self-Healing `vouch doctor --fix` & `vouch config diff` (`src/cli/doctor.rs`, `src/cli/config_cmd.rs`):**
+  - Added `vouch doctor --fix [--yes]` to repair missing CLI paths and unreachable local daemon URLs cleanly with schema validation and atomic `0600` writes.
+  - Added `vouch config diff --current ... --candidate ... [--json]` for semantic TOML diffing without exposing raw secrets.
+- **Interactive Console v2 (`GET /ui`) & Trace Ring Buffer (`GET /v1/traces`):**
+  - Added an authenticated `GET /v1/traces` ring buffer (`100` recent redacted entries) and upgraded `GET /ui` with **Topology & Health** (plus one-click circuit reset), **Route Playground**, and **Trace Waterfall** tabs.
+
+### Fixed
+- **Hedged Routing Attribution & Non-Blocking Loser Cancellation:** Tracked winning `profile_id` alongside `backend_id` through `CandidateOutcome` / `RoutedResponse`, `StreamUsageGuard`, `[pricing]` (`backend:profile` lookup), and trace spans while cancelling losing hedged tasks cleanly in background tasks.
+- **Pre-Execution Token Budget Reservations:** Added atomic `TokenBudgetReservation` (`TokenPolicy::check_and_reserve_tokens` / `settle_tokens`) across `daily_token_budget` and 60 s `tpm` so concurrent bursts cannot overshoot quotas before streams finish.
+- **Crash-Orphan Temp/Worktree Sweep & Graceful Drain:** Tagged `vouch_att_*`, `vouch_prompt_*`, and `.vouch.pid` worktree sidecars with creator PIDs, swept orphaned artifacts on `vouch serve` startup, and added `server.shutdown_drain_secs` (default `15`) to stop accepting new connections before cancelling active tasks.
+- **Cross-Protocol Tool & Multimodal Fidelity:** Preserved `tool_call_id` and image placeholders in `tool_bridge::format_message`, mapped Gemini `thought: true` parts and incremental streaming `functionCall` deltas, and mapped Ollama `/api/chat` inbound `tool_calls`, `tool_call_id`, and flexible `options`.
+
 ## [4.0.0] - 2026-11-27
 
 ### Added
