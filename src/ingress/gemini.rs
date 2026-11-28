@@ -24,14 +24,16 @@ use uuid::Uuid;
 
 use crate::{
     driver::{
-        ChatMessage, ContentPart, MessageContent, ResponseFormat, StreamChunk, ToolCall, Usage,
-        attachments::parse_data_uri, tool_bridge::normalize_tool_definition, truncate,
+        ChatMessage, ContentPart, MessageContent, ResponseFormat, StreamChunk, ThinkingBlock,
+        ToolCall, Usage, attachments::parse_data_uri, tool_bridge::normalize_tool_definition,
+        truncate,
     },
     error::{GatewayError, Result},
     ingress::{
         CancelOnDrop, StreamUsageGuard, completion, execute_or_cached, execution_request,
-        insert_routing_headers, into_chunk_stream, prepare_routed_with_key_hint,
-        record_completion_outcome, record_error_outcome, sse_response, start_ingress_span,
+        insert_dispatched_headers, insert_routing_headers, into_chunk_stream,
+        prepare_routed_with_key_hint, record_completion_outcome, record_error_outcome,
+        sse_response, start_ingress_span,
     },
     state::AppState,
     telemetry::redact_text,
@@ -216,6 +218,7 @@ async fn generate_inner(
     let driver_response = dispatched.routed.response;
     let cache_status = dispatched.cache_status;
     let cache_miss_key = dispatched.cache_miss_key;
+    let coalesced = dispatched.coalesced;
     let request_id = context.request_id.clone();
 
     if stream {
@@ -244,7 +247,7 @@ async fn generate_inner(
             let _cancel_guard = CancelOnDrop(cancel_clone.clone());
             let deadline = tokio::time::Instant::now() + Duration::from_secs(stream_timeout);
             let mut saw_tool_calls = false;
-            let mut tool_calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
+            let mut tool_calls: BTreeMap<usize, (ToolCall, bool)> = BTreeMap::new();
             let mut final_usage: Option<Usage> = None;
 
             loop {
@@ -262,6 +265,7 @@ async fn generate_inner(
                         usage_guard.observe_chunk(&chunk);
                         let StreamChunk {
                             delta,
+                            thinking_delta,
                             tool_calls: tc_deltas,
                             finish_reason,
                             usage,
@@ -270,43 +274,86 @@ async fn generate_inner(
                         if let Some(u) = usage {
                             final_usage = Some(u);
                         }
+                        if let Some(thinking) = thinking_delta.as_deref()
+                            && !thinking.is_empty()
+                        {
+                            let body = gemini_chunk_json(
+                                &model,
+                                "",
+                                &[],
+                                &[ThinkingBlock::Thinking {
+                                    thinking: thinking.to_string(),
+                                    signature: None,
+                                }],
+                                None,
+                                None,
+                            );
+                            if tx.send(Ok(body)).await.is_err() {
+                                break;
+                            }
+                        }
                         if !delta.is_empty() {
-                            let body = gemini_chunk_json(&model, &delta, &[], None, None);
+                            let body = gemini_chunk_json(&model, &delta, &[], &[], None, None);
                             if tx.send(Ok(body)).await.is_err() {
                                 break;
                             }
                         }
                         if !tc_deltas.is_empty() {
                             saw_tool_calls = true;
+                            let mut ready_now = Vec::new();
                             for td in tc_deltas {
-                                let entry =
-                                    tool_calls.entry(td.index).or_insert_with(|| ToolCall {
-                                        id: td.id.clone().unwrap_or_else(|| {
-                                            format!("call_{}", Uuid::new_v4().simple())
-                                        }),
-                                        name: td.name.clone().unwrap_or_default(),
-                                        arguments: String::new(),
-                                    });
+                                let entry = tool_calls.entry(td.index).or_insert_with(|| {
+                                    (
+                                        ToolCall {
+                                            id: td.id.clone().unwrap_or_else(|| {
+                                                format!("call_{}", Uuid::new_v4().simple())
+                                            }),
+                                            name: td.name.clone().unwrap_or_default(),
+                                            arguments: String::new(),
+                                        },
+                                        false,
+                                    )
+                                });
                                 if let Some(id) = td.id {
-                                    entry.id = id;
+                                    entry.0.id = id;
                                 }
                                 if let Some(name) = td.name {
-                                    entry.name = name;
+                                    entry.0.name = name;
                                 }
                                 if let Some(args) = td.arguments_delta {
-                                    entry.arguments.push_str(&args);
+                                    entry.0.arguments.push_str(&args);
+                                }
+                                if !entry.1
+                                    && !entry.0.name.is_empty()
+                                    && serde_json::from_str::<Value>(&entry.0.arguments).is_ok()
+                                {
+                                    entry.1 = true;
+                                    ready_now.push(entry.0.clone());
+                                }
+                            }
+                            if !ready_now.is_empty() {
+                                let body =
+                                    gemini_chunk_json(&model, "", &ready_now, &[], None, None);
+                                if tx.send(Ok(body)).await.is_err() {
+                                    break;
                                 }
                             }
                         }
                         if let Some(reason) = finish_reason {
-                            let calls: Vec<ToolCall> = tool_calls.into_values().collect();
+                            let remaining_calls: Vec<ToolCall> = tool_calls
+                                .into_values()
+                                .filter_map(|(call, emitted)| (!emitted).then_some(call))
+                                .collect();
                             let effective = usage_guard.complete(final_usage.or(usage), &reason);
-                            let gemini_reason =
-                                gemini_finish_reason(&reason, saw_tool_calls || !calls.is_empty());
+                            let gemini_reason = gemini_finish_reason(
+                                &reason,
+                                saw_tool_calls || !remaining_calls.is_empty(),
+                            );
                             let body = gemini_chunk_json(
                                 &model,
                                 "",
-                                &calls,
+                                &remaining_calls,
+                                &[],
                                 Some(gemini_reason),
                                 Some(effective),
                             );
@@ -320,19 +367,25 @@ async fn generate_inner(
                         break;
                     }
                     None => {
-                        let calls: Vec<ToolCall> = tool_calls.into_values().collect();
-                        let reason = if saw_tool_calls || !calls.is_empty() {
+                        let remaining_calls: Vec<ToolCall> = tool_calls
+                            .into_values()
+                            .filter_map(|(call, emitted)| (!emitted).then_some(call))
+                            .collect();
+                        let reason = if saw_tool_calls || !remaining_calls.is_empty() {
                             "tool_calls"
                         } else {
                             "stop"
                         };
                         let effective = usage_guard.complete(final_usage, reason);
-                        let gemini_reason =
-                            gemini_finish_reason(reason, saw_tool_calls || !calls.is_empty());
+                        let gemini_reason = gemini_finish_reason(
+                            reason,
+                            saw_tool_calls || !remaining_calls.is_empty(),
+                        );
                         let body = gemini_chunk_json(
                             &model,
                             "",
-                            &calls,
+                            &remaining_calls,
+                            &[],
                             Some(gemini_reason),
                             Some(effective),
                         );
@@ -415,11 +468,19 @@ async fn generate_inner(
         &context.model,
         &completion.content,
         &completion.tool_calls,
+        &completion.thinking,
         Some(finish),
         Some(completion.usage),
     );
     let mut response = Json(body).into_response();
-    insert_routing_headers(&mut response, &backend, fallback, &request_id, cache_status);
+    insert_dispatched_headers(
+        &mut response,
+        &backend,
+        fallback,
+        &request_id,
+        cache_status,
+        coalesced,
+    );
     Ok(response)
 }
 
@@ -445,10 +506,16 @@ fn normalize_contents(contents: Vec<GeminiContent>) -> Vec<ChatMessage> {
 
         for part in item.parts {
             if let Some(text) = part.get("text").and_then(Value::as_str) {
-                parts.push(ContentPart::Text {
-                    text: text.to_string(),
-                    cache_control: None,
-                });
+                let is_thought = part
+                    .get("thought")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !is_thought {
+                    parts.push(ContentPart::Text {
+                        text: text.to_string(),
+                        cache_control: None,
+                    });
+                }
             } else if let Some(inline) = part.get("inlineData").or_else(|| part.get("inline_data"))
                 && let Some(data) = inline.get("data").and_then(Value::as_str)
             {
@@ -484,8 +551,13 @@ fn normalize_contents(contents: Vec<GeminiContent>) -> Vec<ChatMessage> {
                     .get("args")
                     .map(Value::to_string)
                     .unwrap_or_else(|| "{}".into());
+                let id = fc
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
                 calls.push(ToolCall {
-                    id: format!("call_{}", Uuid::new_v4().simple()),
+                    id,
                     name: name.to_string(),
                     arguments: args,
                 });
@@ -497,6 +569,11 @@ fn normalize_contents(contents: Vec<GeminiContent>) -> Vec<ChatMessage> {
                     .get("name")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
+                let tool_call_id = fr
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .or_else(|| name.clone());
                 let content_str = fr
                     .get("response")
                     .map(|r| match r {
@@ -508,7 +585,7 @@ fn normalize_contents(contents: Vec<GeminiContent>) -> Vec<ChatMessage> {
                     role: "tool".into(),
                     content: MessageContent::Text(content_str),
                     tool_calls: Vec::new(),
-                    tool_call_id: None,
+                    tool_call_id,
                     name,
                 });
             }
@@ -578,10 +655,18 @@ fn gemini_chunk_json(
     model: &str,
     text: &str,
     tool_calls: &[ToolCall],
+    thinking: &[ThinkingBlock],
     finish_reason: Option<&str>,
     usage: Option<Usage>,
 ) -> Value {
     let mut parts = Vec::new();
+    for block in thinking {
+        if let ThinkingBlock::Thinking { thinking, .. } = block
+            && !thinking.is_empty()
+        {
+            parts.push(json!({ "thought": true, "text": thinking }));
+        }
+    }
     if !text.is_empty() {
         parts.push(json!({ "text": text }));
     }
