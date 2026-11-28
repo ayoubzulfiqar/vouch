@@ -77,6 +77,12 @@ pub struct GatewayConfig {
     /// Opt-in redacted JSONL flight recorder (`[flight_recorder]`).
     #[serde(default)]
     pub flight_recorder: FlightRecorderConfig,
+    /// Cross-agent shared session ledger & handoff settings (`[shared_memory]`).
+    #[serde(default)]
+    pub shared_memory: SharedMemoryConfig,
+    /// Model-free `trace` stdio MCP codebase intelligence bridge (`[trace]`).
+    #[serde(default)]
+    pub trace: TraceBridgeConfig,
     /// Optional virtual ingress tokens.
     #[serde(default)]
     pub tokens: Vec<TokenConfig>,
@@ -577,6 +583,60 @@ pub struct FlightRecorderConfig {
     /// or `std::env::temp_dir().join("vouch-flight.jsonl")`.
     #[serde(default)]
     pub path: Option<PathBuf>,
+}
+
+/// Cross-agent canonical session ledger & deterministic handoff settings (`[shared_memory]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedMemoryConfig {
+    /// Enable canonical session memory tracking and `<vouch_shared_context>` handoffs. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum canonical turns kept per session before oldest turns drop. Default: `32`.
+    #[serde(default = "default_shared_memory_max_turns")]
+    pub max_turns_per_session: usize,
+    /// Strict BPE token budget for injected `<vouch_shared_context>` handoff envelopes. Default: `1500`.
+    #[serde(default = "default_shared_memory_max_context_tokens")]
+    pub max_context_tokens: usize,
+    /// Inject repository context from `[trace]` on turn 1 of a new session. Default: `true`.
+    #[serde(default = "default_true")]
+    pub inject_on_new_session: bool,
+    /// Inject `<vouch_shared_context>` whenever execution moves to a different agent or loses native handle. Default: `true`.
+    #[serde(default = "default_true")]
+    pub inject_on_handoff: bool,
+    /// Write structured session checkpoints back to `trace` via `record_session`. Default: `true`.
+    #[serde(default = "default_true")]
+    pub sync_to_trace: bool,
+}
+
+/// Model-free `trace` stdio MCP intelligence bridge settings (`[trace]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceBridgeConfig {
+    /// Enable spawning pooled `trace serve` stdio MCP workers. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Executable command used to launch the `trace` MCP server. Default: `"trace"`.
+    #[serde(default = "default_trace_command")]
+    pub command: String,
+    /// Command-line arguments passed to `command` (supports `{root}`). Default: `["serve"]`.
+    #[serde(default = "default_trace_args")]
+    pub args: Vec<String>,
+    /// Optional workspace root passed to `trace`; falls back to `workspace.repo_path` or cwd.
+    #[serde(default)]
+    pub workspace_root: Option<PathBuf>,
+    /// Startup + `initialize` handshake timeout in milliseconds. Default: `3000`.
+    #[serde(default = "default_trace_startup_timeout_ms")]
+    pub startup_timeout_ms: u64,
+    /// Hard per-RPC deadline in milliseconds so `trace` queries never stall requests. Default: `1500`.
+    #[serde(default = "default_trace_query_timeout_ms")]
+    pub query_timeout_ms: u64,
+    /// BPE sub-budget reserved inside `shared_memory.max_context_tokens` for `trace` facts. Default: `900`.
+    #[serde(default = "default_trace_max_tokens")]
+    pub max_trace_tokens: usize,
+    /// When `true`, `vouch doctor` fails with exit `2` if `trace` is unreachable. Default: `false`.
+    #[serde(default)]
+    pub required: bool,
 }
 
 /// One credential profile in a `cli` or `pty` backend rotation pool.
@@ -1173,6 +1233,36 @@ impl GatewayConfig {
                 "flight_recorder.max_records must be greater than zero".into(),
             ));
         }
+        if self.shared_memory.max_turns_per_session == 0 {
+            return Err(GatewayError::Config(
+                "shared_memory.max_turns_per_session must be greater than zero".into(),
+            ));
+        }
+        if self.shared_memory.max_context_tokens == 0 {
+            return Err(GatewayError::Config(
+                "shared_memory.max_context_tokens must be greater than zero".into(),
+            ));
+        }
+        if self.trace.enabled && self.trace.command.trim().is_empty() {
+            return Err(GatewayError::Config(
+                "trace.command must not be empty when trace.enabled is true".into(),
+            ));
+        }
+        if self.trace.startup_timeout_ms == 0 {
+            return Err(GatewayError::Config(
+                "trace.startup_timeout_ms must be greater than zero".into(),
+            ));
+        }
+        if self.trace.query_timeout_ms == 0 {
+            return Err(GatewayError::Config(
+                "trace.query_timeout_ms must be greater than zero".into(),
+            ));
+        }
+        if self.trace.max_trace_tokens == 0 {
+            return Err(GatewayError::Config(
+                "trace.max_trace_tokens must be greater than zero".into(),
+            ));
+        }
 
         Ok(())
     }
@@ -1717,6 +1807,27 @@ fn default_shutdown_drain_secs() -> u64 {
 fn default_flight_recorder_max_records() -> usize {
     500
 }
+fn default_shared_memory_max_turns() -> usize {
+    32
+}
+fn default_shared_memory_max_context_tokens() -> usize {
+    1500
+}
+fn default_trace_command() -> String {
+    "trace".into()
+}
+fn default_trace_args() -> Vec<String> {
+    vec!["serve".into()]
+}
+fn default_trace_startup_timeout_ms() -> u64 {
+    3000
+}
+fn default_trace_query_timeout_ms() -> u64 {
+    1500
+}
+fn default_trace_max_tokens() -> usize {
+    900
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -1790,6 +1901,34 @@ impl Default for FlightRecorderConfig {
             enabled: false,
             max_records: default_flight_recorder_max_records(),
             path: None,
+        }
+    }
+}
+
+impl Default for SharedMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_turns_per_session: default_shared_memory_max_turns(),
+            max_context_tokens: default_shared_memory_max_context_tokens(),
+            inject_on_new_session: true,
+            inject_on_handoff: true,
+            sync_to_trace: true,
+        }
+    }
+}
+
+impl Default for TraceBridgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: default_trace_command(),
+            args: default_trace_args(),
+            workspace_root: None,
+            startup_timeout_ms: default_trace_startup_timeout_ms(),
+            query_timeout_ms: default_trace_query_timeout_ms(),
+            max_trace_tokens: default_trace_max_tokens(),
+            required: false,
         }
     }
 }
