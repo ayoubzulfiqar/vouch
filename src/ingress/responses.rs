@@ -8,7 +8,7 @@
 //! emits standard Responses API JSON or SSE events.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     convert::Infallible,
     sync::{
         Arc,
@@ -53,9 +53,16 @@ use crate::{
     telemetry::ActiveSpan,
 };
 
+/// Maximum hops permitted in a `previous_response_id` conversation chain.
+pub const MAX_RESPONSE_CHAIN_DEPTH: usize = 64;
+
 /// Persisted conversation state for stateful `/v1/responses` chaining.
 #[derive(Debug, Clone)]
 pub struct StoredResponse {
+    /// Immediate parent response id when created via `previous_response_id`.
+    pub parent_id: Option<String>,
+    /// Number of hops from the root turn (`0` for the first turn).
+    pub chain_depth: usize,
     /// System prompt / instructions active at the end of that turn.
     pub system: Option<String>,
     /// Full message history including the assistant's output and tool calls.
@@ -126,9 +133,54 @@ impl ResponseStore {
         }
     }
 
+    /// Resolve `prev_id`, enforcing cycle detection and [`MAX_RESPONSE_CHAIN_DEPTH`],
+    /// and return `(entry, next_chain_depth)`.
+    pub fn resolve_chain(&self, prev_id: &str, ttl: Duration) -> Result<(StoredResponse, usize)> {
+        let root = self.get(prev_id, ttl).ok_or_else(|| {
+            GatewayError::NotFound(format!("previous response {prev_id:?} not found"))
+        })?;
+        if root.chain_depth >= MAX_RESPONSE_CHAIN_DEPTH {
+            return Err(GatewayError::BadRequest(format!(
+                "previous_response_id chain exceeded maximum depth of {MAX_RESPONSE_CHAIN_DEPTH} hops"
+            )));
+        }
+        let mut visited = HashSet::new();
+        visited.insert(prev_id.to_string());
+        let mut cur_parent = root.parent_id.clone();
+        let mut hops = 0usize;
+        while let Some(parent_id) = cur_parent {
+            if !visited.insert(parent_id.clone()) {
+                return Err(GatewayError::BadRequest(format!(
+                    "previous_response_id cycle detected at {parent_id:?}"
+                )));
+            }
+            hops += 1;
+            if hops > MAX_RESPONSE_CHAIN_DEPTH {
+                return Err(GatewayError::BadRequest(format!(
+                    "previous_response_id chain exceeded maximum depth of {MAX_RESPONSE_CHAIN_DEPTH} hops"
+                )));
+            }
+            cur_parent = self.get(&parent_id, ttl).and_then(|entry| entry.parent_id);
+        }
+        let next_depth = root.chain_depth.max(hops).saturating_add(1);
+        if next_depth > MAX_RESPONSE_CHAIN_DEPTH {
+            return Err(GatewayError::BadRequest(format!(
+                "previous_response_id chain exceeded maximum depth of {MAX_RESPONSE_CHAIN_DEPTH} hops"
+            )));
+        }
+        Ok((root, next_depth))
+    }
+
     /// Persist a completed response turn when `store = true`, evicting oldest
     /// entries when `max_session_entries` is reached.
-    pub fn insert(&self, id: &str, system: Option<String>, messages: Vec<ChatMessage>) {
+    pub fn insert(
+        &self,
+        id: &str,
+        parent_id: Option<String>,
+        chain_depth: usize,
+        system: Option<String>,
+        messages: Vec<ChatMessage>,
+    ) {
         let cap = self.max_entries.load(Ordering::Relaxed).max(1);
         if !self.entries.contains_key(id) {
             evict_oldest_if_full(&self.entries, cap, |e| e.seq);
@@ -137,6 +189,8 @@ impl ResponseStore {
         self.entries.insert(
             id.to_string(),
             StoredResponse {
+                parent_id,
+                chain_depth,
                 system,
                 messages,
                 stored_at: Instant::now(),
@@ -153,6 +207,7 @@ impl ResponseStore {
             .iter()
             .map(|entry| PersistedResponse {
                 id: entry.key().clone(),
+                parent_id: entry.parent_id.clone(),
                 system: entry.system.clone(),
                 messages: entry.messages.clone(),
                 stored_at_unix_secs: entry.stored_at_unix_secs,
@@ -175,6 +230,8 @@ impl ResponseStore {
             self.entries.insert(
                 item.id.clone(),
                 StoredResponse {
+                    parent_id: item.parent_id.clone(),
+                    chain_depth: 0,
                     system: item.system.clone(),
                     messages: item.messages.clone(),
                     stored_at,
@@ -182,6 +239,23 @@ impl ResponseStore {
                     seq,
                 },
             );
+        }
+        let keys: Vec<String> = self.entries.iter().map(|e| e.key().clone()).collect();
+        for key in keys {
+            let mut visited = HashSet::new();
+            visited.insert(key.clone());
+            let mut cur_parent = self.entries.get(&key).and_then(|e| e.parent_id.clone());
+            let mut depth = 0usize;
+            while let Some(pid) = cur_parent {
+                if !visited.insert(pid.clone()) || depth > MAX_RESPONSE_CHAIN_DEPTH {
+                    break;
+                }
+                depth += 1;
+                cur_parent = self.entries.get(&pid).and_then(|e| e.parent_id.clone());
+            }
+            if let Some(mut entry) = self.entries.get_mut(&key) {
+                entry.chain_depth = depth;
+            }
         }
     }
 
@@ -283,6 +357,8 @@ struct PreparedResponsesExec {
     fallback: bool,
     driver_response: crate::driver::DriverResponse,
     response_id: String,
+    parent_id: Option<String>,
+    chain_depth: usize,
     should_store: bool,
     history_before_reply: Vec<ChatMessage>,
     history_system: Option<String>,
@@ -302,21 +378,24 @@ async fn prepare_responses_execution(
     let (new_system, new_messages) = normalize_input(payload.instructions, payload.input)?;
     let ttl = Duration::from_secs(state.router().session_ttl_secs());
 
-    let (system, messages) = if let Some(prev_id) = payload
+    let (parent_id, chain_depth, system, messages) = if let Some(prev_id) = payload
         .previous_response_id
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty())
     {
-        let prior = state.responses().get(prev_id, ttl).ok_or_else(|| {
-            GatewayError::NotFound(format!("previous response {prev_id:?} not found"))
-        })?;
+        let (prior, next_depth) = state.responses().resolve_chain(prev_id, ttl)?;
         let merged_system = new_system.or(prior.system);
         let mut merged_messages = prior.messages;
         merged_messages.extend(new_messages);
-        (merged_system, merged_messages)
+        (
+            Some(prev_id.to_string()),
+            next_depth,
+            merged_system,
+            merged_messages,
+        )
     } else {
-        (new_system, new_messages)
+        (None, 0, new_system, new_messages)
     };
 
     if messages.is_empty() {
@@ -377,6 +456,8 @@ async fn prepare_responses_execution(
         fallback: dispatched.routed.fallback_used,
         driver_response: dispatched.routed.response,
         response_id: format!("resp_{}", Uuid::new_v4().simple()),
+        parent_id,
+        chain_depth,
         should_store: payload.store,
         history_before_reply,
         history_system,
@@ -402,6 +483,8 @@ async fn responses_inner(
         fallback,
         driver_response,
         response_id,
+        parent_id,
+        chain_depth,
         should_store,
         history_before_reply,
         history_system,
@@ -423,6 +506,7 @@ async fn responses_inner(
         let created_at = unix_now();
         let store = state.responses().clone();
         let resp_id_for_store = response_id.clone();
+        let parent_id_for_store = parent_id.clone();
         let mut usage_guard = StreamUsageGuard::new(
             state.clone(),
             context,
@@ -578,7 +662,13 @@ async fn responses_inner(
                                     tool_call_id: None,
                                     name: None,
                                 });
-                                store.insert(&resp_id_for_store, history_system, full_history);
+                                store.insert(
+                                    &resp_id_for_store,
+                                    parent_id_for_store.clone(),
+                                    chain_depth,
+                                    history_system,
+                                    full_history,
+                                );
                             }
                             let effective_usage = usage_guard.complete(final_usage, &reason);
                             let completed_body = build_response_object(
@@ -637,7 +727,13 @@ async fn responses_inner(
                                 tool_call_id: None,
                                 name: None,
                             });
-                            store.insert(&resp_id_for_store, history_system, full_history);
+                            store.insert(
+                                &resp_id_for_store,
+                                parent_id_for_store.clone(),
+                                chain_depth,
+                                history_system,
+                                full_history,
+                            );
                         }
                         let reason = if collected_calls.is_empty() {
                             "stop"
@@ -719,9 +815,13 @@ async fn responses_inner(
             tool_call_id: None,
             name: None,
         });
-        state
-            .responses()
-            .insert(&response_id, history_system, full_history);
+        state.responses().insert(
+            &response_id,
+            parent_id,
+            chain_depth,
+            history_system,
+            full_history,
+        );
     }
     let msg_id = format!("msg_{}", Uuid::new_v4().simple());
     let body = build_response_object(
@@ -753,6 +853,12 @@ pub async fn responses_ws(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
+    if !state.config().server.cors_permissive && headers.contains_key(axum::http::header::ORIGIN) {
+        return GatewayError::Forbidden(
+            "cross-origin WebSocket upgrades require server.cors_permissive = true".into(),
+        )
+        .into_openai_response();
+    }
     if let Err(error) = state.tokens().authenticate(&headers) {
         return error.into_openai_response();
     }
@@ -878,6 +984,8 @@ async fn run_ws_response(
         fallback,
         driver_response,
         response_id,
+        parent_id,
+        chain_depth,
         should_store,
         history_before_reply,
         history_system,
@@ -1026,9 +1134,13 @@ async fn run_ws_response(
                             tool_call_id: None,
                             name: None,
                         });
-                        state
-                            .responses()
-                            .insert(&response_id, history_system, full_history);
+                        state.responses().insert(
+                            &response_id,
+                            parent_id.clone(),
+                            chain_depth,
+                            history_system,
+                            full_history,
+                        );
                     }
                     let effective_usage = usage_guard.complete(final_usage, &reason);
                     let completed_body = build_response_object(
@@ -1066,9 +1178,13 @@ async fn run_ws_response(
                         tool_call_id: None,
                         name: None,
                     });
-                    state
-                        .responses()
-                        .insert(&response_id, history_system, full_history);
+                    state.responses().insert(
+                        &response_id,
+                        parent_id,
+                        chain_depth,
+                        history_system,
+                        full_history,
+                    );
                 }
                 let reason = if collected_calls.is_empty() {
                     "stop"
