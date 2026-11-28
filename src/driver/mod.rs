@@ -624,6 +624,36 @@ impl std::fmt::Debug for DriverResponse {
     }
 }
 
+/// Normalized request passed to [`Driver::embed`] for `POST /v1/embeddings`.
+#[derive(Debug, Clone)]
+pub struct EmbeddingRequest {
+    /// Correlation id.
+    pub request_id: String,
+    /// Public model name.
+    pub model: String,
+    /// Input strings to embed in order.
+    pub inputs: Vec<String>,
+    /// Requested output encoding (`"float"` or `"base64"`).
+    pub encoding_format: Option<String>,
+    /// Optional reduced embedding dimension hint.
+    pub dimensions: Option<u32>,
+    /// Cancellation token.
+    pub cancel: CancellationToken,
+    /// Propagated W3C trace context.
+    pub trace_context: Option<crate::telemetry::TraceContext>,
+}
+
+/// Vector embedding output returned by [`Driver::embed`].
+#[derive(Debug, Clone)]
+pub struct EmbeddingResult {
+    /// One embedding vector per input string.
+    pub embeddings: Vec<Vec<f32>>,
+    /// Measured or estimated BPE token usage.
+    pub usage: Usage,
+    /// Model name echoed upstream.
+    pub model: String,
+}
+
 /// Egress transport contract.
 #[async_trait]
 pub trait Driver: Send + Sync {
@@ -635,6 +665,14 @@ pub trait Driver: Send + Sync {
     fn max_concurrency(&self) -> usize;
     /// Execute one request.
     async fn execute(&self, request: ExecutionRequest) -> Result<DriverResponse>;
+    /// Generate vector embeddings for `POST /v1/embeddings`.
+    async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResult> {
+        let _ = request;
+        Err(GatewayError::BadRequest(format!(
+            "backend {} does not support embeddings",
+            self.id()
+        )))
+    }
     /// Optional live probe used by `vouch doctor`.
     async fn probe(&self) -> std::result::Result<(), String> {
         Ok(())
@@ -1898,6 +1936,89 @@ pub(crate) async fn finish_subprocess_text_stream(
             let _ = sender.send(Err(error)).await;
             false
         }
+    }
+}
+
+/// Compiled `[[backends.output_filters]]` regex rules for CLI/PTY output.
+#[derive(Debug, Clone, Default)]
+pub struct OutputFilterSet {
+    rules: Vec<(regex::Regex, String)>,
+}
+
+impl OutputFilterSet {
+    /// Compile configured output filter patterns.
+    pub fn compile(filters: &[crate::config::OutputFilterConfig]) -> Result<Self> {
+        let mut rules = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let regex = regex::Regex::new(&filter.pattern).map_err(|error| {
+                GatewayError::Config(format!(
+                    "invalid output_filters regex {:?}: {error}",
+                    filter.pattern
+                ))
+            })?;
+            rules.push((regex, filter.replace.clone()));
+        }
+        Ok(Self { rules })
+    }
+
+    /// True when no output filters are configured.
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    /// Apply every configured regex replacement sequentially.
+    pub fn apply(&self, input: &str) -> String {
+        if self.rules.is_empty() || input.is_empty() {
+            return input.to_string();
+        }
+        let mut out = input.to_string();
+        for (regex, replace) in &self.rules {
+            out = regex.replace_all(&out, replace.as_str()).into_owned();
+        }
+        out
+    }
+}
+
+/// Incremental text filter adapter for streaming CLI/PTY output.
+///
+/// Passes text through unbuffered when `filters` is empty; otherwise buffers
+/// to newline boundaries (and flushes on EOF) so line/inline regex rules match
+/// without splitting across pipe/pty read chunks.
+pub(crate) struct StreamOutputFilterAdapter {
+    filters: OutputFilterSet,
+    carry: String,
+}
+
+impl StreamOutputFilterAdapter {
+    pub(crate) fn new(filters: OutputFilterSet) -> Self {
+        Self {
+            filters,
+            carry: String::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, text: &str) -> String {
+        if self.filters.is_empty() {
+            return text.to_string();
+        }
+        self.carry.push_str(text);
+        let Some(last_nl) = self.carry.rfind('\n') else {
+            return String::new();
+        };
+        let ready: String = self.carry.drain(..=last_nl).collect();
+        self.filters.apply(&ready)
+    }
+
+    pub(crate) fn finish(&mut self) -> String {
+        if self.filters.is_empty() || self.carry.is_empty() {
+            return String::new();
+        }
+        let remainder = std::mem::take(&mut self.carry);
+        self.filters.apply(&remainder)
+    }
+
+    pub(crate) fn apply_raw(&self, text: &str) -> String {
+        self.filters.apply(text)
     }
 }
 
