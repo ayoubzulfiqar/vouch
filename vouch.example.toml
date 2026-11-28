@@ -24,6 +24,8 @@ unix_socket = "/run/user/1000/vouch.sock"
 request_timeout_secs = 300
 # Maximum lifetime of a single streaming response. Default: 900.
 stream_timeout_secs = 900
+# Maximum seconds to drain active requests on SIGINT/SIGTERM before force cancelling. Default: 15.
+shutdown_drain_secs = 15
 # SSE keep-alive comment interval in seconds; 0 disables keep-alives. Default: 15.
 keep_alive_interval_secs = 15
 # Maximum accepted request body size in bytes (8 MiB). Must be > 0.
@@ -192,6 +194,11 @@ pty_rows = 48
 pattern = "Continue? [y/N]"
 response = "y"
 
+# Optional regex filters stripping noisy banners or tags from cli/pty stdout.
+# [[backends.output_filters]]
+# pattern = "(?m)^DEBUG:.*\\n?"
+# replace = ""
+
 # ---------------------------------------------------------------------------
 # [routes] — public model name -> ORDERED fallback chain of backend ids.
 # A sticky session's backend is tried first; then the chain in order. Circuit-
@@ -245,6 +252,31 @@ max_entries = 1000
 ttl_secs = 3600
 max_temperature = 0.2
 persist = false
+# Deduplicate concurrent identical deterministic non-streaming requests via singleflight.
+# Defaults to `true` when `cache.enabled = true`.
+# coalesce_inflight = true
+# Collapse consecutive whitespace before hashing cache/singleflight keys. Default: false.
+normalize_whitespace = false
+
+# ---------------------------------------------------------------------------
+# [security.egress_guard] — outbound secret & credential guardrail (off by default).
+# ---------------------------------------------------------------------------
+[security.egress_guard]
+# Enforcement mode: "off" | "redact" | "block" (`403 egress_policy_blocked`). Default: "off".
+mode = "off"
+# Detect PEM private keys, AWS AKIA/ASIA, GitHub PATs, and Stripe live keys. Default: true.
+block_private_keys = true
+# Additional custom regular expressions treated as sensitive egress secrets.
+extra_patterns = []
+
+# ---------------------------------------------------------------------------
+# [flight_recorder] — opt-in redacted JSONL request recorder for `vouch replay`.
+# ---------------------------------------------------------------------------
+[flight_recorder]
+enabled = false
+max_records = 500
+# Defaults to `<defaults.state_dir>/flight.jsonl` when `state_dir` is set.
+# path = "/var/lib/vouch/state/flight.jsonl"
 
 # ---------------------------------------------------------------------------
 # [pricing.<route_or_backend>] — optional USD token pricing per 1M tokens.
