@@ -26,8 +26,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     config::{AttachmentsConfig, BackendConfig, BackendKind, DefaultsConfig, OutputMode, ReadMode},
     driver::{
-        AnsiStripper, ChunkStream, Driver, DriverResponse, ExecutionRequest, PermitGuard,
-        ProcessGroupGuard, ResponseFormat, StreamChunk, Utf8ChunkDecoder,
+        AnsiStripper, ChatMessage, ChunkStream, Driver, DriverResponse, EmbeddingRequest,
+        EmbeddingResult, ExecutionRequest, OutputFilterSet, PermitGuard, ProcessGroupGuard,
+        ResponseFormat, StreamChunk, StreamOutputFilterAdapter, Usage, Utf8ChunkDecoder,
+        WorkspaceMode,
         attachments::{PromptSpillFile, TempAttachmentGuard, materialize_prompt_with_config},
         capture_session_id, classify_cli_failure, dispatch_stream_chunks, emit_subprocess_tail,
         extract_content, finalize_subprocess_completion, finish_subprocess_text_stream, io_error,
@@ -89,6 +91,7 @@ struct SpawnedCli {
 pub struct CliPipeDriver {
     config: BackendConfig,
     attachments: AttachmentsConfig,
+    output_filters: OutputFilterSet,
     semaphore: Arc<Semaphore>,
     queue_timeout: Duration,
 }
@@ -102,10 +105,12 @@ impl CliPipeDriver {
                 .unwrap_or(defaults.queue_timeout_ms)
                 .max(1),
         );
+        let output_filters = OutputFilterSet::compile(&config.output_filters)?;
         Ok(Self {
             semaphore: Arc::new(Semaphore::new(config.max_concurrency.max(1))),
             config,
             attachments: AttachmentsConfig::default(),
+            output_filters,
             queue_timeout,
         })
     }
@@ -328,7 +333,7 @@ impl CliPipeDriver {
                         &stderr,
                     ));
                 }
-                let raw = strip_ansi(&buffer);
+                let raw = self.output_filters.apply(&strip_ansi(&buffer));
                 capture_session_id(
                     self.config.session_id_regex.as_deref(),
                     &stderr,
@@ -383,6 +388,7 @@ impl CliPipeDriver {
         let output_mode = self.config.output_mode;
         let read_mode = self.config.read_mode;
         let session_id_regex = self.config.session_id_regex.clone();
+        let output_filters = self.output_filters.clone();
         let parse_tools = !request.tools.is_empty();
         let response_format: Option<ResponseFormat> = request.response_format.clone();
         let model = request.model.clone();
@@ -413,6 +419,7 @@ impl CliPipeDriver {
             let mut stripper = AnsiStripper::new();
             let mut raw_line_carry: Vec<u8> = Vec::new();
             let mut filter = SubprocessStreamFilter::new(parse_tools, response_format.clone());
+            let mut out_filter = StreamOutputFilterAdapter::new(output_filters);
             let mut json_buffer = String::new();
             let mut line_buffer = String::new();
             let mut produced = String::new();
@@ -475,7 +482,11 @@ impl CliPipeDriver {
                         produced.push_str(&stripped);
                         match output_mode {
                             OutputMode::Text => {
-                                let chunks = filter.push(&stripped);
+                                let filtered = out_filter.push(&stripped);
+                                if filtered.is_empty() {
+                                    continue;
+                                }
+                                let chunks = filter.push(&filtered);
                                 if !dispatch_stream_chunks(&sender, chunks).await {
                                     guard.terminate();
                                     let _ = child.wait().await;
@@ -491,7 +502,7 @@ impl CliPipeDriver {
                                     if line.trim().is_empty() {
                                         continue;
                                     }
-                                    let delta = jsonl_line_to_delta(line);
+                                    let delta = out_filter.apply_raw(&jsonl_line_to_delta(line));
                                     if !delta.is_empty()
                                         && sender.send(Ok(StreamChunk::delta(delta))).await.is_err()
                                     {
@@ -521,21 +532,28 @@ impl CliPipeDriver {
                 tail_utf8.push_str(&utf8_decoder.feed(&raw_line_carry));
             }
             tail_utf8.push_str(&utf8_decoder.finish());
+            let mut tail_combined = String::new();
             if !tail_utf8.is_empty() {
                 let stripped_tail = stripper.feed(tail_utf8.as_bytes());
                 if !stripped_tail.is_empty() {
                     produced.push_str(&stripped_tail);
                     match output_mode {
                         OutputMode::Text => {
-                            let chunks = filter.push(&stripped_tail);
-                            if !dispatch_stream_chunks(&sender, chunks).await {
-                                guard.terminate();
-                                let _ = child.wait().await;
-                                return;
-                            }
+                            tail_combined.push_str(&out_filter.push(&stripped_tail));
                         }
                         OutputMode::Json => json_buffer.push_str(&stripped_tail),
                         OutputMode::JsonLines => line_buffer.push_str(&stripped_tail),
+                    }
+                }
+            }
+            if output_mode == OutputMode::Text {
+                tail_combined.push_str(&out_filter.finish());
+                if !tail_combined.is_empty() {
+                    let chunks = filter.push(&tail_combined);
+                    if !dispatch_stream_chunks(&sender, chunks).await {
+                        guard.terminate();
+                        let _ = child.wait().await;
+                        return;
                     }
                 }
             }
@@ -716,6 +734,131 @@ impl Driver for CliPipeDriver {
             self.execute_complete(request, permit).await
         }
     }
+
+    async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResult> {
+        let prompt = if request.inputs.len() == 1 {
+            request.inputs[0].clone()
+        } else {
+            serde_json::to_string(&request.inputs).unwrap_or_default()
+        };
+        let exec_req = ExecutionRequest {
+            request_id: request.request_id,
+            session_key: "embeddings".into(),
+            model: request.model.clone(),
+            system: None,
+            messages: vec![ChatMessage::text("user", prompt.clone())],
+            prompt: prompt.clone(),
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            workspace_mode: WorkspaceMode::None,
+            workdir: None,
+            cancel: request.cancel,
+            tools: Vec::new(),
+            tool_choice: None,
+            response_format: None,
+            backend_session_id: None,
+            delta_messages: None,
+            session_capture: Arc::new(parking_lot::Mutex::new(None)),
+            trace_context: request.trace_context,
+            profile_id: None,
+            profile_env: std::collections::BTreeMap::new(),
+            allowed_backends: None,
+            extra: Default::default(),
+        };
+        let permit = PermitGuard::acquire(
+            self.semaphore.clone(),
+            &self.config.id,
+            self.queue_timeout,
+            &exec_req.cancel,
+        )
+        .await?;
+        let DriverResponse::Complete(completion) = self.execute_complete(exec_req, permit).await?
+        else {
+            return Err(GatewayError::Internal(
+                "cli_pipe complete unexpectedly returned stream".into(),
+            ));
+        };
+        let parsed: Value = serde_json::from_str(completion.content.trim()).map_err(|error| {
+            GatewayError::Upstream(format!(
+                "backend {} embeddings output is not valid JSON vector(s): {error}",
+                self.config.id
+            ))
+        })?;
+        let embeddings = parse_cli_embeddings(&self.config.id, &parsed, request.inputs.len())?;
+        Ok(EmbeddingResult {
+            embeddings,
+            usage: Usage::new(crate::usage::count_tokens(&request.model, &prompt), 0),
+            model: request.model,
+        })
+    }
+}
+
+fn parse_cli_embeddings(
+    backend_id: &str,
+    value: &Value,
+    expected_len: usize,
+) -> Result<Vec<Vec<f32>>> {
+    if let Some(arr) = value.as_array() {
+        if arr.is_empty() {
+            return Ok(Vec::new());
+        }
+        if arr[0].is_number() {
+            let single: Vec<f32> = arr
+                .iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect();
+            return Ok(vec![single]);
+        }
+        if arr[0].is_array() {
+            let mut out = Vec::with_capacity(arr.len());
+            for row in arr {
+                let Some(items) = row.as_array() else {
+                    return Err(GatewayError::Upstream(format!(
+                        "backend {backend_id} returned mixed embedding vector array"
+                    )));
+                };
+                out.push(
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_f64().map(|f| f as f32))
+                        .collect(),
+                );
+            }
+            return Ok(out);
+        }
+    }
+    if let Some(data) = value.get("data").and_then(Value::as_array) {
+        let out: Vec<Vec<f32>> = data
+            .iter()
+            .filter_map(|item| item.get("embedding").and_then(Value::as_array))
+            .map(|vec| {
+                vec.iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect()
+            })
+            .collect();
+        if !out.is_empty() || expected_len == 0 {
+            return Ok(out);
+        }
+    }
+    if let Some(vecs) = value.get("embeddings").and_then(Value::as_array) {
+        let out: Vec<Vec<f32>> = vecs
+            .iter()
+            .filter_map(Value::as_array)
+            .map(|vec| {
+                vec.iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect()
+            })
+            .collect();
+        if !out.is_empty() || expected_len == 0 {
+            return Ok(out);
+        }
+    }
+    Err(GatewayError::Upstream(format!(
+        "backend {backend_id} embeddings output must be a JSON vector or array of vectors"
+    )))
 }
 
 fn render_arg(template: &str, prompt: &str, request: &ExecutionRequest) -> String {
