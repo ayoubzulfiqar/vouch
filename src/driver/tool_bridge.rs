@@ -17,6 +17,8 @@ use crate::{
 
 const OPEN_TAG: &str = "<vouch_tool_call>";
 const CLOSE_TAG: &str = "</vouch_tool_call>";
+/// Maximum unclosed `<vouch_tool_call>` block size before terminating a stalled or abusive subprocess (1 MiB).
+pub const MAX_TOOL_TAG_BUFFER_BYTES: usize = 1_048_576;
 
 /// Normalize an OpenAI, OpenAI Responses, or Anthropic tool definition into
 /// OpenAI Chat Completions function-tool format.
@@ -441,7 +443,7 @@ impl StreamingToolParser {
     }
 
     /// Feed an incoming chunk and return confirmed text and/or completed tool calls.
-    pub fn push(&mut self, chunk: &str) -> Vec<StreamParseEvent> {
+    pub fn push(&mut self, chunk: &str) -> Result<Vec<StreamParseEvent>> {
         if !chunk.is_empty() {
             self.buffer.push_str(chunk);
         }
@@ -486,10 +488,15 @@ impl StreamingToolParser {
                 self.buffer.drain(..end + CLOSE_TAG.len());
                 self.in_tag = false;
             } else {
+                if self.buffer.len() > MAX_TOOL_TAG_BUFFER_BYTES {
+                    return Err(GatewayError::ProcessFailure(format!(
+                        "unclosed {OPEN_TAG} block exceeded {MAX_TOOL_TAG_BUFFER_BYTES} byte buffer limit"
+                    )));
+                }
                 break;
             }
         }
-        events
+        Ok(events)
     }
 
     /// Flush any buffered tail at EOF.
@@ -726,16 +733,16 @@ impl SubprocessStreamFilter {
     }
 
     /// Process a clean text chunk into stream chunks ready to forward immediately.
-    pub fn push(&mut self, clean_text: &str) -> Vec<StreamChunk> {
+    pub fn push(&mut self, clean_text: &str) -> Result<Vec<StreamChunk>> {
         let mut chunks = Vec::new();
         if let Some(parser) = &mut self.tool_parser {
-            for event in parser.push(clean_text) {
+            for event in parser.push(clean_text)? {
                 self.push_event(event, &mut chunks);
             }
         } else {
             self.push_text_event(clean_text.to_string(), &mut chunks);
         }
-        chunks
+        Ok(chunks)
     }
 
     fn push_event(&mut self, event: StreamParseEvent, out: &mut Vec<StreamChunk>) {
@@ -902,12 +909,18 @@ mod tests {
     #[test]
     fn streaming_tool_parser_emits_multiple_parallel_tool_calls() {
         let mut parser = StreamingToolParser::new();
-        let mut events = parser.push("Running checks:\n<vouch_tool_call>{\"name\":\"ping\",");
-        events.extend(parser.push("\"arguments\":{\"host\":\"a\"}}</vouch_tool_call><vouch_to"));
+        let mut events = parser
+            .push("Running checks:\n<vouch_tool_call>{\"name\":\"ping\",")
+            .expect("push1");
         events.extend(
-            parser.push(
-                "ol_call>{\"name\":\"echo\",\"arguments\":{\"msg\":\"b\"}}</vouch_tool_call>",
-            ),
+            parser
+                .push("\"arguments\":{\"host\":\"a\"}}</vouch_tool_call><vouch_to")
+                .expect("push2"),
+        );
+        events.extend(
+            parser
+                .push("ol_call>{\"name\":\"echo\",\"arguments\":{\"msg\":\"b\"}}</vouch_tool_call>")
+                .expect("push3"),
         );
         events.extend(parser.finish());
         let calls: Vec<_> = events
@@ -928,13 +941,15 @@ mod tests {
     #[test]
     fn streaming_tool_parser_buffers_split_tags_without_leaking() {
         let mut parser = StreamingToolParser::new();
-        let e1 = parser.push("Let me check <vouch_tool");
+        let e1 = parser.push("Let me check <vouch_tool").expect("push1");
         assert_eq!(e1, vec![StreamParseEvent::Text("Let me check ".into())]);
 
-        let e2 = parser.push("_call>{\"name\":\"search\",");
+        let e2 = parser.push("_call>{\"name\":\"search\",").expect("push2");
         assert!(e2.is_empty());
 
-        let e3 = parser.push("\"arguments\":{\"q\":\"rust\"}}</vouch_tool_call> done");
+        let e3 = parser
+            .push("\"arguments\":{\"q\":\"rust\"}}</vouch_tool_call> done")
+            .expect("push3");
         assert_eq!(e3.len(), 2);
         match &e3[0] {
             StreamParseEvent::ToolCall(delta) => {
