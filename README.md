@@ -13,7 +13,8 @@ A local authentication multiplexer and process-supervised gateway for AI orchest
 - Google Gemini & Ollama ingress: `POST /v1beta/models/{model}:generateContent` & `:streamGenerateContent` (`thought: true` & streaming `functionCall`), plus `GET /api/tags`, `POST /api/chat`, and `POST /api/generate` (`tool_calls`, NDJSON & buffered)
 - Multimodal & tool calling: base64/URL images (`0600` temp attachment lifecycle with startup crash-orphan sweep), parallel multi-tool streaming, schema auto-repair retries, and `tools` / `tool_calls` / `tool_use` bridged across drivers
 - Speculative routing, caching & guardrails: `ordered`, `least_latency`, and `hedged` strategies, singleflight request coalescing (`X-Vouch-Coalesced: true`), deterministic SHA-256 response cache (`[cache]`), outbound secret egress guardrails (`[security.egress_guard]`), and regex `[[backends.output_filters]]`
-- Dual-spec MCP ingress: `vouch mcp` (`stdio` / HTTP) and `POST /mcp` (`2024-11-05` + `2026-07-28`, `resources/*`, `prompts/*`, `[[mcp_upstreams]]` aggregation, async `tasks/*`)
+- Cross-agent shared memory & `trace` bridge: `[shared_memory]` canonical session ledger (`GET/DELETE /v1/sessions`, `POST /v1/sessions/{id}/checkpoint`), zero-LLM-token strictly BPE-budgeted `<vouch_shared_context>` handoffs (`X-Vouch-Handoff: true`, `X-Vouch-Handoff-From`), and optional model-free `[trace]` MCP repository grounding (`trace serve`, `X-Workspace-Root`)
+- Dual-spec MCP ingress: `vouch mcp` (`stdio` / HTTP) and `POST /mcp` (`2024-11-05` + `2026-07-28`, `vouch_ask`, `vouch_session_status`, `vouch_checkpoint`, `resources/*`, `prompts/*`, `[[mcp_upstreams]]` aggregation, async `tasks/*`)
 - Operations, budgets, traces & CLI: `GET /healthz`, `/readyz`, `/metrics`, `GET /v1/usage`, `GET /v1/traces`, `POST /admin/*` (`enable_admin = true`), pre-execution token budget reservations, `[flight_recorder]` + `vouch replay`, `vouch doctor --fix`, `vouch config diff`, `vouch init`, `vouch stats`, `vouch top`, `vouch token create`, `vouch bench`, and interactive `GET /ui` Console v2
 - Egress: pooled HTTP/SSE proxy, headless stdin/stdout subprocess, and configurable PTY subprocess (`pty_auto_respond`, `idle_timeout_secs`, native session delta resumption)
 - Reload: `SIGHUP` or config-file change atomically swaps configuration without dropping in-flight requests
@@ -235,6 +236,16 @@ Everything else has a default. Start from the example config in production — i
 | | `probe_ports` | `true` | TCP-probe HTTP backends |
 | | `probe_timeout_secs` | `30` | Live CLI/PTY smoke probe deadline in `doctor` (HTTP stays `5s`) |
 | | `extra_auth_paths` | `[]` | Extra credential paths reported by `doctor` (metadata only) |
+| `shared_memory` | `enabled` | `false` (`true` in example) | Maintain canonical cross-agent session ledger and inject deterministic `<vouch_shared_context>` on handoffs |
+| | `max_turns_per_session` | `32` | Rolling cap of canonical turns stored per session |
+| | `max_context_tokens` | `1500` | Strict BPE token budget for synthesized `<vouch_shared_context>` envelopes |
+| | `sync_to_trace` | `true` | Push redacted `record_session` checkpoints to `[trace]` on handoffs & session expiry |
+| `trace` | `enabled` | `false` | Enable model-free `trace serve` stdio MCP codebase intelligence bridge |
+| | `required` | `false` | When false, missing/slow `trace` degrades gracefully without failing requests or `doctor` |
+| | `command` / `args` | `"trace"` / `["serve"]` | Executable and arguments spawned per normalized workspace root |
+| | `workspace_root` | unset | Allowed base repository root for `trace` queries and `X-Workspace-Root` overrides |
+| | `startup_timeout_ms` / `query_timeout_ms` | `3000` / `1500` | Initialize & per-tool RPC deadlines in milliseconds |
+| | `max_trace_tokens` | `900` | Maximum BPE tokens allocated to repository rules/decisions/symbols/history in handoffs |
 
 ### Backends
 
@@ -384,9 +395,12 @@ CLI overrides: `vouch serve -c vouch.toml --tcp-listen 127.0.0.1:9090 --unix-soc
 | `Authorization: Bearer *** / `x-api-key` | in | Credential when tokens are configured |
 | `X-Session-ID` (or `X-Vouch-Session-ID`) | in | Sticky affinity key |
 | `X-Workspace-Mode` | in | `auto` (default), `worktree`/`isolated`/`isolate`, or `none`/`off`/`disabled` |
+| `X-Workspace-Root` | in | Optional canonical path override within `[trace].workspace_root` / `[workspace].repo_path` (`403` on traversal/escape) |
 | `x-request-id` | in | Safe correlation id (≤128 chars, ASCII alphanumeric or `-_.::`) |
 | `x-vouch-backend` | out | Backend that served the request |
 | `x-vouch-fallback` | out | `"true"` when an earlier candidate was skipped or failed |
+| `x-vouch-handoff` | out | `"true"` when `[shared_memory]` handed this turn off from a prior backend |
+| `x-vouch-handoff-from` | out | Previous backend id that handed off context (`<vouch_shared_context>`) |
 | `x-vouch-request-id` | out | Effective correlation id |
 | `x-vouch-cache` | out | `HIT`, `MISS`, or `BYPASS` when `[cache].enabled = true` |
 
@@ -486,7 +500,18 @@ Disabled by default (`[server].enable_admin = false` → returns `404`). When en
 
 - `vouch mcp --config vouch.toml` runs over `stdin`/`stdout` (with all logs sent strictly to `stderr` so `stdout` stays pure JSON-RPC).
 - `vouch mcp --config vouch.toml --transport http --bind 127.0.0.1:8081` or `POST /mcp` on the main `vouch serve` daemon exposes the same JSON-RPC handler over HTTP with bearer token enforcement when `[[tokens]]` is configured, validating `Mcp-Method` and `Mcp-Name` headers when present (`-32600` on mismatch).
-- Supported methods: `initialize`, `notifications/initialized`, `server/discover` (`2026-07-28` stateless discovery), `ping`, `tools/list` (`vouch_ask`, per-route `route_<name>` tools, plus namespaced `<upstream>__<tool>` tools from `[[mcp_upstreams]]` with `ttlMs` / `cacheScope: "private"` metadata), `tools/call` (local dispatch or upstream proxy), `resources/list`, `resources/read` (`vouch://health`, `vouch://routes`, `vouch://usage`), `prompts/list`, `prompts/get` (from `[[mcp_prompts]]`), and async `tasks/create`, `tasks/get`, `tasks/result`, and `tasks/cancel`. W3C Trace Context fields (`_meta.traceparent`, `_meta.tracestate`) propagate into tracing spans.
+- Supported methods: `initialize`, `notifications/initialized`, `server/discover` (`2026-07-28` stateless discovery), `ping`, `tools/list` (`vouch_ask`, per-route `route_<name>`, `vouch_session_status`, `vouch_checkpoint`, plus namespaced `<upstream>__<tool>` tools from `[[mcp_upstreams]]` with `ttlMs` / `cacheScope: "private"` metadata), `tools/call` (local dispatch or upstream proxy), `resources/list`, `resources/read` (`vouch://health`, `vouch://routes`, `vouch://usage`), `prompts/list`, `prompts/get` (from `[[mcp_prompts]]`), and async `tasks/create`, `tasks/get`, `tasks/result`, and `tasks/cancel`. W3C Trace Context fields (`_meta.traceparent`, `_meta.tracestate`) propagate into tracing spans.
+
+### Shared cross-agent sessions & `[trace]` bridge
+
+When `[shared_memory].enabled = true`, every authenticated conversation updates a bounded, secret-redacted `SessionLedgerStore` tracking canonical turns, active backend/profile, backend handoff events, sanitized repository `touched_files`, and checkpoints. When execution moves to another backend (failover, latency reorder, or model switch under the same `X-Session-ID`), `vouch` synthesizes a zero-LLM-token `<vouch_shared_context>` envelope strictly bounded to `[shared_memory].max_context_tokens` BPE tokens, resets native CLI delta state so the new agent receives the full clean context, and emits `X-Vouch-Handoff: true` + `X-Vouch-Handoff-From: <backend>`.
+
+When `[trace].enabled = true`, `vouch` maintains a pooled `trace serve` stdio MCP worker per workspace root (`list_rules`, `search_decisions`, `get_symbol_outline`, `find_callers`, `get_recent_history`, and async `record_session` checkpoints), degrading cleanly when `trace.required = false`.
+
+- `GET /v1/sessions` — list live shared session summaries
+- `GET /v1/sessions/{session_id}` — inspect turns, handoffs, touched files, and checkpoints
+- `POST /v1/sessions/{session_id}/checkpoint` — append a redacted `{"note": "...", "files": [...]}` checkpoint (and sync to `trace`)
+- `DELETE /v1/sessions/{session_id}` — clear the ledger, sticky affinity, and any ephemeral git worktree
 
 ### Error format
 
@@ -644,8 +669,8 @@ To let a Docker Compose orchestrator (such as ARTEX, Open WebUI, or LiteLLM) rea
 `GET /healthz` — liveness:
 
 ```json
-{"status":"ok","version":"5.0.0","uptime_secs":42,"models":3,"backends":3,
- "tokens_enforced":true,"workspace_enabled":false}
+{"status":"ok","version":"6.0.0","uptime_secs":42,"models":3,"backends":3,
+ "tokens_enforced":true,"workspace_enabled":false,"shared_sessions":2,"handoffs_total":1}
 ```
 
 `GET /v1/usage` — authenticated JSON report exposing cumulative per-token and per-backend requests, errors, BPE token counts, estimated `total_cost_usd` (via `[pricing.*]`), UTC daily budget usage, and `p50`/`p95`/`p99` latency quantiles (zero raw secrets).
@@ -666,6 +691,8 @@ When `[telemetry].otlp_endpoint` is set, incoming W3C `traceparent`/`tracestate`
 | `vouch_circuit_breaker_transitions_total` | counter | `backend`, `state` |
 | `vouch_fallbacks_total` | counter | `from`, `to` |
 | `vouch_hedged_wins_total` | counter | `winner`, `loser` |
+| `vouch_handoffs_total` | counter | `from`, `to`, `reason` |
+| `vouch_trace_queries_total` | counter | `tool`, `status` |
 | `vouch_cache_requests_total` | counter | `outcome` (`hit`, `miss`, `bypass`) |
 | `vouch_child_exit_total` | counter | `backend`, `code` (`signal` when signalled) |
 | `vouch_token_rate_limited_total` | counter | `token` |
@@ -748,8 +775,9 @@ src/recorder.rs    opt-in redacted JSONL flight recorder with bounded rotation
 src/security/      outbound secret/PII egress guardrails ([security.egress_guard])
 src/auth/          discovery + virtual tokens with atomic pre-execution quota reservations
 src/router/        routing, affinity, native delta sessions, hedged/EWMA scheduling, circuit breaker
+src/memory/        cross-agent SessionLedgerStore, BPE-budgeted handoffs, model-free `trace` MCP bridge
 src/driver/        trait, HTTP proxy (+ embeddings), CLI pipe, PTY, attachments/spill, tool bridge, worktree
-src/ingress/       OpenAI (+ /v1/embeddings), Responses, Anthropic, Gemini, Ollama, MCP, admin, ops, /ui
+src/ingress/       OpenAI (+ /v1/embeddings), Responses, Anthropic, Gemini, Ollama, /v1/sessions, MCP, admin, ops, /ui
 src/cli/           routes, doctor (--fix), service, mcp, top, token, bench, stats, init, replay, config diff
 src/telemetry.rs   JSON tracing, OTLP exporter, trace ring buffer (/v1/traces), secret redaction
 src/metrics.rs     Prometheus instruments
