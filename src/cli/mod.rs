@@ -171,6 +171,9 @@ pub struct TopArgs {
     /// Refresh interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
     pub interval_ms: u64,
+    /// Optional virtual bearer token for polling `/v1/usage` USD totals (`VOUCH_API_KEY`).
+    #[arg(long)]
+    pub token: Option<String>,
 }
 
 /// Arguments for `vouch token`.
