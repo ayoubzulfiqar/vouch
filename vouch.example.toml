@@ -34,6 +34,8 @@ log_level = "info"
 cors_permissive = false
 # Enable the embedded read-only HTML status dashboard at GET /ui. Default: false (off).
 enable_ui = false
+# Enable runtime admin endpoints (POST /admin/reload, POST /admin/circuits/{backend}/reset, DELETE /admin/cache). Default: false.
+enable_admin = false
 
 # ---------------------------------------------------------------------------
 # [defaults] — inherited by backends and by request handling.
@@ -52,6 +54,8 @@ max_session_entries = 10000
 max_concurrency = 4
 # Default ms to wait for a backend permit before failing over. Default: 250.
 queue_timeout_ms = 250
+# Automated structured output schema repair follow-up retries (0..=2) for CLI/PTY backends. Default: 0.
+schema_repair_retries = 0
 
 # ---------------------------------------------------------------------------
 # [resilience] — shared circuit-breaker tuning. Non-zero values required.
@@ -146,6 +150,17 @@ output_mode = "json"
 read_mode = "chunk"
 pty_send_eof = true
 
+# Optional multi-profile credential rotation pool (cli/pty backends).
+[[backends.profiles]]
+id = "acct-1"
+env = { CODEX_HOME = "/path/to/.codex-1" }
+weight = 2
+
+[[backends.profiles]]
+id = "acct-2"
+env = { CODEX_HOME = "/path/to/.codex-2" }
+weight = 1
+
 # 3) Pseudo-terminal subprocess for CLIs that need a TTY or render a TUI.
 #    Runs in spawn_blocking with bounded channels; here the prompt is passed
 #    as an argument instead of stdin, which also satisfies prompt transport.
@@ -214,6 +229,52 @@ header_equals = { "x-tier" = "pro" }
 target_route = "coding/fast"
 
 # ---------------------------------------------------------------------------
+# [route_policies.<model>] — optional scheduling strategy per route.
+# strategy = "ordered" | "least_latency" | "hedged"
+# ---------------------------------------------------------------------------
+[route_policies."coding/default"]
+strategy = "ordered"
+hedge_delay_ms = 2500
+
+# ---------------------------------------------------------------------------
+# [cache] — deterministic SHA-256 response cache (disabled by default).
+# ---------------------------------------------------------------------------
+[cache]
+enabled = false
+max_entries = 1000
+ttl_secs = 3600
+max_temperature = 0.2
+persist = false
+
+# ---------------------------------------------------------------------------
+# [pricing.<route_or_backend>] — optional USD token pricing per 1M tokens.
+# ---------------------------------------------------------------------------
+[pricing."coding/default"]
+input_per_1m_usd = 3.0
+output_per_1m_usd = 15.0
+
+# ---------------------------------------------------------------------------
+# [[mcp_prompts]] — reusable prompt templates exposed via MCP prompts/list & get.
+# ---------------------------------------------------------------------------
+[[mcp_prompts]]
+name = "code-review"
+description = "Focused diff review prompt template"
+template = "Review the changes in {{repo}} focusing on correctness and edge cases."
+arguments = [
+  { name = "repo", description = "Repository name", required = true },
+]
+
+# ---------------------------------------------------------------------------
+# [[mcp_upstreams]] — external MCP stdio/HTTP servers aggregated as <id>__<tool>.
+# ---------------------------------------------------------------------------
+# [[mcp_upstreams]]
+# id = "fs"
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+# timeout_secs = 30
+
+# ---------------------------------------------------------------------------
 # [attachments] — SSRF-safe remote image_url materialization for CLI/PTY.
 # ---------------------------------------------------------------------------
 [attachments]
@@ -240,11 +301,17 @@ otlp_headers = {}
 token = "vouch-replace-me-laptop"
 name = "laptop-agent"
 rpm = 60
+tpm = 200000
 daily_token_budget = 2000000
+max_concurrent = 4
+# Optional RFC-3339 expiration timestamp: expires_at = "2030-01-01T00:00:00Z"
 allowed_models = ["coding/*", "general", "gpt-4o"]
+admin = true
 
 [[tokens]]
 token = "vouch-replace-me-ci"
 name = "ci-runner"
 rpm = 20
 allowed_models = ["coding/fast"]
+allowed_backends = ["local-hermes", "codex-cli"]
+admin = false
