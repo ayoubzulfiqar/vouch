@@ -189,6 +189,27 @@ pub fn record_health_probe(backend: &str, healthy: bool) {
     .set(if healthy { 1.0 } else { 0.0 });
 }
 
+/// Record a cross-agent handoff (`from` -> `to`, with `reason`: `failover`, `policy_reorder`, or `model_switch`).
+pub fn record_handoff(from: &str, to: &str, reason: &str) {
+    metrics::counter!(
+        "vouch_handoffs_total",
+        "from" => from.to_string(),
+        "to" => to.to_string(),
+        "reason" => reason.to_string(),
+    )
+    .increment(1);
+}
+
+/// Record a `trace` MCP tool invocation outcome (`ok`, `timeout`, `error`, `unavailable`).
+pub fn record_trace_query(tool: &str, status: &str) {
+    metrics::counter!(
+        "vouch_trace_queries_total",
+        "tool" => tool.to_string(),
+        "status" => status.to_string(),
+    )
+    .increment(1);
+}
+
 /// Convenience conversion used by the circuit breaker.
 pub fn circuit_state_value(state: crate::router::circuit_breaker::CircuitState) -> u8 {
     match state {
