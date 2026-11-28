@@ -19,14 +19,24 @@ const KNOWN_CLIS: &[(&str, &str, &[&str], bool)] = &[
     (
         "hermes",
         "hermes-cli",
-        &["chat", "--plain", "-q", "{prompt}"],
+        &["chat", "--plain", "-q", "--", "{prompt}"],
         false,
     ),
-    ("opencode", "opencode-cli", &["run", "{prompt}"], false),
-    ("kilocode", "kilocode-cli", &["--auto", "{prompt}"], false),
-    ("claude", "claude-cli", &["-p", "{prompt}"], false),
-    ("codex", "codex-cli", &["exec", "{prompt}"], false),
-    ("gemini", "gemini-cli", &["-p", "{prompt}"], false),
+    (
+        "opencode",
+        "opencode-cli",
+        &["run", "--", "{prompt}"],
+        false,
+    ),
+    (
+        "kilocode",
+        "kilocode-cli",
+        &["--auto", "--", "{prompt}"],
+        false,
+    ),
+    ("claude", "claude-cli", &["-p", "--", "{prompt}"], false),
+    ("codex", "codex-cli", &["exec", "--", "{prompt}"], false),
+    ("gemini", "gemini-cli", &["-p", "--", "{prompt}"], false),
 ];
 
 const KNOWN_HTTP_DAEMONS: &[(&str, &str, u16, &str)] = &[
@@ -268,8 +278,29 @@ mod tests {
     #[tokio::test]
     async fn generated_scaffold_validates_against_strict_schema() {
         let scaffold = generate_config(false).await.expect("scaffold");
+        assert!(!scaffold.toml.is_empty());
         let parsed = GatewayConfig::from_toml_str(&scaffold.toml).expect("valid config");
         assert!(parsed.routes.contains_key("coding/default"));
         assert!(scaffold.token.starts_with("vouch_live_"));
+    }
+
+    #[test]
+    fn known_cli_templates_place_double_dash_before_prompt() {
+        for &(bin, _id, args, stdin) in KNOWN_CLIS {
+            if !stdin {
+                let prompt_idx = args
+                    .iter()
+                    .position(|a| *a == "{prompt}")
+                    .expect("prompt placeholder");
+                let dash_idx = args
+                    .iter()
+                    .position(|a| *a == "--")
+                    .unwrap_or_else(|| panic!("{bin} template missing `--` terminator"));
+                assert!(
+                    dash_idx < prompt_idx,
+                    "{bin}: `--` must precede `{{prompt}}`"
+                );
+            }
+        }
     }
 }
