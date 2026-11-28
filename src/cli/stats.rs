@@ -28,12 +28,13 @@ pub async fn run(args: &StatsArgs) -> Result<()> {
     )?;
     writeln!(
         stdout,
-        "totals: requests={} errors={} prompt_tokens={} completion_tokens={} total_tokens={} p50={}ms p95={}ms p99={}ms",
+        "totals: requests={} errors={} prompt_tokens={} completion_tokens={} total_tokens={} cost=${:.6} p50={}ms p95={}ms p99={}ms",
         report.totals.requests,
         report.totals.errors,
         report.totals.prompt_tokens,
         report.totals.completion_tokens,
         report.totals.total_tokens,
+        report.totals.total_cost_usd,
         report.totals.p50_ms,
         report.totals.p95_ms,
         report.totals.p99_ms,
@@ -48,11 +49,12 @@ pub async fn run(args: &StatsArgs) -> Result<()> {
             };
             writeln!(
                 stdout,
-                "  {:<18} req={} err={} total_tok={} daily_utc={} p50={}ms p95={}ms p99={}ms",
+                "  {:<18} req={} err={} total_tok={} cost=${:.6} daily_utc={} p50={}ms p95={}ms p99={}ms",
                 t.name,
                 t.summary.requests,
                 t.summary.errors,
                 t.summary.total_tokens,
+                t.summary.total_cost_usd,
                 budget,
                 t.summary.p50_ms,
                 t.summary.p95_ms,
@@ -66,11 +68,12 @@ pub async fn run(args: &StatsArgs) -> Result<()> {
         for b in &report.backends {
             writeln!(
                 stdout,
-                "  {:<18} req={} err={} total_tok={} p50={}ms p95={}ms p99={}ms",
+                "  {:<18} req={} err={} total_tok={} cost=${:.6} p50={}ms p95={}ms p99={}ms",
                 b.id,
                 b.summary.requests,
                 b.summary.errors,
                 b.summary.total_tokens,
+                b.summary.total_cost_usd,
                 b.summary.p50_ms,
                 b.summary.p95_ms,
                 b.summary.p99_ms,
