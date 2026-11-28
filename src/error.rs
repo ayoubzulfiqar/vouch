@@ -36,6 +36,10 @@ pub enum GatewayError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// Outbound egress policy blocked the request before dispatching upstream.
+    #[error("egress policy blocked request: {0}")]
+    EgressBlocked(String),
+
     /// The requested model, route, or resource does not exist.
     #[error("not found: {0}")]
     NotFound(String),
@@ -139,7 +143,7 @@ impl GatewayError {
             Self::Config(_) | Self::Internal(_) | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
-            Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::Forbidden(_) | Self::EgressBlocked(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::RateLimited { .. }
             | Self::DailyTokenBudgetExceeded { .. }
@@ -206,7 +210,7 @@ impl GatewayError {
         match self {
             Self::BadRequest(_) => "invalid_request_error",
             Self::Unauthorized(_) | Self::UpstreamAuthExpired(_) => "authentication_error",
-            Self::Forbidden(_) => "permission_error",
+            Self::Forbidden(_) | Self::EgressBlocked(_) => "permission_error",
             Self::NotFound(_) => "not_found_error",
             Self::RateLimited { .. }
             | Self::DailyTokenBudgetExceeded { .. }
@@ -224,6 +228,7 @@ impl GatewayError {
             Self::BadRequest(_) => "invalid_request",
             Self::Unauthorized(_) => "invalid_api_key",
             Self::Forbidden(_) => "model_not_allowed",
+            Self::EgressBlocked(_) => "egress_policy_blocked",
             Self::NotFound(_) => "model_not_found",
             Self::RateLimited { .. } => "rate_limit_exceeded",
             Self::DailyTokenBudgetExceeded { .. } => "daily_token_budget_exceeded",
@@ -243,7 +248,7 @@ impl GatewayError {
         match self {
             Self::BadRequest(_) => "invalid_request_error",
             Self::Unauthorized(_) | Self::UpstreamAuthExpired(_) => "authentication_error",
-            Self::Forbidden(_) => "permission_error",
+            Self::Forbidden(_) | Self::EgressBlocked(_) => "permission_error",
             Self::NotFound(_) => "not_found_error",
             Self::RateLimited { .. }
             | Self::DailyTokenBudgetExceeded { .. }
