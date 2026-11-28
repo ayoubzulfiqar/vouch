@@ -43,7 +43,7 @@ use crate::{
     error::{GatewayError, Result},
     ingress::{
         CancelOnDrop, RequestContext, StreamUsageGuard, completion, execute_or_cached,
-        execution_request, insert_routing_headers, into_chunk_stream,
+        execution_request, insert_dispatched_headers, into_chunk_stream,
         openai::parse_openai_response_format, parse_json_content, prepare_routed,
         record_completion_outcome, record_error_outcome, sse_response, start_ingress_span,
         unix_now,
@@ -418,6 +418,7 @@ async fn responses_inner(
         let mut chunks = into_chunk_stream(driver_response);
         let model = context.model.clone();
         let request_id = context.request_id.clone();
+        let coalesced = context.is_coalesced();
         let stream_cancel = cancel.clone();
         let created_at = unix_now();
         let store = state.responses().clone();
@@ -668,9 +669,18 @@ async fn responses_inner(
         };
 
         let mut response = sse_response(stream, keep_alive);
-        insert_routing_headers(&mut response, &backend, fallback, &request_id, cache_status);
+        insert_dispatched_headers(
+            &mut response,
+            &backend,
+            fallback,
+            &request_id,
+            cache_status,
+            coalesced,
+        );
         return Ok(response);
     }
+
+    let coalesced = context.is_coalesced();
 
     let completion = match completion(driver_response).await {
         Ok(c) => {
@@ -725,12 +735,13 @@ async fn responses_inner(
         completion.usage,
     );
     let mut response = (StatusCode::OK, Json(body)).into_response();
-    insert_routing_headers(
+    insert_dispatched_headers(
         &mut response,
         &backend,
         fallback,
         &context.request_id,
         cache_status,
+        coalesced,
     );
     Ok(response)
 }
