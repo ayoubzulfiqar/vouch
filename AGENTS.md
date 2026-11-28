@@ -89,19 +89,25 @@ env var panic the daemon. Client-visible error strings go through
   unbounded channel. A slow SSE consumer applies backpressure through the
   `PermitGuard` held for the stream's lifetime.
 - Subprocess stdout is capped at 16 MiB, captured stderr at 8 KiB, collected
-  streams at 16 MiB, and request bodies by `server.max_body_bytes`.
+  streams at 16 MiB, unclosed `<vouch_tool_call>` blocks at 1 MiB, single-line
+  `read_mode = "line"` / `json_lines` buffers at 2 MiB, `/v1/responses` chains at
+  64 hops, singleflight waiters by `cache.max_coalesce_waiters` (default 64),
+  and request bodies by `server.max_body_bytes`.
 - `PermitGuard::acquire` waits at most `queue_timeout_ms`, honors client
-  cancellation, releases on `Drop`, and updates the active-permit gauge.
+  cancellation, releases on `Drop` (held by subprocess drivers until child reap),
+  and updates the active-permit gauge.
 
-### PGID supervision for every child process
+### PGID & Job Object supervision for every child process
 
-Subprocess backends spawn with `process_group(0)` so PGID == PID. Move a
-`ProcessGroupGuard` into the task that owns the child: `disarm()` on clean
-exit, `terminate()` on timeout, I/O error, cancellation, or dropped stream.
-Termination sends `SIGTERM` to the whole group, waits 500 ms, then escalates to
-`SIGKILL` if members remain — grandchildren must never outlive a request.
+On Unix, subprocess backends spawn with `process_group(0)` so PGID == PID; on
+Windows they attach to a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Win32 Job Object.
+Move a `ProcessGroupGuard` into the task that owns the child: `disarm()` on
+clean exit, `terminate()` on timeout, I/O error, cancellation, or dropped stream.
+Unix termination sends `SIGTERM` to the whole group, waits 500 ms, then escalates
+to `SIGKILL` if members remain — grandchildren must never outlive a request.
 PTY work is blocking (`portable-pty`) so it runs inside `spawn_blocking` and
-communicates over bounded channels with the same guard.
+communicates over bounded channels with the same guard (`EIO` on Unix handled as
+clean EOF).
 
 ### Hot reload via ArcSwap (never tearing down in-flight work)
 
