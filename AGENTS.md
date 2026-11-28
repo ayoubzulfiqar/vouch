@@ -15,6 +15,7 @@ state is the TOML file plus ephemeral worktrees.
 | --- | --- |
 | `src/config.rs` | Typed TOML schema, validation, `ConfigStore` (ArcSwap snapshot) |
 | `src/error.rs` | The single `GatewayError` type and `Result` alias |
+| `src/memory/mod.rs` | Shared cross-agent memory ledger (`SessionLedgerStore`), deterministic `<vouch_shared_context>` handoff (`SharedMemoryEngine`), and `[trace]` MCP bridge (`TraceBridge`) |
 | `src/cache.rs` | Deterministic SHA-256 response cache (`ResponseCache`) with TTL, eviction, & persistence |
 | `src/usage.rs` | `tiktoken-rs` BPE token counter (`cl100k_base` / `o200k_base`), usage, cost & latency analytics |
 | `src/persistence.rs` | Lock-guarded atomic `0600` snapshots for sessions, responses, cache, budgets, and usage |
@@ -36,6 +37,7 @@ state is the TOML file plus ephemeral worktrees.
 | `src/ingress/anthropic.rs` | Anthropic Messages adapter (`tools`, `tool_use`, `thinking`, `cache_control`, multimodal) |
 | `src/ingress/gemini.rs` | Google Gemini API adapter (`POST /v1beta/models/{model}:{generateContent,streamGenerateContent}`, `thought` & streaming `functionCall`) |
 | `src/ingress/ollama.rs` | Ollama API adapter (`GET /api/tags`, `POST /api/chat`, `POST /api/generate`, `tool_calls` & `options`) |
+| `src/ingress/sessions.rs` | Cross-agent shared session ledger API (`GET/DELETE /v1/sessions`, `POST /v1/sessions/{id}/checkpoint`) |
 | `src/ingress/admin.rs` | Opt-in `server.enable_admin` control plane (`POST /admin/reload`, circuit reset, `DELETE /admin/cache`) |
 | `src/ingress/ui.rs` | Optional `server.enable_ui`-gated embedded Console v2 (`GET /ui`: topology, playground, waterfall) |
 | `src/ingress/ops.rs` | `/healthz`, `/readyz`, `/metrics` (unauthenticated) and `/v1/usage`, `/v1/traces` (authenticated) |
