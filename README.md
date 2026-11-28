@@ -129,10 +129,29 @@ With no `[[tokens]]` entries, `vouch` runs in zero-friction local mode and accep
 
 ## Installation
 
+### Prebuilt releases (Linux, macOS, Windows)
+
+Prebuilt archives and native distro packages are published on [GitHub Releases](https://github.com/ayoubzulfiqar/vouch/releases):
+
+```bash
+# Debian / Ubuntu (.deb)
+sudo apt install ./vouch_6.0.0_amd64.deb        # or arm64
+
+# Fedora / RHEL / openSUSE (.rpm)
+sudo dnf install ./vouch-6.0.0-1.x86_64.rpm     # or aarch64
+
+# Arch Linux / Manjaro (.pkg.tar.zst or AUR-style PKGBUILD)
+sudo pacman -U ./vouch-6.0.0-1-x86_64.pkg.tar.zst   # or aarch64
+# or build from source with packaging/arch/PKGBUILD:
+makepkg -si -p packaging/arch/PKGBUILD
+```
+
+Windows users can extract `vouch-v6.0.0-x86_64-pc-windows-msvc.zip` and add `vouch.exe` to `PATH`, or install via `cargo binstall vouch`.
+
 ### From source or package managers
 
 ```bash
-# Quick binary install (cargo-binstall)
+# Quick binary install (cargo-binstall — Linux, macOS, Windows)
 cargo binstall vouch
 
 # Homebrew (after release tap / formula download)
