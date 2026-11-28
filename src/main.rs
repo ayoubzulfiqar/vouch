@@ -96,9 +96,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let tcp_shutdown = shutdown.clone();
     let tcp_app = app.clone();
     servers.spawn(async move {
-        if let Err(error) = axum::serve(tcp, tcp_app)
-            .with_graceful_shutdown(async move { tcp_shutdown.cancelled().await })
-            .await
+        if let Err(error) = axum::serve(
+            tcp,
+            tcp_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { tcp_shutdown.cancelled().await })
+        .await
         {
             error!(error = %error, "TCP server failed");
         }
