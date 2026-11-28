@@ -846,14 +846,150 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
-/// Non-Unix stub with the same API.
-#[cfg(not(unix))]
+/// Windows Job Object supervision ensuring all descendant processes exit when terminated or dropped.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct ProcessGroupGuard {
+    inner: Arc<WindowsJobSwitch>,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsJobSwitch {
+    job_handle: isize,
+    backend: String,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(windows)]
+impl WindowsJobSwitch {
+    fn close_handle(&self) {
+        if self.job_handle != 0 {
+            // Safety: `job_handle` is a valid Win32 Job Object handle owned exclusively by this struct.
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(
+                    self.job_handle as windows_sys::Win32::Foundation::HANDLE,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJobSwitch {
+    fn drop(&mut self) {
+        self.close_handle();
+    }
+}
+
+#[cfg(windows)]
+impl ProcessGroupGuard {
+    /// Create a Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and attach `pid`.
+    pub fn new(pid: u32, backend: impl Into<String>) -> Self {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
+
+        let backend = backend.into();
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            tracing::warn!(backend = %backend, "CreateJobObjectW failed; child tree supervision disabled");
+            return Self {
+                inner: Arc::new(WindowsJobSwitch {
+                    job_handle: 0,
+                    backend,
+                    armed: std::sync::atomic::AtomicBool::new(false),
+                }),
+            };
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&raw const info).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            tracing::warn!(backend = %backend, "SetInformationJobObject(KILL_ON_JOB_CLOSE) failed");
+        }
+        let proc_handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+        if !proc_handle.is_null() {
+            let assigned = unsafe { AssignProcessToJobObject(job, proc_handle) };
+            if assigned == 0 {
+                tracing::warn!(backend = %backend, pid, "AssignProcessToJobObject failed");
+            }
+            unsafe { CloseHandle(proc_handle) };
+        } else {
+            tracing::warn!(backend = %backend, pid, "OpenProcess failed for Job Object attachment");
+        }
+        Self {
+            inner: Arc::new(WindowsJobSwitch {
+                job_handle: job as isize,
+                backend,
+                armed: std::sync::atomic::AtomicBool::new(true),
+            }),
+        }
+    }
+
+    /// Share the same Job Object kill switch with another task.
+    pub fn clone_guard(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+
+    /// Disarm termination when the child completed cleanly.
+    pub fn disarm(&self) {
+        self.inner
+            .armed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Terminate the entire Windows Job Object process tree immediately.
+    pub fn terminate(&self) {
+        use std::sync::atomic::Ordering;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        if !self.inner.armed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if self.inner.job_handle != 0 {
+            let ok = unsafe {
+                TerminateJobObject(
+                    self.inner.job_handle as windows_sys::Win32::Foundation::HANDLE,
+                    1,
+                )
+            };
+            if ok == 0 {
+                tracing::warn!(backend = %self.inner.backend, "TerminateJobObject returned failure");
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+/// Non-Unix, non-Windows fallback stub with the same API.
+#[cfg(not(any(unix, windows)))]
 #[derive(Debug, Clone)]
 pub struct ProcessGroupGuard {
     backend: String,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl ProcessGroupGuard {
     /// Create a stub guard.
     pub fn new(_pgid: u32, backend: impl Into<String>) -> Self {
@@ -874,7 +1010,7 @@ impl ProcessGroupGuard {
     pub fn terminate(&self) {
         tracing::warn!(
             backend = %self.backend,
-            "process-group supervision is only implemented on Unix"
+            "process-group supervision is not supported on this platform"
         );
     }
 }
