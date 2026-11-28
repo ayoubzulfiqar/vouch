@@ -4645,6 +4645,7 @@ mod hardening_tests {
     use vouch::driver::cli_pipe::{
         MAX_LINE_BUFFER_BYTES, is_windows_batch_shim, should_spill_prompt_to_file,
     };
+    #[cfg(unix)]
     use vouch::driver::pty_runner::is_pty_eof_error;
     use vouch::driver::tool_bridge::{MAX_TOOL_TAG_BUFFER_BYTES, StreamingToolParser};
     use vouch::driver::workspace::WorkspaceManager;
