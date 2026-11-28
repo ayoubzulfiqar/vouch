@@ -56,7 +56,17 @@ pub fn normalize_tools(tools: Vec<Value>) -> Vec<Value> {
 
 /// Format conversation turns including structured tool calls and tool results.
 pub fn format_message(message: &ChatMessage, output: &mut String) {
-    let text = message.content.as_plain_text();
+    let mut text = message.content.as_plain_text();
+    if let crate::driver::MessageContent::Parts(parts) = &message.content {
+        for part in parts {
+            if let crate::driver::ContentPart::ImageBase64 { media_type, .. } = part {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&format!("[Attached image: {media_type}]"));
+            }
+        }
+    }
     if message.role == "tool" {
         let call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
         if let Some(name) = message.name.as_deref() {
