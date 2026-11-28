@@ -78,6 +78,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let log_level = config.server.log_level.clone();
     let secrets = config.secrets();
     telemetry::init(&log_level, secrets)?;
+    if config.tokens.is_empty() {
+        warn!(
+            "running in unauthenticated local mode because [[tokens]] is empty; configure [[tokens]] before exposing vouch beyond loopback"
+        );
+    }
 
     let state = AppState::new(args.config, config)?;
     let orphan_ttl = Duration::from_secs(state.config().defaults.session_ttl_secs.max(1));
@@ -120,7 +125,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     let socket_path = state.config().server.unix_socket.clone();
     if let Some(path) = &socket_path {
-        prepare_socket_path(path)?;
+        vouch::prepare_unix_socket_path(path)?;
         let listener = UnixListener::bind(path).map_err(|error| {
             GatewayError::Io(std::io::Error::new(
                 error.kind(),
@@ -189,29 +194,6 @@ async fn serve(args: ServeArgs) -> Result<()> {
         let _ = std::fs::remove_file(path);
     }
     info!("vouch stopped");
-    Ok(())
-}
-
-/// Remove a stale socket and create its parent directory if needed.
-fn prepare_socket_path(path: &Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_file(path).map_err(|error| {
-            GatewayError::Io(std::io::Error::new(
-                error.kind(),
-                format!("cannot remove stale socket {}: {error}", path.display()),
-            ))
-        })?;
-    }
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            GatewayError::Io(std::io::Error::new(
-                error.kind(),
-                format!("cannot create {}: {error}", parent.display()),
-            ))
-        })?;
-    }
     Ok(())
 }
 
