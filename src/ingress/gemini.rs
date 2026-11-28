@@ -31,9 +31,9 @@ use crate::{
     error::{GatewayError, Result},
     ingress::{
         CancelOnDrop, StreamUsageGuard, completion, execute_or_cached, execution_request,
-        insert_dispatched_headers, insert_routing_headers, into_chunk_stream,
-        prepare_routed_with_key_hint, record_completion_outcome, record_error_outcome,
-        sse_response, start_ingress_span,
+        insert_dispatched_headers, insert_handoff_headers, insert_routing_headers,
+        into_chunk_stream, prepare_routed_with_key_hint, record_completion_outcome,
+        record_error_outcome, record_memory_turn, sse_response, start_ingress_span,
     },
     state::AppState,
     telemetry::redact_text,
@@ -220,6 +220,7 @@ async fn generate_inner(
     let cache_miss_key = dispatched.cache_miss_key;
     let coalesced = dispatched.coalesced;
     let request_id = context.request_id.clone();
+    let handoff_from = context.handoff_from();
 
     if stream {
         let sse_mode = query
@@ -431,6 +432,7 @@ async fn generate_inner(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         };
         insert_routing_headers(&mut response, &backend, fallback, &request_id, cache_status);
+        insert_handoff_headers(&mut response, handoff_from.as_deref());
         return Ok(response);
     }
 
@@ -444,6 +446,14 @@ async fn generate_inner(
                 c.usage,
                 started.elapsed(),
                 Some(ingress_span),
+            );
+            record_memory_turn(
+                &state,
+                &context,
+                &backend,
+                c.usage,
+                &c.content,
+                &c.tool_calls,
             );
             if let Some(key) = cache_miss_key {
                 state.cache().store(key, &backend, &c);
@@ -481,6 +491,7 @@ async fn generate_inner(
         cache_status,
         coalesced,
     );
+    insert_handoff_headers(&mut response, handoff_from.as_deref());
     Ok(response)
 }
 
