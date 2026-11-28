@@ -376,6 +376,8 @@ pub struct ExecutionRequest {
     pub workspace_mode: WorkspaceMode,
     /// Working directory assigned by the router (worktree or configured).
     pub workdir: Option<PathBuf>,
+    /// Optional validated workspace root override (`X-Workspace-Root`) for `trace`.
+    pub workspace_root: Option<PathBuf>,
     /// Cancellation triggered by client disconnect or shutdown.
     pub cancel: CancellationToken,
     /// Normalized OpenAI-format tool declarations.
