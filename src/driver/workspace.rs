@@ -75,6 +75,7 @@ impl WorkspaceEntry {
         if !removed {
             let _ = tokio::fs::remove_dir_all(&self.path).await;
         }
+        let _ = tokio::fs::remove_file(pid_sidecar_path(&self.path)).await;
         let _ = tokio::process::Command::new(&self.git)
             .arg("-C")
             .arg(&self.repo)
@@ -115,6 +116,7 @@ impl Drop for WorkspaceEntry {
                 if !matches!(status, Ok(status) if status.success()) {
                     let _ = std::fs::remove_dir_all(&path);
                 }
+                let _ = std::fs::remove_file(pid_sidecar_path(&path));
                 let _ = std::process::Command::new(&git)
                     .arg("-C")
                     .arg(&repo)
@@ -226,6 +228,8 @@ impl WorkspaceManager {
             )));
         }
 
+        let _ = tokio::fs::write(pid_sidecar_path(&path), std::process::id().to_string()).await;
+
         let entry = Arc::new(WorkspaceEntry {
             path,
             created_at: Instant::now(),
@@ -292,6 +296,112 @@ impl WorkspaceManager {
         }
     }
 
+    /// Sweep orphaned worktree directories left in `workspace.root` from crashed
+    /// daemon processes or older than `max_age`, pruning git worktree metadata.
+    pub async fn sweep_orphans(&self, max_age: Duration) -> usize {
+        let config = self.config.load_full();
+        if !config.enabled {
+            return 0;
+        }
+        let root = config
+            .root
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("vouch-worktrees"));
+        let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+            return 0;
+        };
+        let active_paths: std::collections::HashSet<PathBuf> = self
+            .entries
+            .iter()
+            .map(|entry| entry.value().path.clone())
+            .collect();
+        let current_pid = std::process::id();
+        let mut removed = 0usize;
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".vouch.pid"))
+            {
+                let base_str = path.to_string_lossy();
+                let target_dir = PathBuf::from(base_str.trim_end_matches(".vouch.pid"));
+                if !target_dir.exists() {
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
+                continue;
+            }
+            let Ok(ft) = entry.file_type().await else {
+                continue;
+            };
+            if !ft.is_dir() || active_paths.contains(&path) {
+                continue;
+            }
+            let sidecar = pid_sidecar_path(&path);
+            let sidecar_pid = tokio::fs::read_to_string(&sidecar)
+                .await
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u32>().ok());
+            let age_exceeded = tokio::fs::metadata(&path)
+                .await
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|mtime| mtime.elapsed().ok())
+                .is_some_and(|age| age > max_age);
+
+            let is_orphan = match sidecar_pid {
+                Some(pid) if pid == current_pid => false,
+                Some(pid) => !crate::driver::attachments::is_process_alive(pid) || age_exceeded,
+                None => age_exceeded,
+            };
+            if !is_orphan {
+                continue;
+            }
+
+            let removed_via_git = if let Some(repo) = &config.repo_path {
+                let mut cmd = tokio::process::Command::new(&config.git_binary);
+                cmd.arg("-C")
+                    .arg(repo)
+                    .arg("worktree")
+                    .arg("remove")
+                    .arg("--force")
+                    .arg(&path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true);
+                matches!(
+                    tokio::time::timeout(Duration::from_secs(20), cmd.status()).await,
+                    Ok(Ok(status)) if status.success()
+                )
+            } else {
+                false
+            };
+            if !removed_via_git && tokio::fs::remove_dir_all(&path).await.is_err() {
+                continue;
+            }
+            let _ = tokio::fs::remove_file(&sidecar).await;
+            removed += 1;
+        }
+
+        if removed > 0
+            && let Some(repo) = &config.repo_path
+        {
+            let _ = tokio::process::Command::new(&config.git_binary)
+                .arg("-C")
+                .arg(repo)
+                .arg("worktree")
+                .arg("prune")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
+        removed
+    }
+
     /// Spawn a periodic TTL eviction task.
     pub fn spawn_eviction_task(
         self: &Arc<Self>,
@@ -311,6 +421,12 @@ impl WorkspaceManager {
             }
         })
     }
+}
+
+fn pid_sidecar_path(worktree_path: &Path) -> PathBuf {
+    let mut raw = worktree_path.as_os_str().to_os_string();
+    raw.push(".vouch.pid");
+    PathBuf::from(raw)
 }
 
 fn sanitize_session_key(key: &str) -> String {
@@ -406,8 +522,20 @@ mod tests {
         });
         let entry = manager.acquire("session-1").await.expect("worktree");
         assert!(entry.path.exists());
+        assert!(pid_sidecar_path(&entry.path).exists());
+
+        // Create a synthetic crashed-daemon orphan worktree directory with a dead PID.
+        let orphan_dir = temp.path().join("worktrees").join("orphan-deadbeef");
+        std::fs::create_dir_all(&orphan_dir).expect("orphan dir");
+        std::fs::write(pid_sidecar_path(&orphan_dir), "99999999").expect("orphan pid");
+        let swept = manager.sweep_orphans(Duration::from_secs(3600)).await;
+        assert_eq!(swept, 1);
+        assert!(!orphan_dir.exists());
+        assert!(!pid_sidecar_path(&orphan_dir).exists());
+
         let path = entry.path.clone();
         manager.cleanup_all().await;
         assert!(!path.exists());
+        assert!(!pid_sidecar_path(&path).exists());
     }
 }
