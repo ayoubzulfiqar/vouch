@@ -97,6 +97,73 @@ pub struct PersistedCacheEntry {
     pub seq: u64,
 }
 
+/// Persisted cross-agent handoff event within a shared session ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedHandoffEvent {
+    /// Previous backend identifier.
+    pub from_backend: String,
+    /// Receiving backend identifier.
+    pub to_backend: String,
+    /// Trigger (`failover`, `policy_reorder`, `model_switch`).
+    pub reason: String,
+    /// Event timestamp in seconds since UNIX epoch.
+    pub timestamp: u64,
+}
+
+/// Persisted canonical turn stored inside [`PersistedSharedSession`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedCanonicalTurn {
+    /// Role (`user`, `assistant`, `tool`).
+    pub role: String,
+    /// Redacted concise textual content.
+    pub content: String,
+    /// Redacted summary of tool calls or tool execution status, if any.
+    #[serde(default)]
+    pub tool_summary: Option<String>,
+    /// Backend identifier that observed or produced this turn.
+    pub backend_id: String,
+    /// Turn timestamp in seconds since UNIX epoch.
+    pub timestamp: u64,
+}
+
+/// Persisted canonical cross-agent shared session ledger entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSharedSession {
+    /// Canonical session identifier.
+    pub session_id: String,
+    /// Creation timestamp in seconds since UNIX epoch.
+    pub created_at: u64,
+    /// Last activity timestamp in seconds since UNIX epoch.
+    pub updated_at: u64,
+    /// Last resolved model/route associated with this session.
+    #[serde(default)]
+    pub last_model: Option<String>,
+    /// Active backend id currently holding session state.
+    #[serde(default)]
+    pub active_backend: Option<String>,
+    /// Active credential profile id, if any.
+    #[serde(default)]
+    pub active_profile: Option<String>,
+    /// Chronological cross-agent handoff history.
+    #[serde(default)]
+    pub backend_history: Vec<PersistedHandoffEvent>,
+    /// Bounded rolling window of redacted canonical turns.
+    #[serde(default)]
+    pub turns: Vec<PersistedCanonicalTurn>,
+    /// Deduplicated sanitized relative workspace paths referenced/touched.
+    #[serde(default)]
+    pub touched_files: Vec<String>,
+    /// Explicit redacted milestone/decision checkpoints.
+    #[serde(default)]
+    pub checkpoints: Vec<String>,
+    /// Cumulative prompt BPE tokens across all agents in this session.
+    #[serde(default)]
+    pub total_prompt_tokens: u64,
+    /// Cumulative completion BPE tokens across all agents in this session.
+    #[serde(default)]
+    pub total_completion_tokens: u64,
+}
+
 /// Durable snapshot persisted to `defaults.state_dir/gateway_state.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GatewaySnapshot {
@@ -122,6 +189,12 @@ pub struct GatewaySnapshot {
     /// Optional persisted deterministic response cache entries (`cache.persist = true`).
     #[serde(default)]
     pub cached_responses: Vec<PersistedCacheEntry>,
+    /// Persisted canonical `[shared_memory]` cross-agent session ledgers.
+    #[serde(default)]
+    pub shared_sessions: Vec<PersistedSharedSession>,
+    /// Cumulative cross-agent handoff counter persisted across restarts.
+    #[serde(default)]
+    pub total_handoffs: u64,
 }
 
 impl GatewaySnapshot {
@@ -142,12 +215,25 @@ impl GatewaySnapshot {
             daily_token_budgets,
             usage,
             cached_responses: Vec::new(),
+            shared_sessions: Vec::new(),
+            total_handoffs: 0,
         }
     }
 
     /// Attach persisted deterministic cache entries to the snapshot.
     pub fn with_cached_responses(mut self, entries: Vec<PersistedCacheEntry>) -> Self {
         self.cached_responses = entries;
+        self
+    }
+
+    /// Attach persisted `[shared_memory]` session ledgers and total handoff count.
+    pub fn with_shared_sessions(
+        mut self,
+        sessions: Vec<PersistedSharedSession>,
+        total_handoffs: u64,
+    ) -> Self {
+        self.shared_sessions = sessions;
+        self.total_handoffs = total_handoffs;
         self
     }
 }
