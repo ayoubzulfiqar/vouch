@@ -73,6 +73,22 @@ pub struct MetricsSnapshot {
     pub fallbacks_total: u64,
     /// Total virtual-token rate limit rejections.
     pub rate_limited_total: u64,
+    /// Total speculative hedged backup wins.
+    pub hedged_wins_total: u64,
+    /// Total deterministic response cache hits.
+    pub cache_hits_total: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UsageTotalsPayload {
+    #[serde(default)]
+    total_cost_usd: f64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UsagePayload {
+    #[serde(default)]
+    totals: UsageTotalsPayload,
 }
 
 struct DashboardData {
@@ -80,6 +96,7 @@ struct DashboardData {
     health: Option<HealthzPayload>,
     ready: Option<ReadyzPayload>,
     metrics: MetricsSnapshot,
+    total_cost_usd: Option<f64>,
     last_error: Option<String>,
 }
 
@@ -97,6 +114,12 @@ impl Drop for TerminalGuard {
 pub async fn run(args: &TopArgs) -> Result<()> {
     let (client, base_url, target_label) = build_client(args)?;
     let poll_interval = Duration::from_millis(args.interval_ms.max(100));
+    let api_token = args
+        .token
+        .clone()
+        .or_else(|| std::env::var("VOUCH_API_KEY").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     enable_raw_mode().map_err(GatewayError::Io)?;
     let mut stdout = io::stdout();
@@ -106,7 +129,7 @@ pub async fn run(args: &TopArgs) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(GatewayError::Io)?;
 
-    let mut data = fetch_snapshot(&client, &base_url, &target_label).await;
+    let mut data = fetch_snapshot(&client, &base_url, &target_label, api_token.as_deref()).await;
     let mut last_poll = Instant::now();
 
     loop {
@@ -129,7 +152,7 @@ pub async fn run(args: &TopArgs) -> Result<()> {
         }
 
         if last_poll.elapsed() >= poll_interval {
-            data = fetch_snapshot(&client, &base_url, &target_label).await;
+            data = fetch_snapshot(&client, &base_url, &target_label, api_token.as_deref()).await;
             last_poll = Instant::now();
         }
     }
@@ -157,14 +180,18 @@ async fn fetch_snapshot(
     client: &reqwest::Client,
     base_url: &str,
     target_label: &str,
+    api_token: Option<&str>,
 ) -> DashboardData {
     let health_url = format!("{base_url}/healthz");
     let ready_url = format!("{base_url}/readyz");
     let metrics_url = format!("{base_url}/metrics");
+    let usage_url = format!("{base_url}/v1/usage");
     let health_fut = fetch_json::<HealthzPayload>(client, &health_url);
     let ready_fut = fetch_json::<ReadyzPayload>(client, &ready_url);
     let metrics_fut = fetch_text(client, &metrics_url);
-    let (health_res, ready_res, metrics_res) = tokio::join!(health_fut, ready_fut, metrics_fut);
+    let usage_fut = fetch_usage_optional(client, &usage_url, api_token);
+    let (health_res, ready_res, metrics_res, total_cost_usd) =
+        tokio::join!(health_fut, ready_fut, metrics_fut, usage_fut);
 
     let mut errors = Vec::new();
     let health = match health_res {
@@ -194,12 +221,30 @@ async fn fetch_snapshot(
         health,
         ready,
         metrics,
+        total_cost_usd,
         last_error: if errors.is_empty() {
             None
         } else {
             Some(errors.join("; "))
         },
     }
+}
+
+async fn fetch_usage_optional(
+    client: &reqwest::Client,
+    url: &str,
+    api_token: Option<&str>,
+) -> Option<f64> {
+    let mut req = client.get(url);
+    if let Some(tok) = api_token {
+        req = req.bearer_auth(tok);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let parsed: UsagePayload = resp.json().await.ok()?;
+    Some(parsed.totals.total_cost_usd)
 }
 
 async fn fetch_json<T: serde::de::DeserializeOwned>(
@@ -269,8 +314,12 @@ fn render_dashboard(frame: &mut Frame<'_>, data: &DashboardData) {
                     )),
                 ]),
                 Line::from(format!(
-                    " routes={}  backends={}  tokens={}  worktree={}   [q / Ctrl+C to quit]",
-                    health.models, health.backends, token_badge, ws_badge
+                    " routes={}  backends={}  tokens={}  worktree={}  cost=${:.4}   [q / Ctrl+C to quit]",
+                    health.models,
+                    health.backends,
+                    token_badge,
+                    ws_badge,
+                    data.total_cost_usd.unwrap_or(0.0)
                 )),
             ]
         }
@@ -413,8 +462,11 @@ fn render_dashboard(frame: &mut Frame<'_>, data: &DashboardData) {
     let footer_lines = vec![
         Line::from(format!(" Requests: {req_summary}")),
         Line::from(format!(
-            " Fallbacks: {}   Token rate limits: {}",
-            data.metrics.fallbacks_total, data.metrics.rate_limited_total
+            " Fallbacks: {}   Token rate limits: {}   Hedged wins: {}   Cache hits: {}",
+            data.metrics.fallbacks_total,
+            data.metrics.rate_limited_total,
+            data.metrics.hedged_wins_total,
+            data.metrics.cache_hits_total
         )),
     ];
     let footer = Paragraph::new(footer_lines).block(
@@ -476,6 +528,14 @@ pub fn parse_metrics_snapshot(text: &str) -> MetricsSnapshot {
             }
             "vouch_token_rate_limited_total" => {
                 snap.rate_limited_total = snap.rate_limited_total.saturating_add(value);
+            }
+            "vouch_hedged_wins_total" => {
+                snap.hedged_wins_total = snap.hedged_wins_total.saturating_add(value);
+            }
+            "vouch_cache_requests_total"
+                if labels.get("outcome").map(String::as_str) == Some("hit") =>
+            {
+                snap.cache_hits_total = snap.cache_hits_total.saturating_add(value);
             }
             _ => {}
         }
