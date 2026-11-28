@@ -4092,3 +4092,541 @@ timeout_secs = 5
         harness.state.shutdown().await;
     }
 }
+
+mod v5_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    #[tokio::test]
+    async fn hedged_win_attributes_winner_and_cancels_loser_without_500ms_penalty() {
+        let dir = TempDir::new().expect("temp");
+        // Primary sleeps 3 seconds (ignores fast cancel gracefully or traps SIGTERM), backup responds fast.
+        let slow = script(
+            dir.path(),
+            "slow.sh",
+            "#!/bin/sh\nsleep 3\necho 'from-slow'\n",
+        );
+        let fast = script(dir.path(), "fast.sh", "#!/bin/sh\necho 'from-fast'\n");
+
+        let config = format!(
+            r#"
+[server]
+tcp_listen = "127.0.0.1:0"
+
+[[backends]]
+id = "slow"
+kind = "cli"
+command = {:?}
+stdin = true
+
+[[backends]]
+id = "fast"
+kind = "cli"
+command = {:?}
+stdin = true
+
+[routes]
+"coding/hedged" = ["slow", "fast"]
+
+[route_policies."coding/hedged"]
+strategy = "hedged"
+hedge_delay_ms = 50
+"#,
+            slow, fast
+        );
+        let h = Harness::new(config).await;
+        let started = std::time::Instant::now();
+        let resp = h
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "coding/hedged",
+                    "messages": [{"role": "user", "content": "hi"}]
+                }),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-vouch-backend").unwrap(), "fast");
+        assert_eq!(resp.headers().get("x-vouch-fallback").unwrap(), "true");
+        let body: Value = serde_json::from_str(&body_text(resp).await).expect("json");
+        assert_eq!(body["choices"][0]["message"]["content"], "from-fast");
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "winner waited on slow teardown: {elapsed:?}"
+        );
+
+        // Usage attribution must credit winning backend `fast`, not `slow`.
+        let usage = h.get("/v1/usage", &[]).await;
+        let usage_json: Value = serde_json::from_str(&body_text(usage).await).expect("usage");
+        let backends = usage_json["backends"].as_array().expect("backends");
+        assert!(
+            backends
+                .iter()
+                .any(|b| b["id"] == "fast" && b["requests"] == 1)
+        );
+
+        h.state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn singleflight_coalescing_deduplicates_concurrent_identical_requests() {
+        let dir = TempDir::new().expect("temp");
+        let counter_file = dir.path().join("exec_count.txt");
+        let responder = script(
+            dir.path(),
+            "coalesce.sh",
+            &format!(
+                "#!/bin/sh\necho x >> {:?}\nsleep 0.12\ncat >/dev/null\necho 'coalesced-ok'\n",
+                counter_file
+            ),
+        );
+
+        let config = format!(
+            r#"
+[server]
+tcp_listen = "127.0.0.1:0"
+
+[cache]
+enabled = true
+coalesce_inflight = true
+normalize_whitespace = true
+
+[[backends]]
+id = "mock"
+kind = "cli"
+command = {:?}
+stdin = true
+max_concurrency = 4
+
+[routes]
+"coding/default" = ["mock"]
+"#,
+            responder
+        );
+        let h = Harness::new(config).await;
+
+        let req_a = h.post_json(
+            "/v1/chat/completions",
+            &[],
+            json!({"model": "coding/default", "temperature": 0.0, "messages": [{"role": "user", "content": "same   prompt"}]}),
+        );
+        let req_b = h.post_json(
+            "/v1/chat/completions",
+            &[],
+            json!({"model": "coding/default", "temperature": 0.0, "messages": [{"role": "user", "content": "same prompt"}]}),
+        );
+        let req_c = h.post_json(
+            "/v1/chat/completions",
+            &[],
+            json!({"model": "coding/default", "temperature": 0.0, "messages": [{"role": "user", "content": "  same\tprompt  "}]}),
+        );
+        let (r1, r2, r3) = tokio::join!(req_a, req_b, req_c);
+
+        let coalesced_count = [&r1, &r2, &r3]
+            .iter()
+            .filter(|r| {
+                r.headers()
+                    .get("x-vouch-coalesced")
+                    .is_some_and(|v| v == "true")
+            })
+            .count();
+        assert_eq!(coalesced_count, 2, "two waiters should be coalesced");
+
+        for r in [r1, r2, r3] {
+            assert_eq!(r.status(), StatusCode::OK);
+            let body: Value = serde_json::from_str(&body_text(r).await).expect("json");
+            assert_eq!(body["choices"][0]["message"]["content"], "coalesced-ok");
+        }
+
+        let exec_lines = fs::read_to_string(&counter_file)
+            .expect("count")
+            .lines()
+            .count();
+        assert_eq!(exec_lines, 1, "backend must execute only once");
+
+        let metrics_text = body_text(h.get("/metrics", &[]).await).await;
+        assert!(metrics_text.contains("vouch_coalesced_requests_total"));
+        h.state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pre_execution_budget_reservation_blocks_concurrent_burst_overshoot() {
+        let dir = TempDir::new().expect("temp");
+        let responder = script(
+            dir.path(),
+            "slow_budget.sh",
+            "#!/bin/sh\nsleep 0.15\necho 'ok'\n",
+        );
+
+        let config = format!(
+            r#"
+[server]
+tcp_listen = "127.0.0.1:0"
+
+[[backends]]
+id = "mock"
+kind = "cli"
+command = {:?}
+stdin = true
+max_concurrency = 4
+
+[routes]
+"coding/default" = ["mock"]
+
+[[tokens]]
+token = "vouch-budget-secret"
+name = "tight"
+daily_token_budget = 25
+"#,
+            responder
+        );
+        let h = Harness::new(config).await;
+        let auth = ("authorization", "Bearer vouch-budget-secret");
+        let auth_hdr = [auth];
+        // Prompt has > 14 BPE tokens so two concurrent identical requests (~16+16 > 25) cannot both reserve.
+        let payload = json!({
+            "model": "coding/default",
+            "messages": [{"role": "user", "content": "one two three four five six seven eight nine ten eleven twelve"}]
+        });
+        let r1 = h.post_json("/v1/chat/completions", &auth_hdr, payload.clone());
+        let r2 = h.post_json("/v1/chat/completions", &auth_hdr, payload);
+        let (a, b) = tokio::join!(r1, r2);
+        let statuses = [a.status(), b.status()];
+        assert!(statuses.contains(&StatusCode::OK));
+        assert!(statuses.contains(&StatusCode::TOO_MANY_REQUESTS));
+        h.state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn egress_guard_blocks_and_redacts_and_output_filters_strip_noise() {
+        let dir = TempDir::new().expect("temp");
+        let spawn_marker = dir.path().join("spawned.txt");
+        let echo_script = script(
+            dir.path(),
+            "echo_stdin.sh",
+            &format!(
+                "#!/bin/sh\necho 'sp' >> {:?}\necho 'BANNER_NOISE: ignore'\ncat\n",
+                spawn_marker
+            ),
+        );
+
+        // 1. Block mode must return 403 before spawning backend.
+        let block_cfg = format!(
+            r#"
+[server]
+tcp_listen = "127.0.0.1:0"
+
+[security.egress_guard]
+mode = "block"
+block_private_keys = true
+
+[[backends]]
+id = "mock"
+kind = "cli"
+command = {:?}
+stdin = true
+
+[routes]
+"coding/default" = ["mock"]
+"#,
+            echo_script
+        );
+        let h_block = Harness::new(block_cfg).await;
+        let blocked = h_block
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "leak AKIAIOSFODNN7EXAMPLE here"}]
+                }),
+            )
+            .await;
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        let err_json: Value = serde_json::from_str(&body_text(blocked).await).expect("err");
+        assert_eq!(err_json["error"]["code"], "egress_policy_blocked");
+        assert!(
+            !spawn_marker.exists(),
+            "blocked request must not spawn backend"
+        );
+        h_block.state.shutdown().await;
+
+        // 2. Redact mode scrubs secrets outbound & output_filters strip banner lines inbound.
+        let redact_cfg = format!(
+            r#"
+[server]
+tcp_listen = "127.0.0.1:0"
+
+[security.egress_guard]
+mode = "redact"
+block_private_keys = true
+extra_patterns = ["CORP_SECRET_[0-9]+"]
+
+[[backends]]
+id = "mock"
+kind = "cli"
+command = {:?}
+stdin = true
+output_filters = [{{ pattern = "(?m)^BANNER_NOISE:.*\\n?", replace = "" }}]
+
+[routes]
+"coding/default" = ["mock"]
+"#,
+            echo_script
+        );
+        let h_redact = Harness::new(redact_cfg).await;
+        let ok = h_redact
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "check AKIAIOSFODNN7EXAMPLE and CORP_SECRET_99"}]
+                }),
+            )
+            .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let ok_json: Value = serde_json::from_str(&body_text(ok).await).expect("ok");
+        let reply = ok_json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap();
+        assert!(reply.contains("[REDACTED_EGRESS_SECRET]"));
+        assert!(!reply.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!reply.contains("CORP_SECRET_99"));
+        assert!(!reply.contains("BANNER_NOISE"));
+        h_redact.state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn embeddings_route_supports_float_and_base64_formats() {
+        let dir = TempDir::new().expect("temp");
+        let embed_sh = script(
+            dir.path(),
+            "embed.sh",
+            "#!/bin/sh\ncat >/dev/null\necho '[[0.25, -0.5, 1.0]]'\n",
+        );
+        let config = format!(
+            r#"
+[server]
+tcp_listen = "127.0.0.1:0"
+
+[[backends]]
+id = "emb"
+kind = "cli"
+command = {:?}
+stdin = true
+
+[routes]
+"text-embedding-local" = ["emb"]
+"#,
+            embed_sh
+        );
+        let h = Harness::new(config).await;
+        let resp = h
+            .post_json(
+                "/v1/embeddings",
+                &[],
+                json!({
+                    "model": "text-embedding-local",
+                    "input": "hello world",
+                    "encoding_format": "base64"
+                }),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-vouch-backend").unwrap(), "emb");
+        let json: Value = serde_json::from_str(&body_text(resp).await).expect("json");
+        assert_eq!(json["object"], "list");
+        let b64 = json["data"][0]["embedding"].as_str().expect("base64");
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("decode");
+        assert_eq!(raw.len(), 12);
+        let first = f32::from_le_bytes(raw[0..4].try_into().unwrap());
+        assert!((first - 0.25).abs() < 1e-6);
+        h.state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn flight_recorder_traces_ring_buffer_and_replay_work_end_to_end() {
+        let dir = TempDir::new().expect("temp");
+        let flight_path = dir.path().join("flight.jsonl");
+        let echo_sh = script(dir.path(), "echo_ok.sh", "#!/bin/sh\necho 'OK'\n");
+        let cfg_text = format!(
+            r#"
+[server]
+tcp_listen = "127.0.0.1:0"
+enable_ui = true
+
+[flight_recorder]
+enabled = true
+max_records = 100
+path = {:?}
+
+[[backends]]
+id = "mock"
+kind = "cli"
+command = {:?}
+stdin = true
+
+[routes]
+"coding/default" = ["mock"]
+"#,
+            flight_path, echo_sh
+        );
+        let h = Harness::new(cfg_text).await;
+        let res = h
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "ping"}]
+                }),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Traces ring buffer endpoint
+        let traces_res = h.get("/v1/traces", &[]).await;
+        assert_eq!(traces_res.status(), StatusCode::OK);
+        let traces_json: Value =
+            serde_json::from_str(&body_text(traces_res).await).expect("traces");
+        assert_eq!(traces_json["traces"].as_array().unwrap().len(), 1);
+        assert_eq!(traces_json["traces"][0]["backend"], "mock");
+
+        // Dashboard HTML v2 contains Playground & Trace Waterfall tabs
+        let ui_html = body_text(h.get("/ui", &[]).await).await;
+        assert!(ui_html.contains("Route Playground"));
+        assert!(ui_html.contains("Trace Waterfall"));
+        assert!(ui_html.contains("Reset Circuit"));
+
+        h.state.flight_recorder().flush().await;
+        assert!(flight_path.exists());
+
+        let replay_args = vouch::cli::ReplayArgs {
+            config: h._dir.path().join("vouch.toml"),
+            file: Some(flight_path),
+            route: None,
+            limit: Some(5),
+            json: true,
+        };
+        vouch::cli::replay::run(&replay_args)
+            .await
+            .expect("replay ok");
+
+        h.state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cross_protocol_gemini_thought_and_ollama_tools_fidelity() {
+        let dir = TempDir::new().expect("temp");
+        let cli = script(
+            dir.path(),
+            "tool_reply.sh",
+            "#!/bin/sh\ncat >/dev/null\necho '<vouch_tool_call>{\"name\":\"lookup\",\"arguments\":{\"k\":1}}</vouch_tool_call>'\n",
+        );
+        let cfg = format!(
+            r#"
+[server]
+tcp_listen = "127.0.0.1:0"
+
+[[backends]]
+id = "mock"
+kind = "cli"
+command = {:?}
+stdin = true
+
+[routes]
+"coding/default" = ["mock"]
+"#,
+            cli
+        );
+        let h = Harness::new(cfg).await;
+
+        // Ollama /api/chat with inbound tool_calls + tool result history
+        let ollama_resp = h
+            .post_json(
+                "/api/chat",
+                &[],
+                json!({
+                    "model": "coding/default",
+                    "stream": false,
+                    "messages": [
+                        {"role": "user", "content": "find k"},
+                        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "lookup", "arguments": {"k": 0}}}]},
+                        {"role": "tool", "name": "lookup", "tool_call_id": "c1", "content": "val=0"}
+                    ],
+                    "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+                }),
+            )
+            .await;
+        assert_eq!(ollama_resp.status(), StatusCode::OK);
+        let ojson: Value = serde_json::from_str(&body_text(ollama_resp).await).expect("ojson");
+        assert_eq!(
+            ojson["message"]["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
+
+        // Gemini streaming with functionCall deltas
+        let gem_resp = h
+            .post_json(
+                "/v1beta/models/coding%2Fdefault:streamGenerateContent?alt=sse",
+                &[],
+                json!({
+                    "contents": [{"role": "user", "parts": [{"text": "run lookup"}]}],
+                    "tools": [{"functionDeclarations": [{"name": "lookup", "parameters": {"type": "object"}}]}]
+                }),
+            )
+            .await;
+        assert_eq!(gem_resp.status(), StatusCode::OK);
+        let gem_sse = body_text(gem_resp).await;
+        assert!(gem_sse.contains("\"functionCall\""));
+        assert!(gem_sse.contains("lookup"));
+        h.state.shutdown().await;
+    }
+
+    #[test]
+    fn vouch_example_toml_parses_cleanly_for_v5() {
+        let example = include_str!("../vouch.example.toml");
+        GatewayConfig::from_toml_str(example).expect("vouch.example.toml must validate");
+    }
+
+    #[tokio::test]
+    async fn doctor_fix_applies_planned_repairs_atomically_and_revalidates() {
+        let dir = TempDir::new().expect("temp");
+        let cfg_path = dir.path().join("vouch.toml");
+        let echo_sh = script(dir.path(), "real-tool.sh", "#!/bin/sh\necho 'OK'\n");
+        let broken = r#"
+[server]
+tcp_listen = "127.0.0.1:0"
+
+[[backends]]
+id = "broken"
+kind = "cli"
+command = "/nonexistent/path/real-tool.sh"
+stdin = true
+
+[routes]
+"coding/default" = ["broken"]
+"#;
+        fs::write(&cfg_path, broken).expect("write");
+        let mut cfg = GatewayConfig::from_toml_str(broken).expect("cfg");
+        let fixes = vec![vouch::cli::doctor::ProposedFix {
+            backend_id: "broken".into(),
+            field: "command",
+            old_value: "/nonexistent/path/real-tool.sh".into(),
+            new_value: echo_sh.display().to_string(),
+        }];
+        let applied = vouch::cli::doctor::apply_planned_fixes(&cfg_path, &mut cfg, &fixes, true)
+            .expect("apply");
+        assert!(applied);
+        let reloaded = GatewayConfig::load(&cfg_path).expect("reload");
+        assert_eq!(
+            reloaded.backends[0].command.as_deref(),
+            Some(echo_sh.to_string_lossy().as_ref())
+        );
+    }
+}
