@@ -22,7 +22,7 @@ use crate::{
     error::{GatewayError, Result},
 };
 
-const MAX_IMAGE_REDIRECTS: usize = 5;
+const MAX_IMAGE_REDIRECTS: usize = 3;
 const REMOTE_IMAGE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// RAII temporary file used when `stdin = false` and an inline CLI/PTY prompt
@@ -334,23 +334,31 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_forbidden_v4(v4),
         IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
+            if let Some(mapped) = v6.to_ipv4_mapped().or_else(|| {
+                (!v6.is_unspecified() && !v6.is_loopback())
+                    .then(|| v6.to_ipv4())
+                    .flatten()
+            }) {
                 return is_forbidden_v4(mapped);
             }
+            let is_site_local = (v6.segments()[0] & 0xffc0) == 0xfec0;
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
+                || is_site_local
         }
     }
 }
 
 fn is_forbidden_v4(v4: Ipv4Addr) -> bool {
     let octets = v4.octets();
+    let is_this_network = octets[0] == 0;
     let is_cgnat = octets[0] == 100 && (octets[1] & 0b1100_0000) == 64;
     let is_benchmark = octets[0] == 198 && matches!(octets[1], 18 | 19);
-    v4.is_loopback()
+    is_this_network
+        || v4.is_loopback()
         || v4.is_private()
         || v4.is_link_local()
         || v4.is_unspecified()
