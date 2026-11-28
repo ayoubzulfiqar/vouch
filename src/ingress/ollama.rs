@@ -697,7 +697,7 @@ fn ollama_generate_frame(
     Value::Object(obj)
 }
 
-fn into_ollama_error_response(error: GatewayError) -> Response {
+pub(crate) fn into_ollama_error_response(error: GatewayError) -> Response {
     let status = error.status();
     let msg = redact_text(&error.to_string());
     (status, Json(json!({ "error": msg }))).into_response()
