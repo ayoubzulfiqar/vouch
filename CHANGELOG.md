@@ -14,6 +14,9 @@ All notable changes to `vouch` are documented in this file.
 - **Session Control Endpoints, MCP Tools & Observability (`src/ingress/sessions.rs`, `src/cli/`):**
   - Added authenticated `GET /v1/sessions`, `GET /v1/sessions/{session_id}`, `POST /v1/sessions/{session_id}/checkpoint`, and `DELETE /v1/sessions/{session_id}` (clearing ledger, sticky affinity, and git worktree).
   - Added `vouch_session_status` and `vouch_checkpoint` built-in MCP tools (scoped by `[[tokens]].allowed_mcp_tools`), `[trace]` health probing in `vouch doctor`, `shared_sessions` + `handoffs_total` in `GET /healthz` and `vouch top`, and Prometheus counters `vouch_handoffs_total{from,to,reason}` and `vouch_trace_queries_total{tool,status}`.
+- **Cross-Platform CI & Multi-Distro Releases (`.github/workflows/`, `packaging/`):**
+  - Added Windows CI checks and `x86_64-pc-windows-msvc` `.zip` release artifacts (plus `cargo-binstall` ZIP override).
+  - Added automated Linux native package builds via `packaging/nfpm.yaml` for Debian/Ubuntu (`.deb`), Fedora/RHEL (`.rpm`), and Arch Linux (`.pkg.tar.zst`) across `x86_64`/`amd64` and `aarch64`/`arm64`, alongside `packaging/arch/PKGBUILD` and `packaging/homebrew/vouch.rb`.
 
 ## [5.0.0] - 2026-11-28
 
