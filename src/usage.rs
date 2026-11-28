@@ -51,14 +51,30 @@ pub fn estimate_usage(model: &str, prompt: &str, completion: &str) -> Usage {
     Usage::new(count_tokens(model, prompt), count_tokens(model, completion))
 }
 
-/// Compute USD cost for `usage` matching `[pricing.<backend_id>]` or fallback `[pricing.<route>]`.
+/// Compute USD cost for `usage` matching `[pricing.<backend_id>:<profile>]`,
+/// `[pricing.<backend_id>]`, or fallback `[pricing.<route>]`.
 pub fn calculate_cost_usd(
     pricing: &BTreeMap<String, PricingConfig>,
     route: &str,
     backend_id: &str,
     usage: Usage,
 ) -> f64 {
-    let Some(rule) = pricing.get(backend_id).or_else(|| pricing.get(route)) else {
+    calculate_cost_usd_with_profile(pricing, route, backend_id, None, usage)
+}
+
+/// Profile-aware USD pricing lookup (`backend:profile` -> `backend` -> `route`).
+pub fn calculate_cost_usd_with_profile(
+    pricing: &BTreeMap<String, PricingConfig>,
+    route: &str,
+    backend_id: &str,
+    profile_id: Option<&str>,
+    usage: Usage,
+) -> f64 {
+    let profile_rule = profile_id.and_then(|pid| pricing.get(&format!("{backend_id}:{pid}")));
+    let Some(rule) = profile_rule
+        .or_else(|| pricing.get(backend_id))
+        .or_else(|| pricing.get(route))
+    else {
         return 0.0;
     };
     let in_cost = (usage.prompt_tokens as f64 / 1_000_000.0) * rule.input_per_1m_usd;
