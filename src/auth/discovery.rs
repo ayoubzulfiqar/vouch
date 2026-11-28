@@ -251,6 +251,9 @@ mod tests {
 
     #[test]
     fn resolves_known_binary() {
+        #[cfg(windows)]
+        assert!(resolve_binary("cmd").is_some());
+        #[cfg(not(windows))]
         assert!(resolve_binary("sh").is_some());
     }
 
