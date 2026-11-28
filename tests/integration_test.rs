@@ -5422,7 +5422,14 @@ mod v6_tests {
              LOG_FILE=\"{log}\"\n\
              while IFS= read -r line; do\n\
                [ -z \"$line\" ] && continue\n\
-               id=$(printf '%s' \"$line\" | sed -n 's/^{{\"id\":\\([0-9]*\\).*/\\1/p; t; s/.*\"id\":\\([0-9]*\\).*/\\1/p')\n\
+               pat='\"id\":'\n\
+               id=\"\"\n\
+               case \"$line\" in\n\
+                 *\"$pat\"*)\n\
+                   after_id=${{line#*\"$pat\"}}\n\
+                   id=${{after_id%%[!0-9]*}}\n\
+                   ;;\n\
+               esac\n\
                case \"$line\" in\n\
                  *'\"method\":\"initialize\"'*)\n\
                    printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"mock-trace\",\"version\":\"6.0.0\"}}}}}}\\n' \"$id\"\n\
@@ -5490,7 +5497,7 @@ mod v6_tests {
     }
 
     async fn wait_for_log_contains(path: &Path, needle: &str) -> String {
-        for _ in 0..80 {
+        for _ in 0..200 {
             if let Ok(content) = fs::read_to_string(path)
                 && content.contains(needle)
             {
