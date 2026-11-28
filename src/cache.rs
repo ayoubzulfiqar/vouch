@@ -14,14 +14,17 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use dashmap::DashMap;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::CacheConfig,
     driver::{
-        ChunkStream, Completion, ExecutionRequest, MessageContent, StreamChunk, ThinkingBlock,
-        ToolCall, ToolCallDelta, Usage,
+        ChunkStream, Completion, ContentPart, ExecutionRequest, MessageContent, StreamChunk,
+        ThinkingBlock, ToolCall, ToolCallDelta, Usage,
     },
     metrics,
     persistence::{PersistedCacheEntry, evict_oldest_if_full, instant_from_unix, unix_now_secs},
@@ -29,6 +32,8 @@ use crate::{
 
 /// HTTP response header indicating deterministic cache outcome (`HIT`, `MISS`, or `BYPASS`).
 pub const CACHE_STATUS_HEADER: HeaderName = HeaderName::from_static("x-vouch-cache");
+/// HTTP response header attached when served by in-flight singleflight coalescing.
+pub const COALESCED_HEADER: HeaderName = HeaderName::from_static("x-vouch-coalesced");
 
 /// Cached completion plus original backend identifier.
 #[derive(Debug, Clone)]
@@ -86,11 +91,58 @@ struct CachedEntry {
     seq: u64,
 }
 
-/// Bounded TTL cache for low-temperature deterministic completions.
+/// Singleflight leader/waiter slot outcome pushed to concurrent identical requests.
+#[derive(Debug, Clone)]
+pub enum InflightResult {
+    /// Leader finished with a shareable [`CachedCompletion`].
+    Ready(CachedCompletion),
+    /// Leader failed or dropped before producing a shareable completion.
+    Aborted,
+}
+
+/// Role returned by [`ResponseCache::begin_or_join_inflight`].
+pub enum CoalesceRole {
+    /// Coalescing is inactive for this request (execute directly without registering).
+    Direct,
+    /// Caller won leadership; executes upstream once and notifies waiting peers via [`InflightLeaderGuard`].
+    Leader(InflightLeaderGuard),
+    /// Caller joined an identical active execution and awaits the leader's [`InflightResult`].
+    Waiter(watch::Receiver<Option<InflightResult>>),
+}
+
+/// RAII singleflight leader guard that removes the key and unblocks waiters on drop.
+pub struct InflightLeaderGuard {
+    key: String,
+    inflight: Arc<DashMap<String, watch::Sender<Option<InflightResult>>>>,
+    tx: watch::Sender<Option<InflightResult>>,
+    finished: bool,
+}
+
+impl InflightLeaderGuard {
+    /// Publish the completed response to all queued identical callers and unregister the slot.
+    pub fn complete(mut self, result: CachedCompletion) {
+        self.finished = true;
+        self.inflight.remove(&self.key);
+        let _ = self.tx.send(Some(InflightResult::Ready(result)));
+    }
+}
+
+impl Drop for InflightLeaderGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.inflight.remove(&self.key);
+            let _ = self.tx.send(Some(InflightResult::Aborted));
+        }
+    }
+}
+
+/// Bounded TTL cache for low-temperature deterministic completions with
+/// optional in-flight singleflight coalescing.
 #[derive(Debug)]
 pub struct ResponseCache {
     config: ArcSwap<CacheConfig>,
     entries: DashMap<String, CachedEntry>,
+    inflight: Arc<DashMap<String, watch::Sender<Option<InflightResult>>>>,
     next_seq: AtomicU64,
 }
 
@@ -100,6 +152,7 @@ impl ResponseCache {
         Self {
             config: ArcSwap::from_pointee(config),
             entries: DashMap::new(),
+            inflight: Arc::new(DashMap::new()),
             next_seq: AtomicU64::new(1),
         }
     }
@@ -157,40 +210,77 @@ impl ResponseCache {
         workspace_isolated: bool,
     ) -> CacheLookup {
         let cfg = self.config.load();
-        if !cfg.enabled {
+        let coalesce = cfg.coalesce_enabled();
+        if !cfg.enabled && !coalesce {
             return CacheLookup::Disabled;
         }
         let effective_temp = request.temperature;
         let high_temp = effective_temp.is_some_and(|t| t > cfg.max_temperature);
         if workspace_isolated || high_temp || header_bypasses_cache(headers) {
-            metrics::record_cache_request("bypass");
-            return CacheLookup::Bypass;
-        }
-
-        let key = compute_cache_key(route, request, effective_temp);
-        let ttl = Duration::from_secs(cfg.ttl_secs.max(1));
-        if let Some(entry) = self.entries.get(&key) {
-            if entry.inserted_at.elapsed() <= ttl {
-                let completion = Completion {
-                    content: entry.content.clone(),
-                    finish_reason: entry.finish_reason.clone(),
-                    usage: Usage::new(entry.prompt_tokens, entry.completion_tokens),
-                    raw: None,
-                    tool_calls: entry.tool_calls.clone(),
-                    thinking: entry.thinking.clone(),
-                };
-                metrics::record_cache_request("hit");
-                return CacheLookup::Hit(CachedCompletion {
-                    completion,
-                    backend_id: entry.backend_id.clone(),
-                });
+            if cfg.enabled {
+                metrics::record_cache_request("bypass");
+                return CacheLookup::Bypass;
             }
-            drop(entry);
-            self.entries.remove(&key);
+            return CacheLookup::Disabled;
         }
 
-        metrics::record_cache_request("miss");
+        let key = compute_cache_key(route, request, effective_temp, cfg.normalize_whitespace);
+        if cfg.enabled {
+            let ttl = Duration::from_secs(cfg.ttl_secs.max(1));
+            if let Some(entry) = self.entries.get(&key) {
+                if entry.inserted_at.elapsed() <= ttl {
+                    let completion = Completion {
+                        content: entry.content.clone(),
+                        finish_reason: entry.finish_reason.clone(),
+                        usage: Usage::new(entry.prompt_tokens, entry.completion_tokens),
+                        raw: None,
+                        tool_calls: entry.tool_calls.clone(),
+                        thinking: entry.thinking.clone(),
+                    };
+                    metrics::record_cache_request("hit");
+                    return CacheLookup::Hit(CachedCompletion {
+                        completion,
+                        backend_id: entry.backend_id.clone(),
+                    });
+                }
+                drop(entry);
+                self.entries.remove(&key);
+            }
+            metrics::record_cache_request("miss");
+        }
+
         CacheLookup::Miss(key)
+    }
+
+    /// True when singleflight request coalescing is currently active.
+    pub fn coalesce_enabled(&self) -> bool {
+        self.config.load().coalesce_enabled()
+    }
+
+    /// Enter or join an active singleflight execution slot for a deterministic key.
+    pub fn begin_or_join_inflight(&self, key: Option<&str>, stream: bool) -> CoalesceRole {
+        let cfg = self.config.load();
+        let Some(key) = key else {
+            return CoalesceRole::Direct;
+        };
+        if stream || !cfg.coalesce_enabled() {
+            return CoalesceRole::Direct;
+        }
+        match self.inflight.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                CoalesceRole::Waiter(occupied.get().subscribe())
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let (tx, _rx) = watch::channel(None);
+                vacant.insert(tx.clone());
+                CoalesceRole::Leader(InflightLeaderGuard {
+                    key: key.to_string(),
+                    inflight: self.inflight.clone(),
+                    tx,
+                    finished: false,
+                })
+            }
+        }
     }
 
     /// Store a completed response under `key`, evicting the oldest entry if full.
@@ -365,18 +455,47 @@ pub fn header_bypasses_cache(headers: &HeaderMap) -> bool {
         .any(|directive| directive == "no-cache" || directive == "no-store")
 }
 
+fn normalize_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Compute deterministic SHA-256 hex digest over `(route, messages, tools, response_format, temperature)`.
 pub fn compute_cache_key(
     route: &str,
     request: &ExecutionRequest,
     effective_temperature: Option<f64>,
+    normalize_whitespace: bool,
 ) -> String {
+    let maybe_norm = |s: &str| {
+        if normalize_whitespace {
+            normalize_ws(s)
+        } else {
+            s.to_string()
+        }
+    };
+    let system = request.system.as_deref().map(maybe_norm);
     let messages_json: Vec<serde_json::Value> = request
         .messages
         .iter()
         .map(|m| {
             let content = match &m.content {
-                MessageContent::Text(t) => json!(t),
+                MessageContent::Text(t) => json!(maybe_norm(t)),
+                MessageContent::Parts(parts) if normalize_whitespace => {
+                    let mapped: Vec<ContentPart> = parts
+                        .iter()
+                        .map(|p| match p {
+                            ContentPart::Text {
+                                text,
+                                cache_control,
+                            } => ContentPart::Text {
+                                text: normalize_ws(text),
+                                cache_control: cache_control.clone(),
+                            },
+                            other => other.clone(),
+                        })
+                        .collect();
+                    json!(mapped)
+                }
                 MessageContent::Parts(parts) => json!(parts),
             };
             json!({
@@ -390,9 +509,9 @@ pub fn compute_cache_key(
         .collect();
 
     let payload = json!({
-        "v": 1,
+        "v": if normalize_whitespace { 2 } else { 1 },
         "route": route,
-        "system": request.system,
+        "system": system,
         "messages": messages_json,
         "tools": request.tools,
         "response_format": request.response_format.as_ref().map(|rf| rf.to_openai_json()),
