@@ -106,6 +106,23 @@ fn cli_backend(id: &str, command: &Path, timeout_secs: u64, env: &str) -> String
     )
 }
 
+fn cli_backend_v3(id: &str, command: &Path, read_mode: &str) -> String {
+    format!(
+        r#"
+[[backends]]
+id = {id:?}
+kind = "cli"
+command = {:?}
+stdin = true
+read_mode = {read_mode:?}
+max_concurrency = 2
+queue_timeout_ms = 2000
+timeout_secs = 10
+"#,
+        command.display().to_string()
+    )
+}
+
 /// Render a complete configuration document.
 fn config(backends: &str, routes: &str, tokens: &str, request_timeout_secs: u64) -> String {
     format!(
@@ -2169,23 +2186,6 @@ mod v3_tests {
     use tokio_tungstenite::tungstenite::{Message as WsMessage, client::IntoClientRequest};
     use vouch::cli::{InitArgs, StatsArgs, init, stats};
 
-    fn cli_backend_v3(id: &str, command: &Path, read_mode: &str) -> String {
-        format!(
-            r#"
-[[backends]]
-id = {id:?}
-kind = "cli"
-command = {:?}
-stdin = true
-read_mode = {read_mode:?}
-max_concurrency = 2
-queue_timeout_ms = 2000
-timeout_secs = 10
-"#,
-            command.display().to_string()
-        )
-    }
-
     #[tokio::test]
     async fn example_config_parses_cleanly() {
         let example = include_str!("../vouch.example.toml");
@@ -3221,5 +3221,874 @@ otlp_headers = {{ Authorization = "Bearer otlp-top-secret-999" }}
         .await
         .expect("vouch init --force should overwrite");
         GatewayConfig::load(&target).expect("docker bridge config must pass validation");
+    }
+}
+
+mod v4_tests {
+    use super::*;
+    use futures::StreamExt;
+    use vouch::usage::UsageReport;
+
+    fn cli_echo_script(dir: &Path, name: &str) -> PathBuf {
+        script(dir, name, "#!/bin/sh\ncat >/dev/null\nprintf 'v4-ok\\n'\n")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_drop_accounts_emitted_tokens_tpm_and_cost() {
+        let dir = TempDir::new().expect("tempdir");
+        let slow_stream = script(
+            dir.path(),
+            "slow_stream.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf 'alpha beta gamma delta epsilon zeta eta theta\\n'\nsleep 10\n",
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "coding/default"
+
+[pricing."coding/default"]
+input_per_1m_usd = 2.0
+output_per_1m_usd = 10.0
+
+{}
+[routes]
+"coding/default" = ["streamer"]
+
+[[tokens]]
+token = "vouch-stream-drop-tok"
+name = "drop-tester"
+tpm = 500
+daily_token_budget = 1000
+max_concurrent = 1
+"#,
+            cli_backend_v3("streamer", &slow_stream, "chunk")
+        );
+        let harness = Harness::new(toml).await;
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer vouch-stream-drop-tok")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "coding/default",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "emit and hang"}]
+                }))
+                .expect("serialize"),
+            ))
+            .expect("req");
+        let resp = harness.app.clone().oneshot(req).await.expect("router");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body_stream = resp.into_body().into_data_stream();
+
+        let mut received = String::new();
+        while let Some(Ok(bytes)) = body_stream.next().await {
+            received.push_str(&String::from_utf8_lossy(&bytes));
+            if received.contains("theta") {
+                break;
+            }
+        }
+        assert!(received.contains("alpha"));
+        // Drop the response stream before [DONE], simulating client disconnect.
+        drop(body_stream);
+        sleep(Duration::from_millis(80)).await;
+
+        let usage_resp = harness
+            .get(
+                "/v1/usage",
+                &[("authorization", "Bearer vouch-stream-drop-tok")],
+            )
+            .await;
+        assert_eq!(usage_resp.status(), StatusCode::OK);
+        let report: UsageReport =
+            serde_json::from_str(&body_text(usage_resp).await).expect("usage JSON");
+        assert_eq!(report.tokens.len(), 1);
+        assert!(
+            report.tokens[0].summary.completion_tokens > 0,
+            "stream drop must debit emitted completion tokens: {:?}",
+            report.tokens[0]
+        );
+        assert!(report.tokens[0].daily_tokens_used > 0);
+        assert!(report.tokens[0].summary.total_cost_usd > 0.0);
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_multi_tool_stream_and_schema_repair_retries() {
+        let dir = TempDir::new().expect("tempdir");
+        let state_file = dir.path().join("attempt_count");
+        let multi_tool = script(
+            dir.path(),
+            "multi_tool.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf '<vouch_tool_call>{\"name\":\"ping\",\"arguments\":{\"h\":\"a\"}}</vouch_tool_call>'\nprintf '<vouch_tool_call>{\"name\":\"echo\",\"arguments\":{\"m\":\"b\"}}</vouch_tool_call>\\n'\n",
+        );
+        let repair_cli = script(
+            dir.path(),
+            "repair.sh",
+            &format!(
+                "#!/bin/sh\nprompt=$(cat)\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\necho \"$count\" > '{}'\nif [ \"$count\" -eq 1 ]; then\n  printf '{{\"city\":\"Paris\"}}\\n'\nelse\n  echo \"$prompt\" | grep -q \"missing required field\" && printf '{{\"city\":\"Paris\",\"temp\":21}}\\n' || printf 'missing-feedback\\n'\nfi\n",
+                state_file.display(),
+                state_file.display(),
+                state_file.display(),
+            ),
+        );
+
+        let toml = format!(
+            r#"
+[defaults]
+model = "tools/multi"
+schema_repair_retries = 1
+
+{}
+{}
+[routes]
+"tools/multi" = ["mt"]
+"json/repair" = ["rep"]
+"#,
+            cli_backend_v3("mt", &multi_tool, "chunk"),
+            cli_backend_v3("rep", &repair_cli, "chunk"),
+        );
+        let harness = Harness::new(toml).await;
+
+        let sse_resp = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "tools/multi",
+                    "stream": true,
+                    "tools": [
+                        {"type": "function", "function": {"name": "ping", "parameters": {"type": "object"}}},
+                        {"type": "function", "function": {"name": "echo", "parameters": {"type": "object"}}}
+                    ],
+                    "messages": [{"role": "user", "content": "run both"}]
+                }),
+            )
+            .await;
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        let sse_text = body_text(sse_resp).await;
+        assert!(sse_text.contains("\"name\":\"ping\""));
+        assert!(sse_text.contains("\"name\":\"echo\""));
+        assert!(sse_text.contains("\"index\":0"));
+        assert!(sse_text.contains("\"index\":1"));
+        assert!(sse_text.contains("\"finish_reason\":\"tool_calls\""));
+
+        // Schema repair retry feeds missing-field error back into attempt #2 cleanly
+        let json_resp = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                json!({
+                    "model": "json/repair",
+                    "stream": false,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "weather",
+                            "strict": true,
+                            "schema": {
+                                "type": "object",
+                                "required": ["city", "temp"],
+                                "additionalProperties": false,
+                                "properties": {
+                                    "city": {"type": "string"},
+                                    "temp": {"type": "integer"}
+                                }
+                            }
+                        }
+                    },
+                    "messages": [{"role": "user", "content": "weather in paris"}]
+                }),
+            )
+            .await;
+        assert_eq!(json_resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_text(json_resp).await).expect("json");
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "{\"city\":\"Paris\",\"temp\":21}"
+        );
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hedged_and_least_latency_routing_strategies() {
+        let dir = TempDir::new().expect("tempdir");
+        let slow_pid = dir.path().join("slow_hedged.pid");
+        let slow_script = script(
+            dir.path(),
+            "slow_hedge.sh",
+            &format!(
+                "#!/bin/sh\necho $$ > '{}'\ncat >/dev/null\nsleep 5\nprintf 'too-late\\n'\n",
+                slow_pid.display(),
+            ),
+        );
+        let fast_script = script(
+            dir.path(),
+            "fast_hedge.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf 'fast-winner\\n'\n",
+        );
+        let laggy_script = script(
+            dir.path(),
+            "laggy.sh",
+            "#!/bin/sh\ncat >/dev/null\nsleep 0.12\nprintf 'from-slower\\n'\n",
+        );
+        let quick_script = script(
+            dir.path(),
+            "quick.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf 'from-quicker\\n'\n",
+        );
+
+        let toml = format!(
+            r#"
+[defaults]
+model = "hedged/route"
+
+{}
+{}
+{}
+{}
+[routes]
+"hedged/route" = ["slow", "fast"]
+"ewma/route" = ["slower", "quicker"]
+
+[route_policies."hedged/route"]
+strategy = "hedged"
+hedge_delay_ms = 60
+
+[route_policies."ewma/route"]
+strategy = "least_latency"
+"#,
+            cli_backend_v3("slow", &slow_script, "chunk"),
+            cli_backend_v3("fast", &fast_script, "chunk"),
+            cli_backend_v3("slower", &laggy_script, "chunk"),
+            cli_backend_v3("quicker", &quick_script, "chunk"),
+        );
+        let harness = Harness::new(toml).await;
+
+        let resp = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                chat_body("hedged/route", false),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-vouch-backend"], "fast");
+        assert_eq!(resp.headers()["x-vouch-fallback"], "true");
+        let payload: Value = serde_json::from_str(&body_text(resp).await).expect("json");
+        assert_eq!(payload["choices"][0]["message"]["content"], "fast-winner");
+
+        // Slow loser must be terminated cleanly and circuit must stay closed
+        if let Ok(pid_str) = fs::read_to_string(&slow_pid)
+            && let Ok(pid) = pid_str.trim().parse::<u32>()
+        {
+            let mut reaped = false;
+            for _ in 0..40 {
+                if !Path::new(&format!("/proc/{pid}")).exists() {
+                    reaped = true;
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            assert!(reaped, "hedged loser pid {pid} should be reaped");
+        }
+        let ready: Value =
+            serde_json::from_str(&body_text(harness.get("/readyz", &[]).await).await)
+                .expect("readyz");
+        let slow_entry = ready["backends"]
+            .as_array()
+            .expect("backends")
+            .iter()
+            .find(|b| b["id"] == "slow")
+            .expect("slow entry");
+        assert_eq!(slow_entry["circuit"], "closed");
+
+        let metrics_text = body_text(harness.get("/metrics", &[]).await).await;
+        assert!(metrics_text.contains("vouch_hedged_wins_total"));
+
+        // Least latency: req1 probes slower (120ms), req2 probes unmeasured quicker (~10ms), req3 stays on quicker
+        let r1 = harness
+            .post_json("/v1/chat/completions", &[], chat_body("ewma/route", false))
+            .await;
+        assert_eq!(r1.headers()["x-vouch-backend"], "slower");
+        let r2 = harness
+            .post_json("/v1/chat/completions", &[], chat_body("ewma/route", false))
+            .await;
+        assert_eq!(r2.headers()["x-vouch-backend"], "quicker");
+        let r3 = harness
+            .post_json("/v1/chat/completions", &[], chat_body("ewma/route", false))
+            .await;
+        assert_eq!(r3.headers()["x-vouch-backend"], "quicker");
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deterministic_cache_hit_miss_bypass_stream_and_persistence() {
+        let dir = TempDir::new().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        let exec_counter = dir.path().join("exec_count");
+        let count_script = script(
+            dir.path(),
+            "count.sh",
+            &format!(
+                "#!/bin/sh\ncat >/dev/null\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\necho \"$count\" > '{}'\nprintf 'cached-reply-%s\\n' \"$count\"\n",
+                exec_counter.display(),
+                exec_counter.display(),
+                exec_counter.display(),
+            ),
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "coding/default"
+state_dir = "{}"
+
+[cache]
+enabled = true
+max_entries = 4
+ttl_secs = 3600
+max_temperature = 0.2
+persist = true
+
+{}
+[routes]
+"coding/default" = ["counter"]
+"#,
+            state_dir.display(),
+            cli_backend_v3("counter", &count_script, "chunk")
+        );
+
+        let harness = Harness::new(toml.clone()).await;
+        let det_body = json!({
+            "model": "coding/default",
+            "stream": false,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": "same prompt"}]
+        });
+        let r1 = harness
+            .post_json("/v1/chat/completions", &[], det_body.clone())
+            .await;
+        assert_eq!(r1.headers()["x-vouch-cache"], "MISS");
+        assert_eq!(fs::read_to_string(&exec_counter).expect("cnt").trim(), "1");
+
+        let r2 = harness
+            .post_json("/v1/chat/completions", &[], det_body.clone())
+            .await;
+        assert_eq!(r2.headers()["x-vouch-cache"], "HIT");
+        assert_eq!(fs::read_to_string(&exec_counter).expect("cnt").trim(), "1");
+
+        // Streaming replay of cached response should also HIT without re-running backend
+        let mut stream_body = det_body.clone();
+        stream_body["stream"] = json!(true);
+        let r3 = harness
+            .post_json("/v1/chat/completions", &[], stream_body)
+            .await;
+        assert_eq!(r3.headers()["x-vouch-cache"], "HIT");
+        let sse = body_text(r3).await;
+        assert!(sse.contains("cached-reply-1"));
+        assert!(sse.contains("[DONE]"));
+        assert_eq!(fs::read_to_string(&exec_counter).expect("cnt").trim(), "1");
+
+        // Cache-Control: no-store and high temperature must BYPASS
+        let r4 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("cache-control", "no-store")],
+                det_body.clone(),
+            )
+            .await;
+        assert_eq!(r4.headers()["x-vouch-cache"], "BYPASS");
+        let mut hot = det_body.clone();
+        hot["temperature"] = json!(0.8);
+        let r5 = harness.post_json("/v1/chat/completions", &[], hot).await;
+        assert_eq!(r5.headers()["x-vouch-cache"], "BYPASS");
+
+        harness.state.shutdown().await;
+        assert!(state_dir.join("gateway_state.lock").exists());
+        assert!(state_dir.join("gateway_state.json").exists());
+
+        // Cold boot restores persisted cache entry and hits without backend execution
+        let before_restart = fs::read_to_string(&exec_counter)
+            .expect("cnt")
+            .trim()
+            .to_string();
+        let harness2 = Harness::new(toml).await;
+        let r6 = harness2
+            .post_json("/v1/chat/completions", &[], det_body)
+            .await;
+        assert_eq!(r6.headers()["x-vouch-cache"], "HIT");
+        assert_eq!(
+            fs::read_to_string(&exec_counter).expect("cnt").trim(),
+            before_restart
+        );
+        let metrics = body_text(harness2.get("/metrics", &[]).await).await;
+        assert!(metrics.contains("vouch_cache_requests_total"));
+        harness2.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gemini_and_ollama_ingress_compatibility() {
+        let dir = TempDir::new().expect("tempdir");
+        let echo = cli_echo_script(dir.path(), "compat.sh");
+        let toml = format!(
+            r#"
+[defaults]
+model = "coding/default"
+
+{}
+[routes]
+"coding/default" = ["echo"]
+
+[[tokens]]
+token = "vouch-compat-key-123"
+name = "compat-user"
+"#,
+            cli_backend_v3("echo", &echo, "chunk")
+        );
+        let harness = Harness::new(toml).await;
+
+        // Gemini generateContent via x-goog-api-key
+        let gem = harness
+            .post_json(
+                "/v1beta/models/coding/default:generateContent",
+                &[("x-goog-api-key", "vouch-compat-key-123")],
+                json!({
+                    "systemInstruction": {"parts": [{"text": "Be concise"}]},
+                    "contents": [{"role": "user", "parts": [{"text": "hi gemini"}]}],
+                    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 64}
+                }),
+            )
+            .await;
+        assert_eq!(gem.status(), StatusCode::OK);
+        let gem_json: Value = serde_json::from_str(&body_text(gem).await).expect("gemini");
+        assert_eq!(
+            gem_json["candidates"][0]["content"]["parts"][0]["text"],
+            "v4-ok"
+        );
+        assert_eq!(gem_json["candidates"][0]["finishReason"], "STOP");
+
+        // Gemini streamGenerateContent?alt=sse&key=
+        let gem_sse = harness
+            .post_json(
+                "/v1beta/models/coding/default:streamGenerateContent?alt=sse&key=vouch-compat-key-123",
+                &[],
+                json!({"contents": [{"parts": [{"text": "stream gemini"}]}]}),
+            )
+            .await;
+        assert_eq!(gem_sse.status(), StatusCode::OK);
+        let gem_sse_body = body_text(gem_sse).await;
+        assert!(gem_sse_body.contains("v4-ok"));
+
+        // Ollama /api/tags
+        let tags = harness
+            .get(
+                "/api/tags",
+                &[("authorization", "Bearer vouch-compat-key-123")],
+            )
+            .await;
+        assert_eq!(tags.status(), StatusCode::OK);
+        let tags_json: Value = serde_json::from_str(&body_text(tags).await).expect("tags");
+        assert_eq!(tags_json["models"][0]["name"], "coding/default");
+
+        // Ollama /api/chat buffered
+        let ochat = harness
+            .post_json(
+                "/api/chat",
+                &[("authorization", "Bearer vouch-compat-key-123")],
+                json!({
+                    "model": "coding/default",
+                    "stream": false,
+                    "messages": [{"role": "user", "content": "hi ollama"}]
+                }),
+            )
+            .await;
+        assert_eq!(ochat.status(), StatusCode::OK);
+        let ochat_json: Value = serde_json::from_str(&body_text(ochat).await).expect("ochat");
+        assert_eq!(ochat_json["message"]["content"], "v4-ok");
+        assert_eq!(ochat_json["done"], true);
+
+        // Ollama /api/generate default streaming NDJSON
+        let ogen = harness
+            .post_json(
+                "/api/generate",
+                &[("authorization", "Bearer vouch-compat-key-123")],
+                json!({"model": "coding/default", "prompt": "hi gen"}),
+            )
+            .await;
+        assert_eq!(ogen.status(), StatusCode::OK);
+        let ndjson = body_text(ogen).await;
+        let lines: Vec<Value> = ndjson
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("ndjson line"))
+            .collect();
+        let joined: String = lines
+            .iter()
+            .filter_map(|l| l["response"].as_str())
+            .collect();
+        assert_eq!(joined.trim(), "v4-ok", "ndjson lines={lines:?}");
+        assert_eq!(lines.last().expect("last")["done"], true);
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_profile_rotation_and_failover() {
+        let dir = TempDir::new().expect("tempdir");
+        let prof_script = script(
+            dir.path(),
+            "profile_worker.sh",
+            "#!/bin/sh\ncat >/dev/null\nif [ \"$VOUCH_PROFILE_ID\" = \"acct-1\" ]; then\n  echo \"HTTP 429 rate limit exceeded Retry-After: 30\" >&2\n  exit 1\nfi\nprintf 'served-by-%s\\n' \"$VOUCH_PROFILE_ID\"\n",
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "coding/default"
+
+[[backends]]
+id = "multi-prof"
+kind = "cli"
+command = "{}"
+stdin = true
+
+[[backends.profiles]]
+id = "acct-1"
+env = {{ ACCOUNT_KEY = "p1-key" }}
+weight = 2
+
+[[backends.profiles]]
+id = "acct-2"
+env = {{ ACCOUNT_KEY = "p2-key" }}
+weight = 1
+
+[routes]
+"coding/default" = ["multi-prof"]
+"#,
+            prof_script.display()
+        );
+        let harness = Harness::new(toml).await;
+        let r1 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[],
+                chat_body("coding/default", false),
+            )
+            .await;
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert_eq!(r1.headers()["x-vouch-backend"], "multi-prof");
+        let payload: Value = serde_json::from_str(&body_text(r1).await).expect("json");
+        assert_eq!(
+            payload["choices"][0]["message"]["content"],
+            "served-by-acct-2"
+        );
+
+        // Parent backend circuit remained closed when acct-2 recovered inside backend pool
+        let ready: Value =
+            serde_json::from_str(&body_text(harness.get("/readyz", &[]).await).await)
+                .expect("readyz");
+        assert_eq!(ready["backends"][0]["circuit"], "closed");
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn token_policies_and_admin_endpoints() {
+        let dir = TempDir::new().expect("tempdir");
+        let trip_script = script(dir.path(), "trip.sh", "#!/bin/sh\ncat >/dev/null\nexit 1\n");
+        let ok_script = cli_echo_script(dir.path(), "ok.sh");
+        let toml = format!(
+            r#"
+[server]
+enable_admin = true
+
+[resilience]
+failure_threshold = 1
+reset_timeout_secs = 60
+
+[cache]
+enabled = true
+
+{}
+{}
+[routes]
+"coding/default" = ["bad", "good"]
+
+[[tokens]]
+token = "vouch-admin-tok"
+name = "admin"
+admin = true
+
+[[tokens]]
+token = "vouch-user-tok"
+name = "limited"
+allowed_backends = ["good"]
+admin = false
+
+[[tokens]]
+token = "vouch-no-backend-tok"
+name = "blocked"
+allowed_backends = ["nonexistent"]
+
+[[tokens]]
+token = "vouch-expired-tok"
+name = "expired"
+expires_at = "2020-01-01T00:00:00Z"
+"#,
+            cli_backend_v3("bad", &trip_script, "chunk"),
+            cli_backend_v3("good", &ok_script, "chunk"),
+        );
+        let harness = Harness::new(toml).await;
+
+        // Expired token rejected with 401
+        let exp = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("authorization", "Bearer vouch-expired-tok")],
+                chat_body("coding/default", false),
+            )
+            .await;
+        assert_eq!(exp.status(), StatusCode::UNAUTHORIZED);
+
+        // allowed_backends with zero intersection -> 403 Forbidden
+        let blocked = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("authorization", "Bearer vouch-no-backend-tok")],
+                chat_body("coding/default", false),
+            )
+            .await;
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+
+        // allowed_backends filtering skips `bad` completely and hits `good` cleanly
+        let scoped = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("authorization", "Bearer vouch-user-tok")],
+                chat_body("coding/default", false),
+            )
+            .await;
+        assert_eq!(scoped.status(), StatusCode::OK);
+        assert_eq!(scoped.headers()["x-vouch-backend"], "good");
+
+        // Admin call trips `bad` first via admin token then verifies non-admin is rejected 403
+        let admin_call = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("authorization", "Bearer vouch-admin-tok")],
+                chat_body("coding/default", false),
+            )
+            .await;
+        assert_eq!(admin_call.status(), StatusCode::OK);
+        assert_eq!(admin_call.headers()["x-vouch-backend"], "good");
+
+        // Non-admin user cannot reset circuits or purge cache
+        let forbidden_reset = harness
+            .post_json(
+                "/admin/circuits/bad/reset",
+                &[("authorization", "Bearer vouch-user-tok")],
+                json!({}),
+            )
+            .await;
+        assert_eq!(forbidden_reset.status(), StatusCode::FORBIDDEN);
+
+        // Admin resets `bad` circuit and unknown backend returns 404
+        let reset_ok = harness
+            .post_json(
+                "/admin/circuits/bad/reset",
+                &[("authorization", "Bearer vouch-admin-tok")],
+                json!({}),
+            )
+            .await;
+        assert_eq!(reset_ok.status(), StatusCode::OK);
+        let reset_404 = harness
+            .post_json(
+                "/admin/circuits/missing/reset",
+                &[("authorization", "Bearer vouch-admin-tok")],
+                json!({}),
+            )
+            .await;
+        assert_eq!(reset_404.status(), StatusCode::NOT_FOUND);
+
+        // DELETE /admin/cache purges cache
+        let purge_req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/admin/cache")
+            .header("authorization", "Bearer vouch-admin-tok")
+            .body(Body::empty())
+            .expect("req");
+        let purge_resp = harness
+            .app
+            .clone()
+            .oneshot(purge_req)
+            .await
+            .expect("router");
+        assert_eq!(purge_resp.status(), StatusCode::OK);
+        let purge_json: Value = serde_json::from_str(&body_text(purge_resp).await).expect("json");
+        assert!(purge_json["evicted"].as_u64().expect("evicted") >= 1);
+
+        // POST /admin/reload reloads cleanly
+        let reload_resp = harness
+            .post_json(
+                "/admin/reload",
+                &[("authorization", "Bearer vouch-admin-tok")],
+                json!({}),
+            )
+            .await;
+        assert_eq!(reload_resp.status(), StatusCode::OK);
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_resources_prompts_and_upstream_aggregation() {
+        let dir = TempDir::new().expect("tempdir");
+        let echo = cli_echo_script(dir.path(), "echo.sh");
+        let mock_upstream = script(
+            dir.path(),
+            "mock_mcp.sh",
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *"tools/list"*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"ping_host","description":"Ping remote","inputSchema":{"type":"object","properties":{"host":{"type":"string"}}}}]}}\n'
+      ;;
+    *"tools/call"*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"pong:example.com"}],"isError":false}}\n'
+      ;;
+  esac
+done
+"#,
+        );
+        let toml = format!(
+            r#"
+[defaults]
+model = "coding/default"
+
+{}
+[routes]
+"coding/default" = ["echo"]
+
+[[mcp_prompts]]
+name = "diff-review"
+description = "Review repository diff"
+template = "Inspect changes in {{{{repo}}}}"
+arguments = [{{ name = "repo", description = "Target repo", required = true }}]
+
+[[mcp_upstreams]]
+id = "net"
+transport = "stdio"
+command = "{}"
+timeout_secs = 5
+"#,
+            cli_backend_v3("echo", &echo, "chunk"),
+            mock_upstream.display()
+        );
+        let harness = Harness::new(toml).await;
+
+        let init = harness
+            .post_json(
+                "/mcp",
+                &[],
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+            )
+            .await;
+        let init_json: Value = serde_json::from_str(&body_text(init).await).expect("init");
+        assert!(init_json["result"]["capabilities"]["resources"].is_object());
+        assert!(init_json["result"]["capabilities"]["prompts"].is_object());
+
+        let rlist = harness
+            .post_json(
+                "/mcp",
+                &[],
+                json!({"jsonrpc": "2.0", "id": 2, "method": "resources/list", "params": {}}),
+            )
+            .await;
+        let rlist_json: Value = serde_json::from_str(&body_text(rlist).await).expect("rlist");
+        assert_eq!(
+            rlist_json["result"]["resources"]
+                .as_array()
+                .expect("arr")
+                .len(),
+            3
+        );
+
+        for uri in ["vouch://health", "vouch://routes", "vouch://usage"] {
+            let rread = harness
+                .post_json(
+                    "/mcp",
+                    &[],
+                    json!({"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": uri}}),
+                )
+                .await;
+            let rread_json: Value = serde_json::from_str(&body_text(rread).await).expect("rread");
+            assert_eq!(rread_json["result"]["contents"][0]["uri"], uri);
+        }
+
+        let plist = harness
+            .post_json(
+                "/mcp",
+                &[],
+                json!({"jsonrpc": "2.0", "id": 4, "method": "prompts/list", "params": {}}),
+            )
+            .await;
+        let plist_json: Value = serde_json::from_str(&body_text(plist).await).expect("plist");
+        assert_eq!(plist_json["result"]["prompts"][0]["name"], "diff-review");
+
+        let pget = harness
+            .post_json(
+                "/mcp",
+                &[],
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "prompts/get",
+                    "params": {"name": "diff-review", "arguments": {"repo": "vouch"}}
+                }),
+            )
+            .await;
+        let pget_json: Value = serde_json::from_str(&body_text(pget).await).expect("pget");
+        assert_eq!(
+            pget_json["result"]["messages"][0]["content"]["text"],
+            "Inspect changes in vouch"
+        );
+
+        let tlist = harness
+            .post_json(
+                "/mcp",
+                &[],
+                json!({"jsonrpc": "2.0", "id": 6, "method": "tools/list", "params": {}}),
+            )
+            .await;
+        let tlist_json: Value = serde_json::from_str(&body_text(tlist).await).expect("tlist");
+        assert!(
+            tlist_json["result"]["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .any(|t| t["name"] == "net__ping_host")
+        );
+
+        let tcall = harness
+            .post_json(
+                "/mcp",
+                &[],
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {"name": "net__ping_host", "arguments": {"host": "example.com"}}
+                }),
+            )
+            .await;
+        let tcall_json: Value = serde_json::from_str(&body_text(tcall).await).expect("tcall");
+        assert_eq!(
+            tcall_json["result"]["content"][0]["text"],
+            "pong:example.com"
+        );
+
+        harness.state.shutdown().await;
     }
 }
