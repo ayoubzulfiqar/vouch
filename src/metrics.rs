@@ -147,6 +147,20 @@ pub fn record_cache_request(outcome: &str) {
     .increment(1);
 }
 
+/// Record a singleflight coalesced secondary request served from an in-flight leader.
+pub fn record_coalesced_request() {
+    metrics::counter!("vouch_coalesced_requests_total").increment(1);
+}
+
+/// Record an outbound egress guardrail action (`redacted` or `blocked`).
+pub fn record_egress_guard_action(action: &str) {
+    metrics::counter!(
+        "vouch_egress_guard_actions_total",
+        "action" => action.to_string(),
+    )
+    .increment(1);
+}
+
 /// Record a child process exit. `code` is `"signal"` when terminated by one.
 pub fn record_child_exit(backend: &str, code: &str) {
     metrics::counter!(
