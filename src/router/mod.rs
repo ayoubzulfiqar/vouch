@@ -35,6 +35,7 @@ use crate::{
         workspace::WorkspaceManager,
     },
     error::{GatewayError, Result},
+    memory::{HandoffReason, SharedMemoryEngine, ledger::format_trace_session_summary},
     metrics,
     persistence::{
         PersistedAffinityEntry, PersistedBackendSession, evict_oldest_if_full, instant_from_unix,
@@ -350,6 +351,34 @@ impl SessionAffinity {
         }
     }
 
+    /// Remove all affinity and continuation state associated with `session_key`.
+    pub fn remove_session(&self, session_key: &str) -> bool {
+        let mut removed = self.entries.remove(session_key).is_some();
+        let bs_keys: Vec<(String, String)> = self
+            .backend_sessions
+            .iter()
+            .filter(|entry| entry.key().0 == session_key)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in bs_keys {
+            if self.backend_sessions.remove(&key).is_some() {
+                removed = true;
+            }
+        }
+        let prof_keys: Vec<(String, String)> = self
+            .profile_affinity
+            .iter()
+            .filter(|entry| entry.key().0 == session_key)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in prof_keys {
+            if self.profile_affinity.remove(&key).is_some() {
+                removed = true;
+            }
+        }
+        removed
+    }
+
     /// Number of tracked sessions.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -542,6 +571,10 @@ pub struct RoutedResponse {
     pub response: DriverResponse,
     /// Human-readable attempt log.
     pub attempts: Vec<String>,
+    /// Previous backend id if execution transitioned from another agent in the same session.
+    pub handoff_from: Option<String>,
+    /// Handoff trigger reason (`"failover"`, `"policy_reorder"`, `"model_switch"`), if any.
+    pub handoff_reason: Option<String>,
 }
 
 /// Result of a routed `POST /v1/embeddings` execution.
@@ -568,6 +601,7 @@ pub struct Router {
     ttft_ewma_ms: DashMap<String, f64>,
     ttl_secs: Arc<AtomicU64>,
     otel: ArcSwap<Option<Arc<OtelExporter>>>,
+    memory: ArcSwap<Option<Arc<SharedMemoryEngine>>>,
 }
 
 impl Router {
@@ -581,9 +615,15 @@ impl Router {
             ttft_ewma_ms: DashMap::new(),
             ttl_secs: Arc::new(AtomicU64::new(config.defaults.session_ttl_secs.max(1))),
             otel: ArcSwap::from_pointee(None),
+            memory: ArcSwap::from_pointee(None),
         };
         router.rebuild(config)?;
         Ok(router)
+    }
+
+    /// Attach the shared memory & `trace` bridge engine for cross-agent handoffs.
+    pub fn set_memory(&self, memory: Arc<SharedMemoryEngine>) {
+        self.memory.store(Arc::new(Some(memory)));
     }
 
     /// Manually reset the circuit breaker for `backend_id` (and all its profiles).
@@ -948,6 +988,7 @@ impl Router {
                         ttl,
                         schema_repair_retries,
                         &otel,
+                        &candidates,
                         &mut attempts,
                         &mut last_error,
                         &mut previous_backend,
@@ -977,6 +1018,9 @@ impl Router {
                             schema_repair_retries,
                             &otel,
                             true,
+                            previous_backend.as_deref(),
+                            &candidates,
+                            policy.strategy,
                             &mut attempts,
                         )
                         .await
@@ -1030,6 +1074,9 @@ impl Router {
                     schema_repair_retries,
                     &otel,
                     fallback_used,
+                    previous_backend.as_deref(),
+                    &candidates,
+                    policy.strategy,
                     &mut attempts,
                 )
                 .await
@@ -1143,6 +1190,7 @@ impl Router {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_backend_attempt(
         &self,
         backend: &BackendHandle,
@@ -1151,11 +1199,16 @@ impl Router {
         workspaces: &WorkspaceManager,
         dispatch_ctx: &TraceContext,
         otel: &Option<Arc<OtelExporter>>,
+        previous_backend_failed: Option<&str>,
+        route_candidates: &[Arc<BackendHandle>],
+        strategy: RouteStrategy,
     ) -> std::result::Result<
         (
             ExecutionRequest,
             Arc<parking_lot::Mutex<Option<String>>>,
             Option<ActiveSpan>,
+            Option<String>,
+            Option<HandoffReason>,
         ),
         GatewayError,
     > {
@@ -1227,7 +1280,31 @@ impl Router {
         } else {
             attempt.trace_context = Some(dispatch_ctx.child());
         }
-        Ok((attempt, attempt_capture, exec_span))
+
+        let (handoff_from, handoff_reason) = if let Some(mem) = self.memory.load().as_ref() {
+            let plan = mem
+                .hydrate_attempt_for_candidate(
+                    base,
+                    &backend.config,
+                    &mut attempt,
+                    previous_backend_failed,
+                    |id| route_candidates.iter().any(|c| c.config.id == id),
+                    strategy,
+                    ttl,
+                )
+                .await;
+            (plan.handoff_from, plan.reason)
+        } else {
+            (None, None)
+        };
+
+        Ok((
+            attempt,
+            attempt_capture,
+            exec_span,
+            handoff_from,
+            handoff_reason,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1242,9 +1319,12 @@ impl Router {
         schema_repair_retries: u8,
         otel: &Option<Arc<OtelExporter>>,
         fallback_used: bool,
+        previous_backend_failed: Option<&str>,
+        route_candidates: &[Arc<BackendHandle>],
+        strategy: RouteStrategy,
         attempts: &mut Vec<String>,
     ) -> Result<CandidateOutcome> {
-        let (base_attempt, capture, mut exec_span) = match self
+        let (base_attempt, capture, mut exec_span, handoff_from, handoff_reason) = match self
             .prepare_backend_attempt(
                 backend,
                 base_request,
@@ -1252,6 +1332,9 @@ impl Router {
                 workspaces,
                 dispatch_ctx,
                 otel,
+                previous_backend_failed,
+                route_candidates,
+                strategy,
             )
             .await
         {
@@ -1310,6 +1393,8 @@ impl Router {
                         capture,
                         exec_span,
                         fallback_used,
+                        handoff_from,
+                        handoff_reason,
                     });
                 }
                 Err(error) => {
@@ -1387,6 +1472,7 @@ impl Router {
         ttl: Duration,
         schema_repair_retries: u8,
         otel: &Option<Arc<OtelExporter>>,
+        route_candidates: &[Arc<BackendHandle>],
         attempts: &mut Vec<String>,
         last_error: &mut Option<GatewayError>,
         previous_backend: &mut Option<String>,
@@ -1395,8 +1481,18 @@ impl Router {
         let cancel1 = base_request.cancel.child_token();
         req1.cancel = cancel1.clone();
 
-        let (mut attempt1, capture1, exec_span1) = match self
-            .prepare_backend_attempt(&c1, &req1, workspace_mode, workspaces, dispatch_ctx, otel)
+        let (mut attempt1, capture1, exec_span1, handoff_from1, handoff_reason1) = match self
+            .prepare_backend_attempt(
+                &c1,
+                &req1,
+                workspace_mode,
+                workspaces,
+                dispatch_ctx,
+                otel,
+                previous_backend.as_deref(),
+                route_candidates,
+                RouteStrategy::Hedged,
+            )
             .await
         {
             Ok(prep) => prep,
@@ -1430,6 +1526,9 @@ impl Router {
                         schema_repair_retries,
                         otel,
                         true,
+                        previous_backend.as_deref(),
+                        route_candidates,
+                        RouteStrategy::Hedged,
                         attempts,
                     )
                     .await
@@ -1471,6 +1570,9 @@ impl Router {
                     schema_repair_retries,
                     otel,
                     true,
+                    previous_backend.as_deref(),
+                    route_candidates,
+                    RouteStrategy::Hedged,
                     attempts,
                 )
                 .await
@@ -1526,6 +1628,8 @@ impl Router {
                     capture: capture1,
                     exec_span: exec_span1,
                     fallback_used: false,
+                    handoff_from: handoff_from1.clone(),
+                    handoff_reason: handoff_reason1,
                 }));
             }
             FirstPhase::Finished1(join_res) => {
@@ -1563,6 +1667,9 @@ impl Router {
                         schema_repair_retries,
                         otel,
                         true,
+                        previous_backend.as_deref(),
+                        route_candidates,
+                        RouteStrategy::Hedged,
                         attempts,
                     )
                     .await
@@ -1582,8 +1689,18 @@ impl Router {
         let mut req2 = base_request.clone();
         let cancel2 = base_request.cancel.child_token();
         req2.cancel = cancel2.clone();
-        let (mut attempt2, capture2, exec_span2) = match self
-            .prepare_backend_attempt(&c2, &req2, workspace_mode, workspaces, dispatch_ctx, otel)
+        let (mut attempt2, capture2, exec_span2, handoff_from2, handoff_reason2) = match self
+            .prepare_backend_attempt(
+                &c2,
+                &req2,
+                workspace_mode,
+                workspaces,
+                dispatch_ctx,
+                otel,
+                previous_backend.as_deref(),
+                route_candidates,
+                RouteStrategy::Hedged,
+            )
             .await
         {
             Ok(prep) => prep,
@@ -1608,6 +1725,8 @@ impl Router {
                             capture: capture1,
                             exec_span: exec_span1,
                             fallback_used: false,
+                            handoff_from: handoff_from1.clone(),
+                            handoff_reason: handoff_reason1,
                         }));
                     }
                     Ok((Err(e), _)) => {
@@ -1662,6 +1781,8 @@ impl Router {
                             capture: capture1,
                             exec_span: exec_span1,
                             fallback_used: false,
+                            handoff_from: handoff_from1.clone(),
+                            handoff_reason: handoff_reason1,
                         }));
                     }
                     Ok((Err(e), _)) => {
@@ -1768,6 +1889,8 @@ impl Router {
                         capture: capture1,
                         exec_span: span1.take(),
                         fallback_used: false,
+                        handoff_from: handoff_from1.clone(),
+                        handoff_reason: handoff_reason1,
                     }));
                 }
                 RaceEvt::Two(Ok((Ok(response), elapsed))) => {
@@ -1801,6 +1924,8 @@ impl Router {
                         capture: capture2,
                         exec_span: span2.take(),
                         fallback_used: true,
+                        handoff_from: handoff_from2.clone(),
+                        handoff_reason: handoff_reason2,
                     }));
                 }
                 RaceEvt::One(join_res) => {
@@ -1916,12 +2041,31 @@ impl Router {
         if let Some(previous) = previous_backend {
             metrics::record_fallback(previous, &backend_id);
         }
+        let handoff_from = outcome.handoff_from;
+        let handoff_reason = outcome.handoff_reason.map(|r| r.as_str().to_string());
+        if let (Some(from), Some(reason)) = (handoff_from.as_deref(), outcome.handoff_reason) {
+            metrics::record_handoff(from, &backend_id, reason.as_str());
+            if let Some(mem) = self.memory.load().as_ref() {
+                mem.ledger()
+                    .record_handoff(session_key, from, &backend_id, reason);
+                let ttl = Duration::from_secs(self.session_ttl_secs());
+                if mem.config().sync_to_trace
+                    && let Some(entry) = mem.ledger().get(session_key, ttl)
+                {
+                    let summary = format_trace_session_summary(&entry);
+                    mem.trace()
+                        .record_session_checkpoint_async(None, summary, entry.touched_files);
+                }
+            }
+        }
         RoutedResponse {
             backend_id,
             profile_id,
             fallback_used,
             response: final_response,
             attempts,
+            handoff_from,
+            handoff_reason,
         }
     }
 
@@ -2104,6 +2248,8 @@ struct CandidateOutcome {
     capture: Arc<parking_lot::Mutex<Option<String>>>,
     exec_span: Option<ActiveSpan>,
     fallback_used: bool,
+    handoff_from: Option<String>,
+    handoff_reason: Option<HandoffReason>,
 }
 
 fn record_candidate_failure(
