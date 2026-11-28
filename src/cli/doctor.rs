@@ -53,6 +53,9 @@ pub struct DoctorReport {
     pub daemons: Vec<DaemonStatus>,
     /// Live smoke-probe results.
     pub probes: Vec<ProbeResult>,
+    /// Optional `[trace]` codebase intelligence MCP bridge status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<crate::memory::TraceProbeStatus>,
     /// Circuit-breaker readiness at the time of the check.
     readiness: ReadinessReport,
     /// Human-readable problems that should be fixed before serving traffic.
@@ -291,6 +294,19 @@ pub async fn inspect(path: &std::path::Path, config: &GatewayConfig) -> Result<D
         probes.push(probe);
     }
 
+    let trace_status = if config.trace.enabled {
+        let probe = state.memory().trace().doctor_probe(None).await;
+        if probe.required && !probe.ok {
+            problems.push(format!(
+                "trace bridge ({}): {}",
+                probe.command, probe.detail
+            ));
+        }
+        Some(probe)
+    } else {
+        None
+    };
+
     let readiness = state.router().readiness();
     if !readiness.ready {
         problems.push("every backend circuit is open".into());
@@ -304,6 +320,7 @@ pub async fn inspect(path: &std::path::Path, config: &GatewayConfig) -> Result<D
         auth_files: discovery.auth_files,
         daemons: discovery.daemons,
         probes,
+        trace: trace_status,
         readiness,
         problems,
         healthy,
@@ -370,6 +387,7 @@ async fn probe_inner(
         max_tokens: Some(16),
         workspace_mode: WorkspaceMode::None,
         workdir: None,
+        workspace_root: None,
         cancel: CancellationToken::new(),
         tools: Vec::new(),
         tool_choice: None,
@@ -474,6 +492,24 @@ fn print_report(report: &DoctorReport) {
             "NOT READY"
         }
     );
+    if let Some(trace) = &report.trace {
+        let status = if trace.ok {
+            "ok"
+        } else if trace.required {
+            "FAILED"
+        } else {
+            "WARN"
+        };
+        let rules = trace
+            .rules_count
+            .map(|n| format!(", rules={n}"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            stdout,
+            "Trace bridge ({}, root={}{}): {status} ({})",
+            trace.command, trace.workspace_root, rules, trace.detail
+        );
+    }
     if report.problems.is_empty() {
         let _ = writeln!(stdout, "Doctor: all checks passed.");
     } else {
