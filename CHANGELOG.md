@@ -2,6 +2,19 @@
 
 All notable changes to `vouch` are documented in this file.
 
+## [6.0.0] - 2026-11-28
+
+### Added
+- **Cross-Agent Shared Memory Ledger (`[shared_memory]`, `src/memory/ledger.rs`, `src/memory/handoff.rs`):**
+  - Added a bounded, secret-redacted `SessionLedgerStore` tracking canonical turns, active backend/profile, backend handoff history, sanitized repository `touched_files`, checkpoints, and token totals per `session_id`, persisted cleanly inside `[defaults].state_dir` (`gateway_state.json`).
+  - Added deterministic zero-LLM-token `<vouch_shared_context>` synthesis on cross-agent transitions (`failover`, `policy_reorder`, `model_switch`) strictly bounded to `shared_memory.max_context_tokens` BPE tokens via `tiktoken`, clearing native CLI delta state (`delta_messages = None`) cleanly and emitting `X-Vouch-Handoff: true` + `X-Vouch-Handoff-From` across streaming and buffered protocols.
+- **Model-Free `trace` MCP Codebase Bridge (`[trace]`, `src/memory/trace_bridge.rs`):**
+  - Added pooled `trace serve` stdio JSON-RPC 2.0 workers keyed by normalized workspace root with `ProcessGroupGuard` process-tree cleanup, strict startup/query timeouts, graceful non-blocking degradation when `trace.required = false`, and `list_rules` / `search_decisions` / `get_symbol_outline` / `find_callers` / `get_recent_history` grounding plus async `record_session` checkpoints.
+  - Enforced canonical traversal/containment checks on `X-Workspace-Root` (`403 Forbidden` on `..` or out-of-root escapes) and sanitized relative repository file extraction (`sanitize_relative_repo_path`).
+- **Session Control Endpoints, MCP Tools & Observability (`src/ingress/sessions.rs`, `src/cli/`):**
+  - Added authenticated `GET /v1/sessions`, `GET /v1/sessions/{session_id}`, `POST /v1/sessions/{session_id}/checkpoint`, and `DELETE /v1/sessions/{session_id}` (clearing ledger, sticky affinity, and git worktree).
+  - Added `vouch_session_status` and `vouch_checkpoint` built-in MCP tools (scoped by `[[tokens]].allowed_mcp_tools`), `[trace]` health probing in `vouch doctor`, `shared_sessions` + `handoffs_total` in `GET /healthz` and `vouch top`, and Prometheus counters `vouch_handoffs_total{from,to,reason}` and `vouch_trace_queries_total{tool,status}`.
+
 ## [5.0.0] - 2026-11-28
 
 ### Added
