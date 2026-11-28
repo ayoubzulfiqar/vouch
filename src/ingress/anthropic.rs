@@ -27,8 +27,9 @@ use crate::{
     error::{GatewayError, Result},
     ingress::{
         CancelOnDrop, StreamUsageGuard, completion, execute_or_cached, execution_request,
-        insert_routing_headers, into_chunk_stream, parse_json_content, prepare_routed,
-        record_completion_outcome, record_error_outcome, sse_response, start_ingress_span,
+        insert_dispatched_headers, insert_routing_headers, into_chunk_stream, parse_json_content,
+        prepare_routed, record_completion_outcome, record_error_outcome, sse_response,
+        start_ingress_span,
     },
     state::AppState,
 };
@@ -163,6 +164,7 @@ async fn messages_inner(
     let driver_response = dispatched.routed.response;
     let cache_status = dispatched.cache_status;
     let cache_miss_key = dispatched.cache_miss_key;
+    let coalesced = dispatched.coalesced;
     let message_id = format!("msg_{}", Uuid::new_v4().simple());
 
     if payload.stream {
@@ -593,12 +595,13 @@ async fn messages_inner(
         },
     });
     let mut response = (StatusCode::OK, Json(body)).into_response();
-    insert_routing_headers(
+    insert_dispatched_headers(
         &mut response,
         &backend,
         fallback,
         &context.request_id,
         cache_status,
+        coalesced,
     );
     Ok(response)
 }
