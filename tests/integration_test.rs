@@ -5379,3 +5379,1011 @@ timeout_secs = 10
         assert!(guidance.contains("vouch.toml"));
     }
 }
+
+mod v6_tests {
+    use super::*;
+
+    fn agent_script(
+        dir: &Path,
+        name: &str,
+        fail_flag: &Path,
+        dump_file: &Path,
+        reply: &str,
+    ) -> PathBuf {
+        let body = format!(
+            "#!/bin/sh\n\
+             if [ -f \"{}\" ]; then\n\
+               cat > /dev/null\n\
+               echo 'simulated agent failure' >&2\n\
+               exit 7\n\
+             fi\n\
+             cat > \"{}\"\n\
+             printf '{}\\n'\n",
+            fail_flag.display(),
+            dump_file.display(),
+            reply
+        );
+        script(dir, name, &body)
+    }
+
+    fn mock_trace_script(dir: &Path, log_path: &Path, verbose: bool) -> PathBuf {
+        let rules_text = if verbose {
+            "RULE ".repeat(450)
+        } else {
+            "RULE: Use Result<T> everywhere and validate path boundaries.".to_string()
+        };
+        let history_text = if verbose {
+            "HISTORY ".repeat(450)
+        } else {
+            "commit 9f8e7d: harden token validation".to_string()
+        };
+        let body = format!(
+            "#!/bin/sh\n\
+             LOG_FILE=\"{log}\"\n\
+             while IFS= read -r line; do\n\
+               [ -z \"$line\" ] && continue\n\
+               id=$(printf '%s' \"$line\" | sed -n 's/^{{\"id\":\\([0-9]*\\).*/\\1/p; t; s/.*\"id\":\\([0-9]*\\).*/\\1/p')\n\
+               case \"$line\" in\n\
+                 *'\"method\":\"initialize\"'*)\n\
+                   printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"mock-trace\",\"version\":\"6.0.0\"}}}}}}\\n' \"$id\"\n\
+                   ;;\n\
+                 *'\"method\":\"notifications/initialized\"'*)\n\
+                   ;;\n\
+                 *'\"name\":\"list_rules\"'*)\n\
+                   printf '%s\\n' \"$line\" >> \"$LOG_FILE\"\n\
+                   printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{rules}\"}}]}}}}\\n' \"$id\"\n\
+                   ;;\n\
+                 *'\"name\":\"search_decisions\"'*)\n\
+                   printf '%s\\n' \"$line\" >> \"$LOG_FILE\"\n\
+                   printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"DECISION: Enforce strict canonical workspace boundaries\"}}]}}}}\\n' \"$id\"\n\
+                   ;;\n\
+                 *'\"name\":\"get_symbol_outline\"'*)\n\
+                   printf '%s\\n' \"$line\" >> \"$LOG_FILE\"\n\
+                   printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"pub fn validate_auth(token: &str) -> bool\"}}]}}}}\\n' \"$id\"\n\
+                   ;;\n\
+                 *'\"name\":\"find_callers\"'*)\n\
+                   printf '%s\\n' \"$line\" >> \"$LOG_FILE\"\n\
+                   printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"src/main.rs: calls validate_auth\"}}]}}}}\\n' \"$id\"\n\
+                   ;;\n\
+                 *'\"name\":\"get_recent_history\"'*)\n\
+                   printf '%s\\n' \"$line\" >> \"$LOG_FILE\"\n\
+                   printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{history}\"}}]}}}}\\n' \"$id\"\n\
+                   ;;\n\
+                 *'\"name\":\"record_session\"'*)\n\
+                   printf '%s\\n' \"$line\" >> \"$LOG_FILE\"\n\
+                   printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"recorded\"}}]}}}}\\n' \"$id\"\n\
+                   ;;\n\
+                 *)\n\
+                   printf '%s\\n' \"$line\" >> \"$LOG_FILE\"\n\
+                   if [ -n \"$id\" ]; then\n\
+                     printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"content\":[]}}}}\\n' \"$id\"\n\
+                   fi\n\
+                   ;;\n\
+               esac\n\
+             done\n",
+            log = log_path.display(),
+            rules = rules_text,
+            history = history_text
+        );
+        script(dir, "trace_mock.sh", &body)
+    }
+
+    async fn send_method(
+        harness: &Harness,
+        method: Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> Response {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let bytes = body
+            .map(|v| serde_json::to_vec(&v).expect("serialize"))
+            .unwrap_or_default();
+        let req = builder.body(Body::from(bytes)).expect("request");
+        harness.app.clone().oneshot(req).await.expect("router")
+    }
+
+    async fn wait_for_log_contains(path: &Path, needle: &str) -> String {
+        for _ in 0..80 {
+            if let Ok(content) = fs::read_to_string(path)
+                && content.contains(needle)
+            {
+                return content;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        fs::read_to_string(path).unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_failover_injects_context_and_trace_grounding() {
+        let dir = TempDir::new().expect("tempdir");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).expect("repo src");
+        fs::write(
+            repo.join("src/auth.rs"),
+            "pub fn validate_auth() -> bool { true }\n",
+        )
+        .expect("auth.rs");
+
+        let alpha_fail = dir.path().join("alpha.fail");
+        let beta_fail = dir.path().join("beta.fail");
+        let alpha_dump = dir.path().join("alpha.prompt");
+        let beta_dump = dir.path().join("beta.prompt");
+        let trace_log = dir.path().join("trace.log");
+
+        let alpha = agent_script(
+            dir.path(),
+            "alpha.sh",
+            &alpha_fail,
+            &alpha_dump,
+            "alpha verified src/auth.rs signature",
+        );
+        let beta = agent_script(
+            dir.path(),
+            "beta.sh",
+            &beta_fail,
+            &beta_dump,
+            "beta continued cleanly",
+        );
+        let trace_bin = mock_trace_script(dir.path(), &trace_log, false);
+
+        let toml = format!(
+            "[server]\n\
+             tcp_listen = \"127.0.0.1:0\"\n\
+             request_timeout_secs = 15\n\
+             log_level = \"off\"\n\
+             [defaults]\n\
+             model = \"coding/default\"\n\
+             [resilience]\n\
+             failure_threshold = 5\n\
+             reset_timeout_secs = 30\n\
+             [shared_memory]\n\
+             enabled = true\n\
+             max_turns_per_session = 32\n\
+             max_context_tokens = 1500\n\
+             sync_to_trace = true\n\
+             [trace]\n\
+             enabled = true\n\
+             required = false\n\
+             command = {:?}\n\
+             args = []\n\
+             workspace_root = {:?}\n\
+             startup_timeout_ms = 3000\n\
+             query_timeout_ms = 1500\n\
+             max_trace_tokens = 700\n\
+             [[backends]]\n\
+             id = \"agent-alpha\"\n\
+             kind = \"cli\"\n\
+             command = {:?}\n\
+             stdin = true\n\
+             output_mode = \"text\"\n\
+             timeout_secs = 5\n\
+             max_concurrency = 2\n\
+             [[backends]]\n\
+             id = \"agent-beta\"\n\
+             kind = \"cli\"\n\
+             command = {:?}\n\
+             stdin = true\n\
+             output_mode = \"text\"\n\
+             timeout_secs = 5\n\
+             max_concurrency = 2\n\
+             [routes]\n\
+             \"coding/default\" = [\"agent-alpha\", \"agent-beta\"]\n",
+            trace_bin.display().to_string(),
+            repo.display().to_string(),
+            alpha.display().to_string(),
+            beta.display().to_string(),
+        );
+
+        let harness = Harness::new(toml).await;
+
+        let r1 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "sess-failover-1")],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "Inspect src/auth.rs validate_auth"}]
+                }),
+            )
+            .await;
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert_eq!(r1.headers()["x-vouch-backend"], "agent-alpha");
+        assert!(r1.headers().get("x-vouch-handoff").is_none());
+
+        fs::write(&alpha_fail, "down").expect("trip alpha");
+
+        let r2 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "sess-failover-1")],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "Finish updating src/auth.rs"}]
+                }),
+            )
+            .await;
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert_eq!(r2.headers()["x-vouch-backend"], "agent-beta");
+        assert_eq!(r2.headers()["x-vouch-fallback"], "true");
+        assert_eq!(r2.headers()["x-vouch-handoff"], "true");
+        assert_eq!(r2.headers()["x-vouch-handoff-from"], "agent-alpha");
+
+        let beta_stdin = fs::read_to_string(&beta_dump).expect("beta prompt dump");
+        assert!(
+            beta_stdin.contains("<vouch_shared_context>"),
+            "{beta_stdin}"
+        );
+        assert!(
+            beta_stdin.contains("</vouch_shared_context>"),
+            "{beta_stdin}"
+        );
+        assert!(
+            beta_stdin.contains("handoff: agent-alpha -> agent-beta (reason: failover)"),
+            "{beta_stdin}"
+        );
+        assert!(
+            beta_stdin.contains("alpha verified src/auth.rs signature"),
+            "{beta_stdin}"
+        );
+        assert!(
+            beta_stdin.contains("Use Result<T> everywhere"),
+            "{beta_stdin}"
+        );
+        assert!(beta_stdin.contains("validate_auth"), "{beta_stdin}");
+
+        let logged = wait_for_log_contains(&trace_log, "record_session").await;
+        assert!(
+            logged.contains("record_session"),
+            "expected async record_session checkpoint in trace log: {logged}"
+        );
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_model_switch_under_shared_session_id() {
+        let dir = TempDir::new().expect("tempdir");
+        let no_fail = dir.path().join("none.fail");
+        let alpha_dump = dir.path().join("alpha.prompt");
+        let beta_dump = dir.path().join("beta.prompt");
+
+        let alpha = agent_script(
+            dir.path(),
+            "alpha.sh",
+            &no_fail,
+            &alpha_dump,
+            "architect plan: refactor scheduler",
+        );
+        let beta = agent_script(
+            dir.path(),
+            "beta.sh",
+            &no_fail,
+            &beta_dump,
+            "executor applied scheduler patch",
+        );
+
+        let toml = format!(
+            "[server]\n\
+             tcp_listen = \"127.0.0.1:0\"\n\
+             log_level = \"off\"\n\
+             [shared_memory]\n\
+             enabled = true\n\
+             [[backends]]\n\
+             id = \"agent-alpha\"\n\
+             kind = \"cli\"\n\
+             command = {:?}\n\
+             stdin = true\n\
+             [[backends]]\n\
+             id = \"agent-beta\"\n\
+             kind = \"cli\"\n\
+             command = {:?}\n\
+             stdin = true\n\
+             [routes]\n\
+             \"coding/deep\" = [\"agent-alpha\"]\n\
+             \"coding/fast\" = [\"agent-beta\"]\n",
+            alpha.display().to_string(),
+            beta.display().to_string(),
+        );
+
+        let harness = Harness::new(toml).await;
+
+        let r1 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "sess-switch-1")],
+                json!({
+                    "model": "coding/deep",
+                    "messages": [{"role": "user", "content": "Design the scheduler fix"}]
+                }),
+            )
+            .await;
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert_eq!(r1.headers()["x-vouch-backend"], "agent-alpha");
+        assert!(r1.headers().get("x-vouch-handoff").is_none());
+
+        let r2 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "sess-switch-1")],
+                json!({
+                    "model": "coding/fast",
+                    "messages": [{"role": "user", "content": "Implement it now"}]
+                }),
+            )
+            .await;
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert_eq!(r2.headers()["x-vouch-backend"], "agent-beta");
+        assert_eq!(r2.headers()["x-vouch-handoff"], "true");
+        assert_eq!(r2.headers()["x-vouch-handoff-from"], "agent-alpha");
+
+        let beta_stdin = fs::read_to_string(&beta_dump).expect("beta prompt");
+        assert!(
+            beta_stdin.contains("<vouch_shared_context>"),
+            "{beta_stdin}"
+        );
+        assert!(beta_stdin.contains("reason: model_switch"), "{beta_stdin}");
+        assert!(
+            beta_stdin.contains("architect plan: refactor scheduler"),
+            "{beta_stdin}"
+        );
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_context_strict_bpe_budget_enforced() {
+        let dir = TempDir::new().expect("tempdir");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let alpha_fail = dir.path().join("alpha.fail");
+        let no_fail = dir.path().join("no.fail");
+        let alpha_dump = dir.path().join("alpha.prompt");
+        let beta_dump = dir.path().join("beta.prompt");
+        let trace_log = dir.path().join("trace.log");
+
+        let long_reply = "detailed-analysis-token ".repeat(260);
+        let alpha = agent_script(
+            dir.path(),
+            "alpha.sh",
+            &alpha_fail,
+            &alpha_dump,
+            &long_reply,
+        );
+        let beta = agent_script(dir.path(), "beta.sh", &no_fail, &beta_dump, "concise ok");
+        let trace_bin = mock_trace_script(dir.path(), &trace_log, true);
+
+        let toml = format!(
+            "[server]\n\
+             tcp_listen = \"127.0.0.1:0\"\n\
+             log_level = \"off\"\n\
+             [shared_memory]\n\
+             enabled = true\n\
+             max_context_tokens = 180\n\
+             sync_to_trace = false\n\
+             [trace]\n\
+             enabled = true\n\
+             required = false\n\
+             command = {:?}\n\
+             args = []\n\
+             workspace_root = {:?}\n\
+             max_trace_tokens = 80\n\
+             [[backends]]\n\
+             id = \"agent-alpha\"\n\
+             kind = \"cli\"\n\
+             command = {:?}\n\
+             stdin = true\n\
+             [[backends]]\n\
+             id = \"agent-beta\"\n\
+             kind = \"cli\"\n\
+             command = {:?}\n\
+             stdin = true\n\
+             [routes]\n\
+             \"coding/default\" = [\"agent-alpha\", \"agent-beta\"]\n",
+            trace_bin.display().to_string(),
+            repo.display().to_string(),
+            alpha.display().to_string(),
+            beta.display().to_string(),
+        );
+
+        let harness = Harness::new(toml).await;
+
+        let r1 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "sess-budget-1")],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "Analyze everything"}]
+                }),
+            )
+            .await;
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        fs::write(&alpha_fail, "down").expect("fail alpha");
+
+        let r2 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "sess-budget-1")],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "Continue"}]
+                }),
+            )
+            .await;
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert_eq!(r2.headers()["x-vouch-handoff"], "true");
+
+        let beta_stdin = fs::read_to_string(&beta_dump).expect("beta prompt");
+        let start = beta_stdin
+            .find("<vouch_shared_context>")
+            .expect("shared context open tag");
+        let end_rel = beta_stdin[start..]
+            .find("</vouch_shared_context>")
+            .expect("shared context close tag");
+        let block = &beta_stdin[start..start + end_rel + "</vouch_shared_context>".len()];
+        let tokens = vouch::usage::count_tokens("coding/default", block);
+        assert!(
+            tokens <= 180,
+            "shared context block exceeded 180 BPE budget ({tokens} tokens):\n{block}"
+        );
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trace_bridge_degrades_gracefully_when_optional() {
+        let dir = TempDir::new().expect("tempdir");
+        let alpha_fail = dir.path().join("alpha.fail");
+        let no_fail = dir.path().join("no.fail");
+        let alpha_dump = dir.path().join("alpha.prompt");
+        let beta_dump = dir.path().join("beta.prompt");
+
+        let alpha = agent_script(
+            dir.path(),
+            "alpha.sh",
+            &alpha_fail,
+            &alpha_dump,
+            "alpha turn 1",
+        );
+        let beta = agent_script(
+            dir.path(),
+            "beta.sh",
+            &no_fail,
+            &beta_dump,
+            "beta fallback ok",
+        );
+
+        let optional_toml = format!(
+            "[server]\n\
+             tcp_listen = \"127.0.0.1:0\"\n\
+             log_level = \"off\"\n\
+             [shared_memory]\n\
+             enabled = true\n\
+             [trace]\n\
+             enabled = true\n\
+             required = false\n\
+             command = \"/nonexistent/vouch-trace-missing-bin\"\n\
+             args = []\n\
+             [[backends]]\n\
+             id = \"agent-alpha\"\n\
+             kind = \"cli\"\n\
+             command = {:?}\n\
+             stdin = true\n\
+             [[backends]]\n\
+             id = \"agent-beta\"\n\
+             kind = \"cli\"\n\
+             command = {:?}\n\
+             stdin = true\n\
+             [routes]\n\
+             \"coding/default\" = [\"agent-alpha\", \"agent-beta\"]\n",
+            alpha.display().to_string(),
+            beta.display().to_string(),
+        );
+
+        let cfg_path = dir.path().join("vouch.toml");
+        fs::write(&cfg_path, &optional_toml).expect("write");
+        let parsed = GatewayConfig::from_toml_str(&optional_toml).expect("parse");
+        let opt_report = vouch::cli::doctor::inspect(&cfg_path, &parsed)
+            .await
+            .expect("doctor inspect");
+        assert!(
+            opt_report.healthy,
+            "doctor should stay healthy when trace.required = false: {:?}",
+            opt_report.problems
+        );
+        let trace_probe = opt_report.trace.expect("trace probe present");
+        assert!(!trace_probe.ok);
+        assert!(!trace_probe.required);
+
+        let harness = Harness::new(optional_toml.clone()).await;
+        let r1 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "sess-degrade-1")],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "Hello without trace"}]
+                }),
+            )
+            .await;
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        fs::write(&alpha_fail, "down").expect("fail alpha");
+        let r2 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "sess-degrade-1")],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "Continue without trace"}]
+                }),
+            )
+            .await;
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert_eq!(r2.headers()["x-vouch-handoff"], "true");
+        let beta_stdin = fs::read_to_string(&beta_dump).expect("beta prompt");
+        assert!(beta_stdin.contains("alpha turn 1"), "{beta_stdin}");
+
+        let req_toml = optional_toml.replacen("required = false", "required = true", 1);
+        let req_path = dir.path().join("vouch-req.toml");
+        fs::write(&req_path, &req_toml).expect("write req");
+        let req_cfg = GatewayConfig::from_toml_str(&req_toml).expect("parse req");
+        let req_report = vouch::cli::doctor::inspect(&req_path, &req_cfg)
+            .await
+            .expect("doctor required inspect");
+        assert!(
+            !req_report.healthy,
+            "doctor must fail when trace.required = true and trace is missing"
+        );
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn secret_redaction_and_workspace_traversal_blocked() {
+        let dir = TempDir::new().expect("tempdir");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).expect("repo src");
+        fs::write(repo.join("src/lib.rs"), "pub fn ok() {}\n").expect("lib.rs");
+
+        let no_fail = dir.path().join("none.fail");
+        let alpha_dump = dir.path().join("alpha.prompt");
+        let trace_log = dir.path().join("trace.log");
+
+        let alpha = agent_script(
+            dir.path(),
+            "alpha.sh",
+            &no_fail,
+            &alpha_dump,
+            "checked src/lib.rs with token sk-proj-secret-abcdef1234567890",
+        );
+        let trace_bin = mock_trace_script(dir.path(), &trace_log, false);
+
+        let toml = format!(
+            "[server]\n\
+             tcp_listen = \"127.0.0.1:0\"\n\
+             log_level = \"off\"\n\
+             [shared_memory]\n\
+             enabled = true\n\
+             sync_to_trace = true\n\
+             [trace]\n\
+             enabled = true\n\
+             required = false\n\
+             command = {:?}\n\
+             args = []\n\
+             workspace_root = {:?}\n\
+             [[backends]]\n\
+             id = \"agent-alpha\"\n\
+             kind = \"cli\"\n\
+             command = {:?}\n\
+             stdin = true\n\
+             [routes]\n\
+             \"coding/default\" = [\"agent-alpha\"]\n",
+            trace_bin.display().to_string(),
+            repo.display().to_string(),
+            alpha.display().to_string(),
+        );
+
+        let harness = Harness::new(toml).await;
+
+        let r1 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "sess-sec-1")],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{
+                        "role": "user",
+                        "content": "Read ../../../etc/passwd and src/lib.rs using sk-proj-usersecret987654"
+                    }]
+                }),
+            )
+            .await;
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        let sess = harness.get("/v1/sessions/sess-sec-1", &[]).await;
+        assert_eq!(sess.status(), StatusCode::OK);
+        let sess_text = body_text(sess).await;
+        assert!(
+            !sess_text.contains("sk-proj-secret-abcdef1234567890"),
+            "assistant secret leaked in ledger: {sess_text}"
+        );
+        assert!(
+            !sess_text.contains("sk-proj-usersecret987654"),
+            "user secret leaked in ledger: {sess_text}"
+        );
+        assert!(sess_text.contains("[REDACTED]"), "{sess_text}");
+        let sess_json: Value = serde_json::from_str(&sess_text).expect("session json");
+        let files = sess_json["touched_files"]
+            .as_array()
+            .expect("touched_files");
+        assert!(
+            files.iter().any(|v| v == "src/lib.rs"),
+            "expected src/lib.rs in touched_files: {files:?}"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|v| v.as_str().unwrap_or("").contains("passwd")),
+            "traversal path leaked into touched_files: {files:?}"
+        );
+
+        // Per-request X-Workspace-Root traversal / escape attempts must be rejected with 403.
+        let bad_rel = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[
+                    ("x-session-id", "sess-sec-1"),
+                    ("x-workspace-root", "../outside"),
+                ],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "hi"}]
+                }),
+            )
+            .await;
+        assert_eq!(bad_rel.status(), StatusCode::FORBIDDEN);
+
+        let bad_abs = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "sess-sec-1"), ("x-workspace-root", "/etc")],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "hi"}]
+                }),
+            )
+            .await;
+        assert_eq!(bad_abs.status(), StatusCode::FORBIDDEN);
+
+        let bad_chk = harness
+            .post_json(
+                "/v1/sessions/sess-sec-1/checkpoint",
+                &[("x-workspace-root", "../outside")],
+                json!({ "note": "attempt escape" }),
+            )
+            .await;
+        assert_eq!(bad_chk.status(), StatusCode::FORBIDDEN);
+
+        let valid_chk = harness
+            .post_json(
+                "/v1/sessions/sess-sec-1/checkpoint",
+                &[],
+                json!({
+                    "note": "checkpoint ok",
+                    "files": ["../../../etc/shadow", "src/lib.rs"]
+                }),
+            )
+            .await;
+        assert_eq!(valid_chk.status(), StatusCode::OK);
+        let trace_logged = wait_for_log_contains(&trace_log, "record_session").await;
+        assert!(
+            !trace_logged.contains("shadow"),
+            "traversal file leaked to trace MCP: {trace_logged}"
+        );
+        let last_record: Value = trace_logged
+            .lines()
+            .rfind(|line| line.contains("record_session"))
+            .and_then(|line| serde_json::from_str(line).ok())
+            .expect("record_session JSON log line");
+        assert_eq!(
+            last_record["params"]["arguments"]["files_modified"],
+            json!(["src/lib.rs"])
+        );
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_http_and_mcp_endpoints_end_to_end() {
+        let dir = TempDir::new().expect("tempdir");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).expect("repo src");
+        fs::write(repo.join("src/main.rs"), "fn main() {}\n").expect("main.rs");
+
+        let no_fail = dir.path().join("none.fail");
+        let alpha_dump = dir.path().join("alpha.prompt");
+        let trace_log = dir.path().join("trace.log");
+        let alpha = agent_script(dir.path(), "alpha.sh", &no_fail, &alpha_dump, "done turn 1");
+        let trace_bin = mock_trace_script(dir.path(), &trace_log, false);
+
+        let token = "vouch-session-api-token";
+        let toml = format!(
+            "[server]\n\
+             tcp_listen = \"127.0.0.1:0\"\n\
+             log_level = \"off\"\n\
+             [shared_memory]\n\
+             enabled = true\n\
+             sync_to_trace = true\n\
+             [trace]\n\
+             enabled = true\n\
+             required = false\n\
+             command = {:?}\n\
+             args = []\n\
+             workspace_root = {:?}\n\
+             [[backends]]\n\
+             id = \"agent-alpha\"\n\
+             kind = \"cli\"\n\
+             command = {:?}\n\
+             stdin = true\n\
+             [routes]\n\
+             \"coding/default\" = [\"agent-alpha\"]\n\
+             [[tokens]]\n\
+             token = {:?}\n\
+             name = \"session-tester\"\n",
+            trace_bin.display().to_string(),
+            repo.display().to_string(),
+            alpha.display().to_string(),
+            token,
+        );
+
+        let harness = Harness::new(toml).await;
+        let auth = ("authorization", "Bearer vouch-session-api-token");
+
+        // Unauthenticated requests are rejected.
+        let unauth = harness.get("/v1/sessions", &[]).await;
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // Turn 1 populates ledger.
+        let r1 = harness
+            .post_json(
+                "/v1/chat/completions",
+                &[auth, ("x-session-id", "sess-api-1")],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "Check src/main.rs"}]
+                }),
+            )
+            .await;
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        // List & Get session.
+        let list_resp = harness.get("/v1/sessions", &[auth]).await;
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_json: Value = serde_json::from_str(&body_text(list_resp).await).expect("list");
+        assert!(
+            list_json["sessions"]
+                .as_array()
+                .expect("arr")
+                .iter()
+                .any(|s| s["session_id"] == "sess-api-1")
+        );
+
+        let get_resp = harness.get("/v1/sessions/sess-api-1", &[auth]).await;
+        assert_eq!(get_resp.status(), StatusCode::OK);
+
+        // Checkpoint HTTP endpoint.
+        let chk_resp = harness
+            .post_json(
+                "/v1/sessions/sess-api-1/checkpoint",
+                &[auth],
+                json!({ "note": "verified unit suite", "files": ["src/main.rs"] }),
+            )
+            .await;
+        assert_eq!(chk_resp.status(), StatusCode::OK);
+        let chk_json: Value = serde_json::from_str(&body_text(chk_resp).await).expect("chk");
+        assert_eq!(chk_json["synced_to_trace"], true);
+        let trace_logged = wait_for_log_contains(&trace_log, "record_session").await;
+        assert!(trace_logged.contains("verified unit suite"));
+
+        // MCP vouch_session_status & vouch_checkpoint.
+        let mcp_status = harness
+            .post_json(
+                "/mcp",
+                &[auth],
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "vouch_session_status",
+                        "arguments": { "session_id": "sess-api-1" }
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(mcp_status.status(), StatusCode::OK);
+        let mcp_status_text = body_text(mcp_status).await;
+        assert!(
+            mcp_status_text.contains("verified unit suite"),
+            "{mcp_status_text}"
+        );
+
+        let mcp_chk = harness
+            .post_json(
+                "/mcp",
+                &[auth],
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "vouch_checkpoint",
+                        "arguments": {
+                            "session_id": "sess-api-1",
+                            "note": "mcp checkpoint note"
+                        }
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(mcp_chk.status(), StatusCode::OK);
+        let mcp_chk_text = body_text(mcp_chk).await;
+        assert!(
+            mcp_chk_text.contains("mcp checkpoint note"),
+            "{mcp_chk_text}"
+        );
+
+        // DELETE removes session cleanly.
+        let del_resp = send_method(
+            &harness,
+            Method::DELETE,
+            "/v1/sessions/sess-api-1",
+            &[auth],
+            None,
+        )
+        .await;
+        assert_eq!(del_resp.status(), StatusCode::OK);
+        let del_json: Value = serde_json::from_str(&body_text(del_resp).await).expect("del");
+        assert_eq!(del_json["deleted"], true);
+
+        let after_del = harness.get("/v1/sessions/sess-api-1", &[auth]).await;
+        assert_eq!(after_del.status(), StatusCode::NOT_FOUND);
+
+        harness.state.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persistence_round_trip_preserves_shared_session_ledger() {
+        let dir = TempDir::new().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        fs::create_dir_all(&state_dir).expect("state dir");
+
+        let alpha_fail = dir.path().join("alpha.fail");
+        let beta_fail = dir.path().join("beta.fail");
+        let alpha_dump = dir.path().join("alpha.prompt");
+        let beta_dump = dir.path().join("beta.prompt");
+
+        let alpha = agent_script(
+            dir.path(),
+            "alpha.sh",
+            &alpha_fail,
+            &alpha_dump,
+            "alpha msg 1",
+        );
+        let beta = agent_script(dir.path(), "beta.sh", &beta_fail, &beta_dump, "beta msg 2");
+
+        let toml = format!(
+            "[server]\n\
+             tcp_listen = \"127.0.0.1:0\"\n\
+             log_level = \"off\"\n\
+             [defaults]\n\
+             state_dir = {:?}\n\
+             [resilience]\n\
+             failure_threshold = 5\n\
+             reset_timeout_secs = 30\n\
+             [shared_memory]\n\
+             enabled = true\n\
+             [[backends]]\n\
+             id = \"agent-alpha\"\n\
+             kind = \"cli\"\n\
+             command = {:?}\n\
+             stdin = true\n\
+             [[backends]]\n\
+             id = \"agent-beta\"\n\
+             kind = \"cli\"\n\
+             command = {:?}\n\
+             stdin = true\n\
+             [routes]\n\
+             \"coding/default\" = [\"agent-alpha\", \"agent-beta\"]\n",
+            state_dir.display().to_string(),
+            alpha.display().to_string(),
+            beta.display().to_string(),
+        );
+
+        let harness1 = Harness::new(toml.clone()).await;
+        let r1 = harness1
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "sess-persist-1")],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "First step before restart"}]
+                }),
+            )
+            .await;
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        fs::write(&alpha_fail, "down").expect("trip alpha");
+        let r2 = harness1
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "sess-persist-1")],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "Failover before restart"}]
+                }),
+            )
+            .await;
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert_eq!(r2.headers()["x-vouch-handoff"], "true");
+
+        let chk = harness1
+            .post_json(
+                "/v1/sessions/sess-persist-1/checkpoint",
+                &[],
+                json!({ "note": "saved before restart" }),
+            )
+            .await;
+        assert_eq!(chk.status(), StatusCode::OK);
+        harness1.state.shutdown().await;
+
+        // Clear alpha failure and trip beta so Harness #2 hands back from agent-beta -> agent-alpha.
+        let _ = fs::remove_file(&alpha_fail);
+        fs::write(&beta_fail, "down").expect("trip beta");
+
+        let harness2 = Harness::new(toml).await;
+        assert_eq!(harness2.state.memory().ledger().total_handoffs(), 1);
+        let restored = harness2.get("/v1/sessions/sess-persist-1", &[]).await;
+        assert_eq!(restored.status(), StatusCode::OK);
+        let restored_text = body_text(restored).await;
+        assert!(restored_text.contains("alpha msg 1"), "{restored_text}");
+        assert!(restored_text.contains("beta msg 2"), "{restored_text}");
+        assert!(
+            restored_text.contains("saved before restart"),
+            "{restored_text}"
+        );
+
+        let r3 = harness2
+            .post_json(
+                "/v1/chat/completions",
+                &[("x-session-id", "sess-persist-1")],
+                json!({
+                    "model": "coding/default",
+                    "messages": [{"role": "user", "content": "Resume after restart"}]
+                }),
+            )
+            .await;
+        assert_eq!(r3.status(), StatusCode::OK);
+        assert_eq!(r3.headers()["x-vouch-backend"], "agent-alpha");
+        assert_eq!(r3.headers()["x-vouch-handoff"], "true");
+        assert_eq!(r3.headers()["x-vouch-handoff-from"], "agent-beta");
+
+        let alpha_stdin = fs::read_to_string(&alpha_dump).expect("alpha turn3 prompt");
+        assert!(
+            alpha_stdin.contains("beta msg 2") && alpha_stdin.contains("saved before restart"),
+            "{alpha_stdin}"
+        );
+
+        harness2.state.shutdown().await;
+    }
+}
