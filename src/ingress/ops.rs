@@ -62,3 +62,15 @@ pub async fn usage(State(state): State<Arc<AppState>>, headers: axum::http::Head
     let report = state.usage().report(state.uptime_secs(), &budgets);
     Json(report).into_response()
 }
+
+/// Recent completed request traces ring buffer (`GET /v1/traces`).
+pub async fn traces(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(error) = state.tokens().authenticate(&headers) {
+        return error.into_openai_response();
+    }
+    let traces = state.traces().recent();
+    Json(json!({ "traces": traces })).into_response()
+}
