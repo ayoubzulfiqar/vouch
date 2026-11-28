@@ -156,6 +156,10 @@ pub struct TokenPolicy {
     pub admin: bool,
     /// Compiled model allowlist; `None` means every model.
     allowlist: Option<ModelAllowlist>,
+    /// True when `allowed_models` permits every model (empty or contains `*`).
+    allows_all_models: bool,
+    /// Compiled MCP tool allowlist; `None` falls back to default policy.
+    allowed_mcp_tools: Option<ModelAllowlist>,
     window: Mutex<VecDeque<Instant>>,
     budget_state: Mutex<TokenBudgetState>,
     concurrency: Option<Arc<Semaphore>>,
@@ -172,11 +176,18 @@ impl TokenPolicy {
             .name
             .clone()
             .unwrap_or_else(|| format!("token-{}", &hash_hex[..8]));
+        let allows_all_models =
+            config.allowed_models.is_empty() || config.allowed_models.iter().any(|p| p == "*");
         let allowlist = if config.allowed_models.is_empty() {
             None
         } else {
             Some(ModelAllowlist::compile(&config.allowed_models)?)
         };
+        let allowed_mcp_tools = config
+            .allowed_mcp_tools
+            .as_ref()
+            .map(|patterns| ModelAllowlist::compile_named("allowed_mcp_tools", patterns))
+            .transpose()?;
         let expires_at_unix_secs = config
             .expires_at
             .as_deref()
@@ -197,6 +208,8 @@ impl TokenPolicy {
             allowed_backends: config.allowed_backends.clone(),
             admin: config.admin,
             allowlist,
+            allows_all_models,
+            allowed_mcp_tools,
             window: Mutex::new(VecDeque::new()),
             budget_state: Mutex::new(TokenBudgetState {
                 daily: DailyTokenCounter {
@@ -216,6 +229,20 @@ impl TokenPolicy {
             .as_ref()
             .map(|allowlist| allowlist.matches(model))
             .unwrap_or(true)
+    }
+
+    /// Whether this token may invoke MCP tool `tool_name`.
+    pub fn allows_mcp_tool(&self, tool_name: &str) -> bool {
+        if let Some(mcp_allowlist) = &self.allowed_mcp_tools {
+            return mcp_allowlist.matches(tool_name);
+        }
+        if self.allows_all_models {
+            return true;
+        }
+        // When `allowed_mcp_tools` is unset and `allowed_models` is restricted,
+        // built-in model routes are gated by `allowed_models` while arbitrary
+        // upstream MCP tools (`<upstream>__<tool>`) are denied by default.
+        !tool_name.contains("__")
     }
 
     /// Optional backend allowlist for routing enforcement.
@@ -488,6 +515,14 @@ impl Principal {
         self.allows_model(requested) || self.allows_model(resolved)
     }
 
+    /// Whether this caller may invoke MCP tool `tool_name`.
+    pub fn allows_mcp_tool(&self, tool_name: &str) -> bool {
+        self.policy
+            .as_ref()
+            .map(|policy| policy.allows_mcp_tool(tool_name))
+            .unwrap_or(true)
+    }
+
     /// Configured backend allowlist for this caller, if any.
     pub fn allowed_backends(&self) -> Option<Vec<String>> {
         self.policy
@@ -744,6 +779,7 @@ mod tests {
             max_concurrent: None,
             expires_at: None,
             allowed_models: Vec::new(),
+            allowed_mcp_tools: None,
             allowed_backends: None,
             admin: false,
         }
