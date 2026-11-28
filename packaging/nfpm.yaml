@@ -1,0 +1,43 @@
+name: "vouch"
+arch: "${ARCH}"
+platform: "linux"
+version: "${VERSION}"
+release: "1"
+section: "utils"
+priority: "optional"
+maintainer: "Ayoub Zulfiqar <ayoubzulfiqar@users.noreply.github.com>"
+description: "Local authentication multiplexer and process-supervised AI gateway"
+homepage: "https://github.com/ayoubzulfiqar/vouch"
+license: "GPL-3.0-or-later"
+contents:
+  - src: "${BIN_PATH}"
+    dst: "/usr/bin/vouch"
+    file_info:
+      mode: 0755
+  - src: "vouch.example.toml"
+    dst: "/etc/vouch/vouch.example.toml"
+    type: "config|noreplace"
+    file_info:
+      mode: 0644
+  - src: "LICENSE"
+    dst: "/usr/share/licenses/vouch/LICENSE"
+    file_info:
+      mode: 0644
+  - src: "NOTICE"
+    dst: "/usr/share/doc/vouch/NOTICE"
+    file_info:
+      mode: 0644
+  - src: "README.md"
+    dst: "/usr/share/doc/vouch/README.md"
+    file_info:
+      mode: 0644
+  - src: "CHANGELOG.md"
+    dst: "/usr/share/doc/vouch/CHANGELOG.md"
+    file_info:
+      mode: 0644
+  - src: "vouch.example.toml"
+    dst: "/usr/share/doc/vouch/vouch.example.toml"
+    file_info:
+      mode: 0644
+rpm:
+  group: "Applications/System"
