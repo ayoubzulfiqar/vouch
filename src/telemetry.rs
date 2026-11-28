@@ -874,3 +874,81 @@ fn now_unix_nanos() -> u128 {
         .unwrap_or_default()
         .as_nanos()
 }
+
+/// Redacted summary of one completed gateway request stored in memory for
+/// `GET /v1/traces` and the interactive Trace Waterfall UI.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RecentTraceEntry {
+    /// Request correlation identifier (`x-vouch-request-id`).
+    pub request_id: String,
+    /// RFC-3339 UTC timestamp when completed.
+    pub timestamp: String,
+    /// Wire protocol (`/v1/chat/completions`, `/v1/messages`, ...).
+    pub protocol: String,
+    /// Resolved route key.
+    pub route: String,
+    /// Original model/alias requested by client.
+    pub requested_model: String,
+    /// Backend that handled the execution (`"none"` when rejected pre-dispatch).
+    pub backend: String,
+    /// Active credential profile id when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    /// True when failover or hedged backup succeeded.
+    pub fallback: bool,
+    /// Deterministic cache outcome (`hit`, `miss`, `bypass`, `disabled`, `coalesced`).
+    pub cache: String,
+    /// True when satisfied by singleflight coalescing.
+    pub coalesced: bool,
+    /// Time to first chunk or response completion in milliseconds.
+    pub ttft_ms: u64,
+    /// Total end-to-end request duration in milliseconds.
+    pub total_ms: u64,
+    /// HTTP status code.
+    pub status: u16,
+    /// Prompt BPE token count.
+    pub prompt_tokens: u64,
+    /// Completion BPE token count.
+    pub completion_tokens: u64,
+    /// Redacted error summary, if failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Bounded FIFO ring buffer storing the most recent `capacity` request traces.
+#[derive(Debug)]
+pub struct TraceRingBuffer {
+    capacity: usize,
+    entries: ParkingMutex<std::collections::VecDeque<RecentTraceEntry>>,
+}
+
+impl TraceRingBuffer {
+    /// Create a ring buffer capped at `capacity` recent traces (default `100`).
+    pub fn new(capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        Self {
+            capacity: cap,
+            entries: ParkingMutex::new(std::collections::VecDeque::with_capacity(cap)),
+        }
+    }
+
+    /// Push a sanitized trace entry, evicting the oldest if at capacity.
+    pub fn push(&self, mut entry: RecentTraceEntry) {
+        if let Some(err) = entry.error.take() {
+            entry.error = Some(redact_text(&err));
+        }
+        entry.requested_model = redact_text(&entry.requested_model);
+        entry.route = redact_text(&entry.route);
+        let mut guard = self.entries.lock();
+        if guard.len() >= self.capacity {
+            guard.pop_front();
+        }
+        guard.push_back(entry);
+    }
+
+    /// Return recent traces ordered newest-first.
+    pub fn recent(&self) -> Vec<RecentTraceEntry> {
+        let guard = self.entries.lock();
+        guard.iter().rev().cloned().collect()
+    }
+}
