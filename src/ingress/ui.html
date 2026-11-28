@@ -3,12 +3,13 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>vouch — gateway monitor</title>
+  <title>vouch — console</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect x='24' y='24' width='464' height='464' rx='108' fill='%230e1116' stroke='%232e3744' stroke-width='8'/%3E%3Cpath d='M132 176 L242 362' fill='none' stroke='%23e6edf3' stroke-width='46' stroke-linecap='round'/%3E%3Cpath d='M222 144 L297 271' fill='none' stroke='%2358a6ff' stroke-width='32' stroke-linecap='round'/%3E%3Cpath d='M242 362 L378 148' fill='none' stroke='%230e1116' stroke-width='60' stroke-linecap='round'/%3E%3Cpath d='M242 362 L378 148' fill='none' stroke='%233fb950' stroke-width='48' stroke-linecap='round'/%3E%3C/svg%3E" />
   <style>
     :root {
       --bg: #0e1116;
       --surface: #161b22;
+      --surface-alt: #1b222c;
       --border: #2a313c;
       --text: #e6edf3;
       --muted: #8b949e;
@@ -28,23 +29,59 @@
       font-size: 14px;
       line-height: 1.5;
     }
-    .wrap { max-width: 1040px; margin: 0 auto; }
+    .wrap { max-width: 1120px; margin: 0 auto; }
     header {
       display: flex;
       flex-wrap: wrap;
       justify-content: space-between;
       align-items: center;
       gap: 12px;
-      margin-bottom: 20px;
+      margin-bottom: 16px;
       padding-bottom: 12px;
       border-bottom: 1px solid var(--border);
     }
     h1 { font-size: 18px; margin: 0; font-family: var(--mono); }
     .brand { display: flex; align-items: center; gap: 10px; }
+    .header-right { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
     .meta { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+    .token-input {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 5px;
+      padding: 5px 9px;
+      font-family: var(--mono);
+      font-size: 12px;
+      width: 210px;
+    }
+    .tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 18px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 10px;
+    }
+    .tab-btn {
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--muted);
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .tab-btn:hover { color: var(--text); background: var(--surface); }
+    .tab-btn.active {
+      background: var(--surface);
+      border-color: var(--border);
+      color: var(--accent);
+    }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
     .cards {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
       gap: 12px;
       margin-bottom: 20px;
     }
@@ -68,9 +105,12 @@
       border-bottom: 1px solid var(--border);
       font-weight: 600;
       font-size: 13px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
     }
     table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
-    th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+    th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: middle; }
     th { color: var(--muted); font-weight: 500; }
     tr:last-child td { border-bottom: none; }
     .pill {
@@ -84,6 +124,76 @@
     .warn { background: rgba(210, 153, 34, 0.16); color: var(--warn); }
     .err { background: rgba(248, 81, 73, 0.16); color: var(--err); }
     .info { background: rgba(88, 166, 255, 0.16); color: var(--info); }
+    button.btn {
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 5px 10px;
+      border-radius: 5px;
+      font-size: 12px;
+      font-family: var(--mono);
+      cursor: pointer;
+    }
+    button.btn:hover { border-color: var(--info); color: var(--info); }
+    button.btn-primary {
+      background: rgba(63, 185, 80, 0.18);
+      border-color: var(--accent);
+      color: var(--accent);
+      font-weight: 600;
+    }
+    button.btn-primary:hover { background: rgba(63, 185, 80, 0.28); color: var(--text); }
+    .form-grid {
+      padding: 14px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+    }
+    .field label {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      margin-bottom: 4px;
+    }
+    .field input, .field select, .field textarea {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 5px;
+      padding: 7px 10px;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .playground-body { padding: 0 14px 14px 14px; display: flex; flex-direction: column; gap: 12px; }
+    .split { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
+    @media (max-width: 780px) { .split { grid-template-columns: 1fr; } }
+    pre.box {
+      margin: 0;
+      padding: 12px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      font-family: var(--mono);
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      min-height: 150px;
+      max-height: 340px;
+      overflow-y: auto;
+    }
+    .waterfall-bar {
+      width: 180px;
+      height: 10px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      overflow: hidden;
+      display: flex;
+    }
+    .wf-ttft { background: var(--info); height: 100%; }
+    .wf-tail { background: var(--accent); height: 100%; }
+    .status-banner { font-family: var(--mono); font-size: 12px; color: var(--info); }
   </style>
 </head>
 <body>
@@ -99,44 +209,152 @@
         </svg>
         <h1 id="title">vouch gateway</h1>
       </div>
-      <div class="meta" id="meta">connecting...</div>
+      <div class="header-right">
+        <input id="api-token" class="token-input" type="password" placeholder="Optional Bearer token..." autocomplete="off" />
+        <div class="meta" id="meta">connecting...</div>
+      </div>
     </header>
-    <section class="cards" id="cards"></section>
-    <section class="panel">
-      <div class="panel-title">Backends &amp; Circuit Breakers</div>
-      <table>
-        <thead>
-          <tr>
-            <th>Backend</th>
-            <th>Kind</th>
-            <th>Permits</th>
-            <th>Circuit</th>
-            <th>Failures</th>
-            <th>Child Exits</th>
-          </tr>
-        </thead>
-        <tbody id="backends-body"></tbody>
-      </table>
-    </section>
-    <section class="panel">
-      <div class="panel-title">Request Counters</div>
-      <table>
-        <thead>
-          <tr>
-            <th>Protocol</th>
-            <th>Endpoint</th>
-            <th>Status</th>
-            <th>Count</th>
-          </tr>
-        </thead>
-        <tbody id="requests-body"></tbody>
-      </table>
-    </section>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab-btn active" data-tab="topology">Topology &amp; Health</button>
+      <button class="tab-btn" data-tab="playground">Route Playground</button>
+      <button class="tab-btn" data-tab="waterfall">Trace Waterfall</button>
+    </nav>
+
+    <div id="tab-topology" class="tab-pane active">
+      <section class="cards" id="cards"></section>
+      <section class="panel">
+        <div class="panel-title">
+          <span>Backends &amp; Circuit Breakers</span>
+          <span class="status-banner" id="circuit-msg"></span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Backend</th>
+              <th>Kind</th>
+              <th>Permits</th>
+              <th>Circuit</th>
+              <th>Failures</th>
+              <th>Child Exits</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="backends-body"></tbody>
+        </table>
+      </section>
+      <section class="panel">
+        <div class="panel-title">Request Counters</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Protocol</th>
+              <th>Endpoint</th>
+              <th>Status</th>
+              <th>Count</th>
+            </tr>
+          </thead>
+          <tbody id="requests-body"></tbody>
+        </table>
+      </section>
+    </div>
+
+    <div id="tab-playground" class="tab-pane">
+      <section class="panel">
+        <div class="panel-title">
+          <span>Interactive Route Playground (POST /v1/chat/completions)</span>
+          <button id="pg-send" class="btn btn-primary" type="button">Send Prompt</button>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label for="pg-model">Model / Route</label>
+            <input id="pg-model" list="pg-models-list" placeholder="default" />
+            <datalist id="pg-models-list"></datalist>
+          </div>
+          <div class="field">
+            <label for="pg-session">Session ID (optional)</label>
+            <input id="pg-session" placeholder="playground-session" />
+          </div>
+          <div class="field">
+            <label for="pg-stream">Streaming</label>
+            <select id="pg-stream">
+              <option value="true" selected>SSE Stream (stream=true)</option>
+              <option value="false">Buffered JSON (stream=false)</option>
+            </select>
+          </div>
+        </div>
+        <div class="playground-body">
+          <div class="field">
+            <label for="pg-prompt">Prompt</label>
+            <textarea id="pg-prompt" rows="4">Reply with a concise one-line status greeting.</textarea>
+          </div>
+          <div class="split">
+            <div>
+              <div class="card-label" style="margin-bottom:4px;">Assistant Output</div>
+              <pre id="pg-output" class="box"></pre>
+            </div>
+            <div>
+              <div class="card-label" style="margin-bottom:4px;">Routing &amp; Cache Headers</div>
+              <pre id="pg-headers" class="box"></pre>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div id="tab-waterfall" class="tab-pane">
+      <section class="panel">
+        <div class="panel-title">
+          <span>Recent Request Traces (GET /v1/traces)</span>
+          <button id="wf-refresh" class="btn" type="button">Refresh Now</button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Request ID</th>
+              <th>Route</th>
+              <th>Backend</th>
+              <th>Cache</th>
+              <th>Status</th>
+              <th>Tokens (in/out)</th>
+              <th>Timing (TTFT / Total)</th>
+              <th>Waterfall</th>
+            </tr>
+          </thead>
+          <tbody id="traces-body"></tbody>
+        </table>
+      </section>
+    </div>
   </div>
+
   <script>
+    const tokenInput = document.getElementById("api-token");
+    tokenInput.value = sessionStorage.getItem("vouch_ui_token") || "";
+    tokenInput.addEventListener("input", () => {
+      sessionStorage.setItem("vouch_ui_token", tokenInput.value.trim());
+    });
+
+    function authHeaders(extra = {}) {
+      const h = Object.assign({}, extra);
+      const tok = tokenInput.value.trim();
+      if (tok) h["Authorization"] = "Bearer " + tok;
+      return h;
+    }
+
+    for (const btn of document.querySelectorAll(".tab-btn")) {
+      btn.addEventListener("click", () => {
+        for (const b of document.querySelectorAll(".tab-btn")) b.classList.remove("active");
+        for (const p of document.querySelectorAll(".tab-pane")) p.classList.remove("active");
+        btn.classList.add("active");
+        document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+        if (btn.dataset.tab === "waterfall") loadTraces();
+        if (btn.dataset.tab === "playground") loadModels();
+      });
+    }
+
     function parseProm(text) {
       const permits = {}, okExits = {}, errExits = {}, reqs = [];
-      let fallbacks = 0, rateLimits = 0;
+      let fallbacks = 0, rateLimits = 0, coalesced = 0;
       for (const raw of text.split("\n")) {
         const line = raw.trim();
         if (!line || line.startsWith("#")) continue;
@@ -165,11 +383,13 @@
           reqs.push({ protocol: labels.protocol || "-", endpoint: labels.endpoint || "-", status: labels.status || "-", count: val });
         } else if (name === "vouch_fallbacks_total") {
           fallbacks += val;
+        } else if (name === "vouch_coalesced_requests_total") {
+          coalesced += val;
         } else if (name === "vouch_token_rate_limited_total") {
           rateLimits += val;
         }
       }
-      return { permits, okExits, errExits, reqs, fallbacks, rateLimits };
+      return { permits, okExits, errExits, reqs, fallbacks, rateLimits, coalesced };
     }
 
     function addCell(tr, text, cls) {
@@ -194,6 +414,7 @@
         ["Routes", health ? String(health.models) : "-"],
         ["Auth Mode", health && health.tokens_enforced ? "Enforced" : "Local"],
         ["Fallbacks", String(m.fallbacks)],
+        ["Coalesced", String(m.coalesced)],
         ["Rate Limits", String(m.rateLimits)],
       ];
       for (const [label, val] of items) {
@@ -208,6 +429,26 @@
         card.appendChild(l);
         card.appendChild(v);
         root.appendChild(card);
+      }
+    }
+
+    async function resetCircuit(backendId) {
+      const msg = document.getElementById("circuit-msg");
+      msg.textContent = "Resetting " + backendId + "...";
+      try {
+        const res = await fetch("/admin/circuits/" + encodeURIComponent(backendId) + "/reset", {
+          method: "POST",
+          headers: authHeaders(),
+        });
+        if (res.ok) {
+          msg.textContent = "Reset circuit for " + backendId;
+          await refresh();
+        } else {
+          const body = await res.text();
+          msg.textContent = "Reset failed (" + res.status + "): " + body.slice(0, 120);
+        }
+      } catch (err) {
+        msg.textContent = "Reset error: " + String(err);
       }
     }
 
@@ -245,6 +486,15 @@
           addCell(tr, cText, cls);
           addCell(tr, String(b.consecutive_failures));
           addCell(tr, ok + " ok / " + err + " err");
+
+          const actionTd = document.createElement("td");
+          const btn = document.createElement("button");
+          btn.className = "btn";
+          btn.type = "button";
+          btn.textContent = "Reset Circuit";
+          btn.addEventListener("click", () => resetCircuit(b.id));
+          actionTd.appendChild(btn);
+          tr.appendChild(actionTd);
           bBody.appendChild(tr);
         }
 
@@ -259,11 +509,159 @@
           addCell(tr, String(row.count));
           rBody.appendChild(tr);
         }
+
+        if (document.getElementById("tab-waterfall").classList.contains("active")) {
+          await loadTraces();
+        }
       } catch (err) {
         document.getElementById("meta").textContent = "poll error: " + String(err);
       }
     }
 
+    async function loadModels() {
+      try {
+        const res = await fetch("/v1/models", { headers: authHeaders() });
+        if (!res.ok) return;
+        const json = await res.json();
+        const dl = document.getElementById("pg-models-list");
+        dl.replaceChildren();
+        const input = document.getElementById("pg-model");
+        const ids = (json.data || []).map((m) => m.id);
+        for (const id of ids) {
+          const opt = document.createElement("option");
+          opt.value = id;
+          dl.appendChild(opt);
+        }
+        if (!input.value && ids.length > 0) input.value = ids[0];
+      } catch (_) {}
+    }
+
+    async function loadTraces() {
+      const tbody = document.getElementById("traces-body");
+      try {
+        const res = await fetch("/v1/traces", { headers: authHeaders() });
+        if (!res.ok) {
+          tbody.replaceChildren();
+          const tr = document.createElement("tr");
+          addCell(tr, "HTTP " + res.status + " (enter bearer token above if enabled)", "warn");
+          tbody.appendChild(tr);
+          return;
+        }
+        const json = await res.json();
+        const list = json.traces || [];
+        const maxTotal = Math.max(1, ...list.map((t) => t.total_ms || 1));
+        tbody.replaceChildren();
+        for (const t of list) {
+          const tr = document.createElement("tr");
+          addCell(tr, t.request_id.slice(0, 14));
+          addCell(tr, t.route);
+          addCell(tr, t.profile_id ? (t.backend + ":" + t.profile_id) : t.backend);
+          addCell(tr, t.coalesced ? "coalesced" : t.cache, t.coalesced || t.cache === "hit" ? "ok" : "info");
+          addCell(tr, String(t.status), t.status < 400 ? "ok" : "err");
+          addCell(tr, t.prompt_tokens + " / " + t.completion_tokens);
+          addCell(tr, t.ttft_ms + "ms / " + t.total_ms + "ms");
+
+          const wfTd = document.createElement("td");
+          const bar = document.createElement("div");
+          bar.className = "waterfall-bar";
+          const totalPct = Math.min(100, Math.round(((t.total_ms || 1) / maxTotal) * 100));
+          const ttftMs = Math.min(t.ttft_ms || 0, t.total_ms || 0);
+          const ttftPct = Math.min(totalPct, Math.round((ttftMs / maxTotal) * 100));
+          const tailPct = Math.max(0, totalPct - ttftPct);
+          const s1 = document.createElement("div");
+          s1.className = "wf-ttft";
+          s1.style.width = ttftPct + "%";
+          const s2 = document.createElement("div");
+          s2.className = "wf-tail";
+          s2.style.width = tailPct + "%";
+          bar.appendChild(s1);
+          bar.appendChild(s2);
+          wfTd.appendChild(bar);
+          tr.appendChild(wfTd);
+          tbody.appendChild(tr);
+        }
+      } catch (err) {
+        tbody.replaceChildren();
+        const tr = document.createElement("tr");
+        addCell(tr, "Trace fetch error: " + String(err), "err");
+        tbody.appendChild(tr);
+      }
+    }
+
+    document.getElementById("wf-refresh").addEventListener("click", loadTraces);
+
+    document.getElementById("pg-send").addEventListener("click", async () => {
+      const outEl = document.getElementById("pg-output");
+      const hdrEl = document.getElementById("pg-headers");
+      const model = document.getElementById("pg-model").value.trim();
+      const prompt = document.getElementById("pg-prompt").value;
+      const sessionId = document.getElementById("pg-session").value.trim();
+      const stream = document.getElementById("pg-stream").value === "true";
+
+      outEl.textContent = "Dispatching request...\n";
+      hdrEl.textContent = "";
+      const headers = authHeaders({ "Content-Type": "application/json" });
+      if (sessionId) headers["X-Session-ID"] = sessionId;
+
+      const body = {
+        messages: [{ role: "user", content: prompt }],
+        stream,
+      };
+      if (model) body.model = model;
+
+      const started = performance.now();
+      try {
+        const res = await fetch("/v1/chat/completions", {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        });
+        const hdrLines = ["HTTP " + res.status];
+        for (const name of ["x-vouch-backend", "x-vouch-fallback", "x-vouch-request-id", "x-vouch-cache", "x-vouch-coalesced"]) {
+          const val = res.headers.get(name);
+          if (val !== null) hdrLines.push(name + ": " + val);
+        }
+        hdrEl.textContent = hdrLines.join("\n");
+
+        if (!res.ok) {
+          outEl.textContent = await res.text();
+          return;
+        }
+        if (!stream || !res.body) {
+          const json = await res.json();
+          const msg = json.choices && json.choices[0] && json.choices[0].message ? json.choices[0].message.content : JSON.stringify(json, null, 2);
+          outEl.textContent = msg + "\n\n[" + Math.round(performance.now() - started) + "ms]";
+          return;
+        }
+        outEl.textContent = "";
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() || "";
+          for (const raw of lines) {
+            const line = raw.trim();
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (data === "[DONE]") continue;
+            try {
+              const obj = JSON.parse(data);
+              const delta = obj.choices && obj.choices[0] && obj.choices[0].delta && obj.choices[0].delta.content;
+              if (delta) outEl.textContent += delta;
+            } catch (_) {}
+          }
+        }
+        hdrEl.textContent += "\nelapsed: " + Math.round(performance.now() - started) + "ms";
+      } catch (err) {
+        outEl.textContent = "Request error: " + String(err);
+      }
+    });
+
+    loadModels();
     refresh();
     setInterval(refresh, 2000);
   </script>
