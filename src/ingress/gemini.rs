@@ -717,7 +717,7 @@ fn gemini_chunk_json(
 fn gemini_error_json(error: &GatewayError) -> Value {
     let code = error.status().as_u16();
     let status = match error.status() {
-        StatusCode::BAD_REQUEST => "INVALID_ARGUMENT",
+        StatusCode::BAD_REQUEST | StatusCode::UNSUPPORTED_MEDIA_TYPE => "INVALID_ARGUMENT",
         StatusCode::UNAUTHORIZED => "UNAUTHENTICATED",
         StatusCode::FORBIDDEN => "PERMISSION_DENIED",
         StatusCode::NOT_FOUND => "NOT_FOUND",
@@ -735,7 +735,7 @@ fn gemini_error_json(error: &GatewayError) -> Value {
     })
 }
 
-fn into_gemini_error_response(error: GatewayError) -> Response {
+pub(crate) fn into_gemini_error_response(error: GatewayError) -> Response {
     let status = error.status();
     let body = gemini_error_json(&error);
     (status, Json(body)).into_response()
