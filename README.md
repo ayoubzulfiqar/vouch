@@ -92,9 +92,9 @@ Processes are supervised, not just spawned. Each child runs in its own process g
 ## Requirements
 
 - Rust 2024 toolchain (`rustup toolchain install stable` and `rustup update`)
-- Linux, macOS, or another Unix for full process-group supervision (non-Unix builds omit the Unix-only signal/PGID paths)
+- Linux, macOS, or other Unix for PGID `SIGTERM`/`SIGKILL` supervision, or Windows with Win32 Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) supervision and `.cmd`/`.bat` prompt spillover
 - At least one configured backend: a reachable local HTTP daemon, or an executable on `PATH` (or an absolute path)
-- Optional: `git` for workspace isolation, `systemd --user` or `launchd` for service installation
+- Optional: `git` for workspace isolation; `systemd --user` (Linux), `launchd` (macOS), or Task Scheduler/`sc.exe` guidance (`vouch service install` on Windows)
 
 `reqwest` is built with `default-features = false` and the `rustls` feature — no system OpenSSL is required. Keep it that way; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -178,7 +178,7 @@ model = "coding/default"
 id = "local-agent"
 kind = "cli"
 command = "codex"
-args = ["exec", "{prompt}"]
+args = ["exec", "--", "{prompt}"]
 # prompt transport is satisfied by {prompt} in args, or by stdin = true
 
 [routes]
@@ -192,9 +192,10 @@ Everything else has a default. Start from the example config in production — i
 | Section | Field | Default | Meaning |
 | --- | --- | --- | --- |
 | `server` | `tcp_listen` | `127.0.0.1:8080` | TCP bind address |
-| | `unix_socket` | unset | Optional Unix socket path, created `0600` |
+| | `unix_socket` | unset | Optional Unix socket path (`< 100` bytes on macOS/BSD), created `0600` in a `0700` dir |
 | | `request_timeout_secs` | `300` | Deadline for non-streaming requests, including workspace setup |
 | | `stream_timeout_secs` | `900` | Maximum lifetime of one streaming response |
+| | `shutdown_drain_secs` | `15` | Graceful drain window before cancelling in-flight requests |
 | | `keep_alive_interval_secs` | `15` | SSE keep-alive comment interval; `0` disables |
 | | `max_body_bytes` | `8388608` | Maximum request body; must be > 0 |
 | | `log_level` | `"info"` | Tracing filter; `RUST_LOG` wins |
@@ -213,6 +214,7 @@ Everything else has a default. Start from the example config in production — i
 | | `ttl_secs` | `3600` | Cached response lifetime in seconds |
 | | `max_temperature` | `0.2` | Requests with temperature above this bypass the cache |
 | | `persist` | `false` | Save/restore unexpired cache entries in `defaults.state_dir` |
+| | `max_coalesce_waiters` | `64` | Maximum queued callers per in-flight singleflight leader (`503` when exceeded) |
 | `attachments` | `fetch_remote_urls` | `false` | Download remote `http(s)://` `image_url` payloads on CLI/PTY backends |
 | | `max_image_bytes` | `10485760` | Maximum downloaded image payload size in bytes (10 MiB) |
 | | `allow_private_ips` | `false` | Block loopback/private/link-local IPs to prevent SSRF unless enabled |
@@ -320,6 +322,7 @@ target_route = "coding/default"
 | `max_concurrent` | unlimited | Maximum concurrent in-flight requests/streams held by this token |
 | `expires_at` | unset | RFC-3339 expiration timestamp (`YYYY-MM-DDTHH:MM:SSZ` or offset; rejects with `401`) |
 | `allowed_models` | all models | Glob patterns matching requested alias or resolved route, e.g. `["coding/*", "gpt-4o"]` |
+| `allowed_mcp_tools` | unset | Optional glob allowlist for MCP `tools/call` / `tasks/create`; when unset and `allowed_models` is restricted, `<upstream>__*` tools are denied (`403`/`-32003`) |
 | `allowed_backends` | all backends | Optional backend id allowlist enforced during route dispatch (`403` when none permitted) |
 | `admin` | `false` | Grants access to `POST /admin/reload`, `/admin/circuits/{backend}/reset`, and `DELETE /admin/cache` |
 
@@ -348,7 +351,8 @@ Credentials are SHA-256 hashed and compared in constant time against every confi
 - `cli`/`pty` backends without a prompt transport (`stdin = true` or `{prompt}` in `args`)
 - `http` backends without `base_url`, or with a `command`
 - `workspace.enabled = true` without `repo_path`, and `isolate_workspace = true` while workspace isolation is disabled
-- tokens shorter than 8 characters, `rpm = 0`, or invalid glob patterns
+- `server.unix_socket` paths ≥ 100 bytes (incompatible with macOS/BSD `sockaddr_un`) or `cache.max_coalesce_waiters = 0`
+- tokens shorter than 8 characters, `rpm = 0`, or invalid `allowed_models` / `allowed_backends` / `allowed_mcp_tools` glob patterns
 
 ### Hot reload
 
@@ -373,7 +377,7 @@ curl -s http://127.0.0.1:8080/healthz
 curl -s --unix-socket /run/user/1000/vouch.sock http://localhost/healthz
 ```
 
-CLI overrides: `vouch serve -c vouch.toml --tcp-listen 127.0.0.1:9090 --unix-socket /tmp/vouch.sock`. The socket is created with mode `0600` and removed on graceful shutdown. A stale socket at that path is removed at startup.
+CLI overrides: `vouch serve -c vouch.toml --tcp-listen 127.0.0.1:9090 --unix-socket /tmp/vouch.sock`. Parent directories owned by the user (excluding sticky dirs like `/tmp`) are hardened to `0700`, an active listener at the path fails cleanly rather than being unlinked, and the bound socket is set to `0600` and removed on graceful shutdown.
 
 | Header | Direction | Meaning |
 | --- | --- | --- |
@@ -626,11 +630,13 @@ To let a Docker Compose orchestrator (such as ARTEX, Open WebUI, or LiteLLM) rea
 
 - **Default listener is loopback only.** Keep it that way unless the host is isolated. The optional Unix socket is created with mode `0600`.
 - **Local mode is intentionally permissive.** With no `[[tokens]]`, any (or no) credential is accepted. Never bind a non-loopback address in that mode.
-- **Token enforcement** is constant-time over SHA-256 hashes, with sliding-window RPM limits and glob-scoped model access. Prefer long random tokens stored in your orchestrator's secret store, not in source.
-- **Do not commit secrets.** Use `api_key_env` for HTTP upstreams and `env` for subprocess backends. Configured secrets are harvested into the log redactor; `Bearer ...`, `sk-...`, common secret JSON fields, `x-api-key`, and configured literals are scrubbed from structured logs and client-visible errors.
+- **Browser & CSWSH protection.** `POST` calls to `/v1/*`, `/api/*`, `/mcp`, `/admin/*`, and `/v1beta/*` require `Content-Type: application/json` (`415 Unsupported Media Type` otherwise), and `GET /v1/responses` WebSocket upgrades carrying an `Origin` header are rejected with `403 Forbidden` unless `server.cors_permissive = true`.
+- **Token enforcement** is constant-time over SHA-256 hashes, with sliding-window RPM/TPM limits, UTC daily token budgets, `allowed_models`/`allowed_backends`/`allowed_mcp_tools` scoping, and pre-execution quota reservations. Prefer long random tokens stored in your orchestrator's secret store, not in source.
+- **Do not commit secrets.** Use `api_key_env` for HTTP upstreams and `env` for subprocess backends. Configured secrets are harvested into the log redactor; `Bearer ...`, `sk-...`, common secret JSON fields, `x-api-key`, upstream MCP `error.message`/`error.data`, and configured literals are scrubbed from structured logs and client-visible errors.
+- **SSRF & temp-file isolation.** Remote image downloads cap redirects at `3` hops and block `0.0.0.0/8`, loopback, private, link-local, CGNAT, unique-local/site-local IPv6, and `::ffff:0:0/96` / IPv4-compatible IPv6 targets unless `attachments.allow_private_ips = true`. Temporary files and worktrees use `O_EXCL` (`0600`) creation and reject path-traversal session keys (`""`, `.`, `..`, `/`, `\`, `\0`).
 - **Ops endpoints are unauthenticated by design.** `/healthz`, `/readyz`, and `/metrics` expose backend ids, health state, and counters — never credentials or prompts. Keep them behind network controls if that metadata is sensitive.
 - **CORS is off by default.** Only set `cors_permissive = true` for a trusted browser client.
-- **Process isolation.** Children run in their own process group and are killed as a group on timeout, error, or disconnect. Worktree isolation optionally hides your main checkout from code-writing agents.
+- **Process isolation.** Unix children run in their own PGID (`SIGTERM` -> 500 ms -> `SIGKILL`), Windows children attach to a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job Object (with forced file spillover for `.cmd`/`.bat` shims when `stdin = false`), and CLI templates place `--` before `{prompt}` to prevent flag injection. Worktree isolation optionally hides your main checkout from code-writing agents.
 - **Reporting.** Private vulnerability reports and response expectations are in [SECURITY.md](SECURITY.md). Do not open a public issue for a security flaw.
 
 ## Observability
@@ -638,7 +644,7 @@ To let a Docker Compose orchestrator (such as ARTEX, Open WebUI, or LiteLLM) rea
 `GET /healthz` — liveness:
 
 ```json
-{"status":"ok","version":"4.0.0","uptime_secs":42,"models":3,"backends":3,
+{"status":"ok","version":"5.0.0","uptime_secs":42,"models":3,"backends":3,
  "tokens_enforced":true,"workspace_enabled":false}
 ```
 
@@ -677,15 +683,17 @@ Logs are structured JSON with automatic secret redaction (including URL query pa
 | --- | --- | --- |
 | `vouch serve` | `-c/--config`, `--tcp-listen`, `--unix-socket` | Run the daemon in the foreground. Handles `SIGHUP` reload; drains on `SIGINT`/`SIGTERM`. |
 | `vouch routes` | `-c/--config`, `--json` | Validate config and print the model → backend fallback table; `--json` prints the raw route map. |
-| `vouch doctor` | `-c/--config`, `--json` | Check configured binaries, auth-file metadata, daemon reachability, and run one live request per backend (`probe_timeout_secs` for CLI/PTY, `5s` for HTTP). Exits `2` when a check fails. |
+| `vouch replay` | `-c/--config`, `--file`, `--route`, `--limit`, `--json` | Replay captured JSONL `[flight_recorder]` requests offline against configured routes |
+| `vouch config diff` | `--current`, `--candidate`, `--json` | Compute semantic config diffs without exposing raw secret values |
+| `vouch doctor` | `-c/--config`, `--fix`, `--yes`, `--json` | Check configured binaries, auth-file metadata, daemon reachability, and probe each backend; `--fix` repairs missing CLI/daemon targets. Exits `2` on failure. |
 | `vouch mcp` | `-c/--config`, `--transport`, `--bind` | Expose routes as MCP JSON-RPC tools (`2024-11-05` + `2026-07-28`, async `tasks/*`) over `stdio` or HTTP (`POST /mcp`). |
 | `vouch top` | `--url`, `--unix-socket`, `--interval-ms`, `--token` | Live terminal UI polling `/healthz`, `/readyz`, `/metrics`, and `/v1/usage` (USD cost, hedged wins, cache hits, `AUTH_EXPIRED`) |
 | `vouch token create` | `--name`, `--rpm`, `--allow` | Generate a 256-bit `vouch_live_...` virtual token and print a ready-to-paste `[[tokens]]` TOML block. |
 | `vouch bench` | `-c/--config`, `-m/--model`, `-n/--requests`, `--concurrency`, `--prompt`, `--stream`, `--json` | Benchmark configured routes end-to-end for TTFT, p50/p95 latency, throughput, and fallbacks. |
 | `vouch stats` | `--url`, `--unix-socket`, `--token`, `--json` | Fetch and display cumulative per-token/per-backend usage & latency analytics from `GET /v1/usage`. |
 | `vouch init` | `-o/--output`, `--docker-bridge`, `--force` | Scan host agent CLIs & local daemons and write a validated `0600` `vouch.toml`. |
-| `vouch service install` | `-c/--config`, `--binary`, `--no-start` | Write and enable a user systemd unit (Linux) or launchd agent (macOS). |
-| `vouch service uninstall` | `--no-stop` | Stop, disable, and remove the user service. |
+| `vouch service install` | `-c/--config`, `--binary`, `--no-start` | Write/enable a systemd unit (Linux), launchd agent (macOS), or print `schtasks.exe`/`sc.exe` setup commands (Windows). |
+| `vouch service uninstall` | `--no-stop` | Stop, disable, and remove the user service (or print Windows cleanup instructions). |
 
 `doctor` actually executes CLI/PTY backends with a tiny `Reply with OK.` prompt (using `[discovery].probe_timeout_secs`, default `30` seconds) and sends an HTTP GET to HTTP backends; budget for that on a production config. It never prints credential contents.
 
@@ -709,7 +717,7 @@ systemctl --user reload vouch.service   # SIGHUP triggers atomic reload
 vouch service uninstall
 ```
 
-On macOS the agent is `com.ayoubzulfiqar.vouch`, installed at `~/Library/LaunchAgents/com.ayoubzulfiqar.vouch.plist` and managed with `launchctl load`/`unload`. The generated systemd unit uses `Restart=on-failure`, `KillMode=control-group`, `ExecReload=/bin/kill -HUP $MAINPID`, and a `0600` file mode.
+On macOS the agent is `com.ayoubzulfiqar.vouch`, installed at `~/Library/LaunchAgents/com.ayoubzulfiqar.vouch.plist` and managed with `launchctl load`/`unload`. On Windows, `vouch service install` prints ready-to-run `schtasks.exe` and `sc.exe` registration commands. The generated systemd unit uses `Restart=on-failure`, `KillMode=control-group`, `ExecReload=/bin/kill -HUP $MAINPID`, and a `0600` file mode.
 
 `systemctl --user reload vouch.service` sends `SIGHUP` to the daemon, which swaps the configuration atomically without dropping in-flight requests.
 
