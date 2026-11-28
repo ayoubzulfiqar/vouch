@@ -260,6 +260,9 @@ async fn run_single_sample(
         delta_messages: None,
         session_capture: Arc::new(parking_lot::Mutex::new(None)),
         trace_context: None,
+        profile_id: None,
+        profile_env: std::collections::BTreeMap::new(),
+        allowed_backends: None,
         extra: serde_json::Map::new(),
     };
 
