@@ -4,7 +4,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -100,6 +100,24 @@ pub enum InflightResult {
     Aborted,
 }
 
+#[derive(Debug)]
+struct InflightSlot {
+    tx: watch::Sender<Option<InflightResult>>,
+    waiters: Arc<AtomicUsize>,
+}
+
+/// RAII counter guard decrementing queued singleflight waiter count on drop.
+#[derive(Debug)]
+pub struct CoalesceWaiterGuard {
+    waiters: Arc<AtomicUsize>,
+}
+
+impl Drop for CoalesceWaiterGuard {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Role returned by [`ResponseCache::begin_or_join_inflight`].
 pub enum CoalesceRole {
     /// Coalescing is inactive for this request (execute directly without registering).
@@ -107,13 +125,15 @@ pub enum CoalesceRole {
     /// Caller won leadership; executes upstream once and notifies waiting peers via [`InflightLeaderGuard`].
     Leader(InflightLeaderGuard),
     /// Caller joined an identical active execution and awaits the leader's [`InflightResult`].
-    Waiter(watch::Receiver<Option<InflightResult>>),
+    Waiter(watch::Receiver<Option<InflightResult>>, CoalesceWaiterGuard),
+    /// In-flight waiter limit (`cache.max_coalesce_waiters`) reached for this key.
+    Saturated,
 }
 
 /// RAII singleflight leader guard that removes the key and unblocks waiters on drop.
 pub struct InflightLeaderGuard {
     key: String,
-    inflight: Arc<DashMap<String, watch::Sender<Option<InflightResult>>>>,
+    inflight: Arc<DashMap<String, InflightSlot>>,
     tx: watch::Sender<Option<InflightResult>>,
     finished: bool,
 }
@@ -142,7 +162,7 @@ impl Drop for InflightLeaderGuard {
 pub struct ResponseCache {
     config: ArcSwap<CacheConfig>,
     entries: DashMap<String, CachedEntry>,
-    inflight: Arc<DashMap<String, watch::Sender<Option<InflightResult>>>>,
+    inflight: Arc<DashMap<String, InflightSlot>>,
     next_seq: AtomicU64,
 }
 
@@ -268,11 +288,29 @@ impl ResponseCache {
         }
         match self.inflight.entry(key.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(occupied) => {
-                CoalesceRole::Waiter(occupied.get().subscribe())
+                let slot = occupied.get();
+                let limit = cfg.max_coalesce_waiters.max(1);
+                let acquired =
+                    slot.waiters
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                            (current < limit).then_some(current + 1)
+                        });
+                match acquired {
+                    Ok(_) => CoalesceRole::Waiter(
+                        slot.tx.subscribe(),
+                        CoalesceWaiterGuard {
+                            waiters: slot.waiters.clone(),
+                        },
+                    ),
+                    Err(_) => CoalesceRole::Saturated,
+                }
             }
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
                 let (tx, _rx) = watch::channel(None);
-                vacant.insert(tx.clone());
+                vacant.insert(InflightSlot {
+                    tx: tx.clone(),
+                    waiters: Arc::new(AtomicUsize::new(0)),
+                });
                 CoalesceRole::Leader(InflightLeaderGuard {
                     key: key.to_string(),
                     inflight: self.inflight.clone(),
