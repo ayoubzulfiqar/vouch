@@ -22,8 +22,9 @@ use crate::{
         AttachmentsConfig, AutoRespondRule, BackendConfig, BackendKind, DefaultsConfig, OutputMode,
     },
     driver::{
-        AnsiStripper, ChunkStream, Driver, DriverResponse, ExecutionRequest, PermitGuard,
-        ProcessGroupGuard, ResponseFormat, StreamChunk, Utf8ChunkDecoder,
+        AnsiStripper, ChunkStream, Driver, DriverResponse, ExecutionRequest, OutputFilterSet,
+        PermitGuard, ProcessGroupGuard, ResponseFormat, StreamChunk, StreamOutputFilterAdapter,
+        Utf8ChunkDecoder,
         attachments::{PromptSpillFile, TempAttachmentGuard, materialize_prompt_with_config},
         capture_session_id, classify_cli_failure, dispatch_stream_chunks, emit_subprocess_tail,
         finalize_subprocess_completion, finish_subprocess_text_stream, io_error, strip_ansi,
@@ -97,6 +98,7 @@ struct SpawnedPty {
 pub struct PtyRunnerDriver {
     config: BackendConfig,
     attachments: AttachmentsConfig,
+    output_filters: OutputFilterSet,
     semaphore: Arc<Semaphore>,
     queue_timeout: Duration,
 }
@@ -110,10 +112,12 @@ impl PtyRunnerDriver {
                 .unwrap_or(defaults.queue_timeout_ms)
                 .max(1),
         );
+        let output_filters = OutputFilterSet::compile(&config.output_filters)?;
         Ok(Self {
             semaphore: Arc::new(Semaphore::new(config.max_concurrency.max(1))),
             config,
             attachments: AttachmentsConfig::default(),
+            output_filters,
             queue_timeout,
         })
     }
@@ -437,7 +441,7 @@ impl PtyRunnerDriver {
             Ok((raw, exit)) => {
                 guard.disarm();
                 metrics::record_child_exit(&self.config.id, &exit.metric_code());
-                let text = strip_ansi(&raw);
+                let text = self.output_filters.apply(&strip_ansi(&raw));
                 if !exit.success {
                     return Err(classify_cli_failure(
                         &self.config.id,
@@ -490,6 +494,7 @@ impl PtyRunnerDriver {
         let backend = self.config.id.clone();
         let output_mode = self.config.output_mode;
         let session_id_regex = self.config.session_id_regex.clone();
+        let output_filters = self.output_filters.clone();
         let parse_tools = !request.tools.is_empty();
         let response_format: Option<ResponseFormat> = request.response_format.clone();
         let model = request.model.clone();
@@ -507,6 +512,7 @@ impl PtyRunnerDriver {
             let mut utf8_decoder = Utf8ChunkDecoder::new();
             let mut stripper = AnsiStripper::new();
             let mut filter = SubprocessStreamFilter::new(parse_tools, response_format.clone());
+            let mut out_filter = StreamOutputFilterAdapter::new(output_filters);
             let mut json_buffer = String::new();
             let mut line_buffer = String::new();
             let mut produced = String::new();
@@ -566,10 +572,13 @@ impl PtyRunnerDriver {
                 produced.push_str(&stripped);
                 match output_mode {
                     OutputMode::Text => {
-                        let chunks = filter.push(&stripped);
-                        if !dispatch_stream_chunks(&sender, chunks).await {
-                            guard.terminate();
-                            return;
+                        let filtered = out_filter.push(&stripped);
+                        if !filtered.is_empty() {
+                            let chunks = filter.push(&filtered);
+                            if !dispatch_stream_chunks(&sender, chunks).await {
+                                guard.terminate();
+                                return;
+                            }
                         }
                     }
                     OutputMode::Json => json_buffer.push_str(&stripped),
@@ -581,7 +590,8 @@ impl PtyRunnerDriver {
                             if line.trim().is_empty() {
                                 continue;
                             }
-                            let delta = crate::driver::cli_pipe::jsonl_line_to_delta(line);
+                            let delta = out_filter
+                                .apply_raw(&crate::driver::cli_pipe::jsonl_line_to_delta(line));
                             if !delta.is_empty()
                                 && sender.send(Ok(StreamChunk::delta(delta))).await.is_err()
                             {
@@ -594,20 +604,27 @@ impl PtyRunnerDriver {
             }
 
             let tail_utf8 = utf8_decoder.finish();
+            let mut tail_combined = String::new();
             if !tail_utf8.is_empty() {
                 let stripped_tail = stripper.feed(tail_utf8.as_bytes());
                 if !stripped_tail.is_empty() {
                     produced.push_str(&stripped_tail);
                     match output_mode {
                         OutputMode::Text => {
-                            let chunks = filter.push(&stripped_tail);
-                            if !dispatch_stream_chunks(&sender, chunks).await {
-                                guard.terminate();
-                                return;
-                            }
+                            tail_combined.push_str(&out_filter.push(&stripped_tail));
                         }
                         OutputMode::Json => json_buffer.push_str(&stripped_tail),
                         OutputMode::JsonLines => line_buffer.push_str(&stripped_tail),
+                    }
+                }
+            }
+            if output_mode == OutputMode::Text {
+                tail_combined.push_str(&out_filter.finish());
+                if !tail_combined.is_empty() {
+                    let chunks = filter.push(&tail_combined);
+                    if !dispatch_stream_chunks(&sender, chunks).await {
+                        guard.terminate();
+                        return;
                     }
                 }
             }
