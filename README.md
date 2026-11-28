@@ -8,11 +8,13 @@ A local authentication multiplexer and process-supervised gateway for AI orchest
 
 `vouch` runs under your host user account, binds only to loopback (and an optional `0600` Unix socket by default), and adds policy in the middle: routing, fallback chains, circuit breakers, sticky sessions, per-token quotas, worktree isolation, redacted logs, and process-group supervision.
 
-- OpenAI-compatible: `GET /v1/models`, `POST /v1/chat/completions` (JSON, SSE, `response_format`), stateful `POST /v1/responses` (`previous_response_id`, `store`, `text.format`)
+- OpenAI-compatible: `GET /v1/models`, `POST /v1/chat/completions` (JSON, SSE, `response_format`), stateful `POST` + WebSocket `GET /v1/responses` (`previous_response_id`, `store`, `text.format`)
 - Anthropic-compatible: `POST /v1/messages` (JSON, SSE, extended `thinking`, `cache_control`)
-- Multimodal & tool calling: base64/URL images (`0600` temp attachment lifecycle) and `tools` / `tool_calls` / `tool_use` bridged across HTTP, CLI, and PTY backends
-- Dual-spec MCP ingress: `vouch mcp` (`stdio` / HTTP) and `POST /mcp` (`2024-11-05` + stateless `2026-07-28`, `server/discover`, `tasks/*`)
-- Operations & CLI tooling: `GET /healthz`, `GET /readyz`, `GET /metrics`, `vouch top` TUI, `vouch token create`, `vouch bench`, and opt-in `GET /ui` (`server.enable_ui = true`)
+- Google Gemini & Ollama ingress: `POST /v1beta/models/{model}:generateContent` & `:streamGenerateContent`, plus `GET /api/tags`, `POST /api/chat`, and `POST /api/generate` (NDJSON & buffered)
+- Multimodal & tool calling: base64/URL images (`0600` temp attachment lifecycle), parallel multi-tool streaming, schema auto-repair retries, and `tools` / `tool_calls` / `tool_use` bridged across drivers
+- Speculative routing & caching: `ordered`, `least_latency` (EWMA TTFT), and `hedged` strategies (`[route_policies.<model>]`), multi-profile credential rotation (`[[backends.profiles]]`), and deterministic SHA-256 response cache (`[cache]`)
+- Dual-spec MCP ingress: `vouch mcp` (`stdio` / HTTP) and `POST /mcp` (`2024-11-05` + `2026-07-28`, `resources/*`, `prompts/*`, `[[mcp_upstreams]]` aggregation, async `tasks/*`)
+- Operations, budgets & CLI: `GET /healthz`, `/readyz`, `/metrics`, `GET /v1/usage`, `POST /admin/*` (`enable_admin = true`), per-token RPM/TPM/concurrency/expiry/USD pricing, `vouch init`, `vouch stats`, `vouch top`, `vouch token create`, `vouch bench`, and opt-in `GET /ui`
 - Egress: pooled HTTP/SSE proxy, headless stdin/stdout subprocess, and configurable PTY subprocess (`pty_auto_respond`, `idle_timeout_secs`, native session delta resumption)
 - Reload: `SIGHUP` or config-file change atomically swaps configuration without dropping in-flight requests
 
@@ -198,12 +200,19 @@ Everything else has a default. Start from the example config in production — i
 | | `log_level` | `"info"` | Tracing filter; `RUST_LOG` wins |
 | | `cors_permissive` | `false` | Permissive browser CORS |
 | | `enable_ui` | `false` | Serve read-only HTML status dashboard at `GET /ui` |
+| | `enable_admin` | `false` | Enable `POST /admin/reload`, `/admin/circuits/{backend}/reset`, `DELETE /admin/cache` |
 | `defaults` | `model` | unset | Default public model or alias; must resolve when set |
 | | `session_ttl_secs` | `3600` | Idle TTL for sticky sessions and worktrees |
 | | `max_session_entries` | `10000` | Bounded capacity for session affinity and `/v1/responses` stores (evicts oldest) |
-| | `state_dir` | unset | Directory for atomic `0600` persistence across restarts |
+| | `state_dir` | unset | Directory for lock-guarded atomic `0600` persistence across restarts |
 | | `max_concurrency` | `4` | Default per-backend concurrency |
 | | `queue_timeout_ms` | `250` | Permit wait before failover |
+| | `schema_repair_retries` | `0` | Automated CLI/PTY structured output repair follow-up retries (`0..=2`) |
+| `cache` | `enabled` | `false` | Deterministic SHA-256 response cache (`X-Vouch-Cache: HIT|MISS|BYPASS`) |
+| | `max_entries` | `1000` | Maximum cached completions before oldest eviction |
+| | `ttl_secs` | `3600` | Cached response lifetime in seconds |
+| | `max_temperature` | `0.2` | Requests with temperature above this bypass the cache |
+| | `persist` | `false` | Save/restore unexpired cache entries in `defaults.state_dir` |
 | `attachments` | `fetch_remote_urls` | `false` | Download remote `http(s)://` `image_url` payloads on CLI/PTY backends |
 | | `max_image_bytes` | `10485760` | Maximum downloaded image payload size in bytes (10 MiB) |
 | | `allow_private_ips` | `false` | Block loopback/private/link-local IPs to prevent SSRF unless enabled |
@@ -258,8 +267,9 @@ At least one `[[backends]]` is required and ids must be unique.
 | `pty_auto_respond` | `[]` | `[{ pattern, response }]` rules to answer interactive PTY prompts automatically |
 | `resume_args` | `[]` | Argument template for continuing native multi-turn CLI/PTY sessions with delta prompts |
 | `session_id_regex` | unset | Regex extracting `{backend_session_id}` from turn-1 stdout/stderr |
+| `profiles` | `[]` | `[[backends.profiles]]` pool (`id`, `env`, `weight`) for weighted rotation and per-profile circuits |
 
-CLI/PTY children also receive `VOUCH_REQUEST_ID`, `VOUCH_SESSION_ID`, `VOUCH_MODEL`, and (on resumed turns) `VOUCH_BACKEND_SESSION_ID`.
+CLI/PTY children also receive `VOUCH_REQUEST_ID`, `VOUCH_SESSION_ID`, `VOUCH_MODEL`, (on resumed turns) `VOUCH_BACKEND_SESSION_ID`, and (when rotating profiles) `VOUCH_PROFILE_ID`.
 
 Prompts are templated as `arg.replace("{prompt}", prompt).replace("{model}", model)...`. For `output_mode = "json"`, stdout must be a JSON object with a `choices[0].message.content` or `content` field; `json_lines` reads newline-delimited objects and concatenates their text.
 
@@ -276,9 +286,17 @@ A public model name maps to an **ordered** list of backend ids. The sticky backe
 
 At least one route is required, ids must resolve to configured backends, and a chain may not repeat an id.
 
-Optional `[aliases]` and trait-based `[[routing_rules]]` (evaluated before static `[routes]`):
+Optional `[route_policies.<model>]`, `[pricing.<id>]`, `[aliases]`, and trait-based `[[routing_rules]]` (evaluated before static `[routes]`):
 
 ```toml
+[route_policies."coding/default"]
+strategy = "hedged"    # "ordered" (default) | "least_latency" | "hedged"
+hedge_delay_ms = 2500
+
+[pricing."coding/default"]
+input_per_1m_usd = 3.0
+output_per_1m_usd = 15.0
+
 [aliases]
 "gpt-4o" = "coding/default"
 
@@ -297,8 +315,13 @@ target_route = "coding/default"
 | `token` | required | At least 8 characters and unique |
 | `name` | `token-<hash-prefix>` | Label used in logs and metrics |
 | `rpm` | unlimited | Sliding 60-second request cap; must be > 0 when set |
+| `tpm` | unlimited | Sliding 60-second prompt + completion BPE token limit |
 | `daily_token_budget` | unlimited | Rolling UTC-day prompt + completion BPE token limit (`429 daily_token_budget_exceeded`) |
+| `max_concurrent` | unlimited | Maximum concurrent in-flight requests/streams held by this token |
+| `expires_at` | unset | RFC-3339 expiration timestamp (`YYYY-MM-DDTHH:MM:SSZ` or offset; rejects with `401`) |
 | `allowed_models` | all models | Glob patterns matching requested alias or resolved route, e.g. `["coding/*", "gpt-4o"]` |
+| `allowed_backends` | all backends | Optional backend id allowlist enforced during route dispatch (`403` when none permitted) |
+| `admin` | `false` | Grants access to `POST /admin/reload`, `/admin/circuits/{backend}/reset`, and `DELETE /admin/cache` |
 
 ```toml
 [[tokens]]
@@ -361,6 +384,7 @@ CLI overrides: `vouch serve -c vouch.toml --tcp-listen 127.0.0.1:9090 --unix-soc
 | `x-vouch-backend` | out | Backend that served the request |
 | `x-vouch-fallback` | out | `"true"` when an earlier candidate was skipped or failed |
 | `x-vouch-request-id` | out | Effective correlation id |
+| `x-vouch-cache` | out | `HIT`, `MISS`, or `BYPASS` when `[cache].enabled = true` |
 
 An explicit session id is preserved verbatim when it is ≤128 characters and uses only ASCII alphanumeric, `-`, `_`, `.`, or `:`. Longer or unsafe values — and the absence of a header — are replaced with the first 8 bytes of a SHA-256 hash of the system prompt plus first user turn. This gives multi-turn orchestrators a deterministic affinity key without leaking prompt text into headers.
 
@@ -439,13 +463,26 @@ Clients can pass `tools` and `tool_choice` to `/v1/chat/completions`, `/v1/respo
 
 CLI/PTY `usage` counters are computed with `tiktoken-rs` (`cl100k_base` / `o200k_base`).
 
+### Google Gemini & Ollama compatibility
+
+- **Google Gemini (`POST /v1beta/models/{model}:generateContent` and `:streamGenerateContent`):** Accepts `x-goog-api-key` or `?key=`, `systemInstruction`, `contents` (`text`, `inlineData`, `fileData`, `functionCall`, `functionResponse`), `tools.functionDeclarations`, and `generationConfig` (`temperature`, `maxOutputTokens`, `responseMimeType`, `responseSchema`). `:streamGenerateContent` returns SSE events with `?alt=sse` or a streamed JSON array otherwise.
+- **Ollama (`GET /api/tags`, `POST /api/chat`, `POST /api/generate`):** Lists configured models at `/api/tags`; `/api/chat` and `/api/generate` default to `stream: true` (`application/x-ndjson`) or single-object JSON when `stream: false`, mapping `images`, `format`, `options`, and `tools`.
+
+### Runtime admin control endpoints
+
+Disabled by default (`[server].enable_admin = false` → returns `404`). When enabled, requests require a configured token with `admin = true` (or a loopback TCP/Unix socket source when no tokens exist):
+
+- `POST /admin/reload` — atomically validates and reloads TOML configuration without interrupting active streams
+- `POST /admin/circuits/{backend}/reset` — manually closes/resets a backend and all of its profile circuit breakers (`404` on unknown backend)
+- `DELETE /admin/cache` — purges every entry in the deterministic response cache and returns `{ "evicted": N }`
+
 ### MCP server ingress
 
 `vouch` exposes configured routes as MCP (Model Context Protocol, JSON-RPC 2.0) tools over `stdio` or HTTP, supporting both the legacy handshake (`2024-11-05`) and the stateless `2026-07-28` specification:
 
 - `vouch mcp --config vouch.toml` runs over `stdin`/`stdout` (with all logs sent strictly to `stderr` so `stdout` stays pure JSON-RPC).
 - `vouch mcp --config vouch.toml --transport http --bind 127.0.0.1:8081` or `POST /mcp` on the main `vouch serve` daemon exposes the same JSON-RPC handler over HTTP with bearer token enforcement when `[[tokens]]` is configured, validating `Mcp-Method` and `Mcp-Name` headers when present (`-32600` on mismatch).
-- Supported methods: `initialize`, `notifications/initialized`, `server/discover` (`2026-07-28` stateless discovery), `ping`, `tools/list` (`vouch_ask` plus per-route `route_<name>` tools with `ttlMs` / `cacheScope: "private"` metadata), `tools/call`, and async `tasks/create`, `tasks/get`, `tasks/result`, and `tasks/cancel`. W3C Trace Context fields (`_meta.traceparent`, `_meta.tracestate`) propagate into tracing spans.
+- Supported methods: `initialize`, `notifications/initialized`, `server/discover` (`2026-07-28` stateless discovery), `ping`, `tools/list` (`vouch_ask`, per-route `route_<name>` tools, plus namespaced `<upstream>__<tool>` tools from `[[mcp_upstreams]]` with `ttlMs` / `cacheScope: "private"` metadata), `tools/call` (local dispatch or upstream proxy), `resources/list`, `resources/read` (`vouch://health`, `vouch://routes`, `vouch://usage`), `prompts/list`, `prompts/get` (from `[[mcp_prompts]]`), and async `tasks/create`, `tasks/get`, `tasks/result`, and `tasks/cancel`. W3C Trace Context fields (`_meta.traceparent`, `_meta.tracestate`) propagate into tracing spans.
 
 ### Error format
 
@@ -601,11 +638,11 @@ To let a Docker Compose orchestrator (such as ARTEX, Open WebUI, or LiteLLM) rea
 `GET /healthz` — liveness:
 
 ```json
-{"status":"ok","version":"3.0.0","uptime_secs":42,"models":3,"backends":3,
+{"status":"ok","version":"4.0.0","uptime_secs":42,"models":3,"backends":3,
  "tokens_enforced":true,"workspace_enabled":false}
 ```
 
-`GET /v1/usage` — authenticated JSON report exposing cumulative per-token and per-backend requests, errors, BPE token counts, UTC daily budget usage, and `p50`/`p95`/`p99` latency quantiles (zero raw secrets).
+`GET /v1/usage` — authenticated JSON report exposing cumulative per-token and per-backend requests, errors, BPE token counts, estimated `total_cost_usd` (via `[pricing.*]`), UTC daily budget usage, and `p50`/`p95`/`p99` latency quantiles (zero raw secrets).
 
 When `[telemetry].otlp_endpoint` is set, incoming W3C `traceparent`/`tracestate` headers (and MCP `_meta.traceparent`) propagate through `ingress`, `router.dispatch`, `workspace.worktree`, and `driver.exec` child spans exported asynchronously over OTLP/HTTP JSON with redacted attributes.
 
@@ -622,11 +659,13 @@ When `[telemetry].otlp_endpoint` is set, incoming W3C `traceparent`/`tracestate`
 | `vouch_circuit_breaker_state` | gauge | `backend` — `0` closed, `1` half-open, `2` open |
 | `vouch_circuit_breaker_transitions_total` | counter | `backend`, `state` |
 | `vouch_fallbacks_total` | counter | `from`, `to` |
+| `vouch_hedged_wins_total` | counter | `winner`, `loser` |
+| `vouch_cache_requests_total` | counter | `outcome` (`hit`, `miss`, `bypass`) |
 | `vouch_child_exit_total` | counter | `backend`, `code` (`signal` when signalled) |
 | `vouch_token_rate_limited_total` | counter | `token` |
 | `vouch_backend_health` | gauge | `backend` — `1` healthy, `0` unhealthy |
 
-`protocol` is `openai`, `anthropic`, `mcp`, or `ops`. Histogram buckets run from 1 ms to 300 s.
+`protocol` is `openai`, `anthropic`, `gemini`, `ollama`, `mcp`, `admin`, or `ops`. Histogram buckets run from 1 ms to 300 s.
 
 `GET /ui` — returns `404` by default. Setting `[server].enable_ui = true` enables a read-only HTML dashboard that polls `/healthz`, `/readyz`, and `/metrics` from the browser with `cache-control: no-store`.
 
@@ -640,7 +679,7 @@ Logs are structured JSON with automatic secret redaction (including URL query pa
 | `vouch routes` | `-c/--config`, `--json` | Validate config and print the model → backend fallback table; `--json` prints the raw route map. |
 | `vouch doctor` | `-c/--config`, `--json` | Check configured binaries, auth-file metadata, daemon reachability, and run one live request per backend (`probe_timeout_secs` for CLI/PTY, `5s` for HTTP). Exits `2` when a check fails. |
 | `vouch mcp` | `-c/--config`, `--transport`, `--bind` | Expose routes as MCP JSON-RPC tools (`2024-11-05` + `2026-07-28`, async `tasks/*`) over `stdio` or HTTP (`POST /mcp`). |
-| `vouch top` | `--url`, `--unix-socket`, `--interval-ms` | Live terminal UI polling `/healthz`, `/readyz`, and `/metrics` (highlights `AUTH_EXPIRED` backends). |
+| `vouch top` | `--url`, `--unix-socket`, `--interval-ms`, `--token` | Live terminal UI polling `/healthz`, `/readyz`, `/metrics`, and `/v1/usage` (USD cost, hedged wins, cache hits, `AUTH_EXPIRED`) |
 | `vouch token create` | `--name`, `--rpm`, `--allow` | Generate a 256-bit `vouch_live_...` virtual token and print a ready-to-paste `[[tokens]]` TOML block. |
 | `vouch bench` | `-c/--config`, `-m/--model`, `-n/--requests`, `--concurrency`, `--prompt`, `--stream`, `--json` | Benchmark configured routes end-to-end for TTFT, p50/p95 latency, throughput, and fallbacks. |
 | `vouch stats` | `--url`, `--unix-socket`, `--token`, `--json` | Fetch and display cumulative per-token/per-backend usage & latency analytics from `GET /v1/usage`. |
