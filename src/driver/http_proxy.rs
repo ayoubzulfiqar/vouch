@@ -20,9 +20,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     config::{BackendConfig, BackendKind, DefaultsConfig},
     driver::{
-        ChunkStream, Completion, Driver, DriverResponse, ExecutionRequest, PermitGuard, SseDecoder,
-        StreamChunk, ToolCallDelta, Usage, extract_content, extract_delta_full, extract_thinking,
-        extract_tool_call_deltas, extract_tool_calls, extract_upstream_error, extract_usage,
+        ChunkStream, Completion, Driver, DriverResponse, EmbeddingRequest, EmbeddingResult,
+        ExecutionRequest, PermitGuard, SseDecoder, StreamChunk, ToolCallDelta, Usage,
+        extract_content, extract_delta_full, extract_thinking, extract_tool_call_deltas,
+        extract_tool_calls, extract_upstream_error, extract_usage,
         map_upstream_status_with_headers, truncate,
     },
     error::{GatewayError, Result},
@@ -495,6 +496,93 @@ impl Driver for HttpProxyDriver {
         }
     }
 
+    async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResult> {
+        let permit = PermitGuard::acquire(
+            self.semaphore.clone(),
+            &self.config.id,
+            self.queue_timeout,
+            &request.cancel,
+        )
+        .await?;
+        let base = self
+            .config
+            .base_url
+            .as_deref()
+            .unwrap_or("")
+            .trim_end_matches('/');
+        let upstream_path = self.config.upstream_path.as_deref().unwrap_or("");
+        let is_ollama = upstream_path.starts_with("/api/");
+        let embed_url =
+            if upstream_path.ends_with("/embeddings") || upstream_path.ends_with("/embed") {
+                format!("{base}/{}", upstream_path.trim_start_matches('/'))
+            } else if is_ollama {
+                format!("{base}/api/embed")
+            } else {
+                format!("{base}/v1/embeddings")
+            };
+
+        let upstream_model = self
+            .config
+            .model
+            .clone()
+            .unwrap_or_else(|| request.model.clone());
+        let mut payload = json!({
+            "model": upstream_model,
+            "input": request.inputs,
+        });
+        if !is_ollama
+            && let Some(dim) = request.dimensions
+            && let Some(obj) = payload.as_object_mut()
+        {
+            obj.insert("dimensions".into(), json!(dim));
+        }
+
+        let response = self
+            .client
+            .post(&embed_url)
+            .headers(self.headers(false, request.trace_context.as_ref())?)
+            .json(&payload)
+            .send()
+            .await?;
+        let status = response.status();
+        let resp_headers = response.headers().clone();
+        let text = response.text().await?;
+        permit.release();
+
+        if !status.is_success() {
+            return Err(map_upstream_status_with_headers(
+                status.as_u16(),
+                Some(&resp_headers),
+                &text,
+            ));
+        }
+        let value: Value = serde_json::from_str(&text).map_err(|error| {
+            GatewayError::Upstream(format!(
+                "backend {} returned invalid embeddings JSON: {error}",
+                self.config.id
+            ))
+        })?;
+        if let Some(error) = extract_upstream_error(&value) {
+            return Err(GatewayError::Upstream(format!(
+                "backend {} reported an embeddings error: {}",
+                self.config.id,
+                truncate(&telemetry::redact_text(&error), 500)
+            )));
+        }
+
+        let embeddings = parse_embeddings_json(&self.config.id, &value)?;
+        let prompt_tokens = value
+            .pointer("/usage/prompt_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| value.get("prompt_eval_count").and_then(Value::as_u64))
+            .unwrap_or(0);
+        Ok(EmbeddingResult {
+            embeddings,
+            usage: Usage::new(prompt_tokens, 0),
+            model: upstream_model,
+        })
+    }
+
     async fn probe(&self) -> std::result::Result<(), String> {
         let url = self
             .health_url
@@ -522,4 +610,46 @@ pub fn build_openai_body(model: &str, messages: Vec<Value>, stream: bool) -> Map
     body.insert("messages".into(), json!(messages));
     body.insert("stream".into(), json!(stream));
     body
+}
+
+fn parse_embeddings_json(backend_id: &str, value: &Value) -> Result<Vec<Vec<f32>>> {
+    if let Some(data) = value.get("data").and_then(Value::as_array) {
+        let mut out = Vec::with_capacity(data.len());
+        for item in data {
+            let vec_vals = item
+                .get("embedding")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    GatewayError::Upstream(format!(
+                        "backend {backend_id} embeddings data item missing vector"
+                    ))
+                })?;
+            let vec: Vec<f32> = vec_vals
+                .iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect();
+            out.push(vec);
+        }
+        return Ok(out);
+    }
+    if let Some(arrays) = value.get("embeddings").and_then(Value::as_array) {
+        let mut out = Vec::with_capacity(arrays.len());
+        for arr in arrays {
+            let vec_vals = arr.as_array().ok_or_else(|| {
+                GatewayError::Upstream(format!(
+                    "backend {backend_id} ollama embeddings entry is not an array"
+                ))
+            })?;
+            out.push(
+                vec_vals
+                    .iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect(),
+            );
+        }
+        return Ok(out);
+    }
+    Err(GatewayError::Upstream(format!(
+        "backend {backend_id} returned unrecognized embeddings payload"
+    )))
 }
