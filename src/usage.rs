@@ -459,4 +459,17 @@ mod tests {
         assert_eq!(report.totals.total_tokens, 50);
         assert!(report.totals.p95_ms >= 50);
     }
+
+    #[test]
+    fn latency_ring_buffer_caps_at_max_samples() {
+        let tracker = UsageTracker::new();
+        for ms in 1..=2_500u64 {
+            tracker.record_success("dev", "hermes", Usage::new(1, 1), Duration::from_millis(ms));
+        }
+        let stats = tracker.by_backend.get("hermes").expect("backend stats");
+        assert!(stats.latencies_ms.len() <= MAX_LATENCY_SAMPLES);
+        assert_eq!(stats.latencies_ms.len(), MAX_LATENCY_SAMPLES);
+        assert_eq!(stats.latencies_ms.front().copied(), Some(2_500 - 1024 + 1));
+        assert_eq!(stats.latencies_ms.back().copied(), Some(2_500));
+    }
 }
