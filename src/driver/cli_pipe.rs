@@ -45,6 +45,32 @@ use crate::{
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum captured stderr used in diagnostics.
 const MAX_STDERR_BYTES: usize = 8 * 1024;
+/// Maximum single-line buffer size enforced in `read_mode = "line"` and `output_mode = "json_lines"` (2 MiB).
+pub const MAX_LINE_BUFFER_BYTES: usize = 2_097_152;
+
+/// True when a command invokes a Windows `.cmd` or `.bat` batch shim (whose
+/// `cmd.exe /c` interpreter mangles newlines and shell metacharacters passed in argv).
+pub fn is_windows_batch_shim(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    lower.ends_with(".cmd") || lower.ends_with(".bat")
+}
+
+/// True when an inline argv prompt must spill to a private temp file via [`PromptSpillFile`].
+pub fn should_spill_prompt_to_file(
+    stdin: bool,
+    prompt_len: usize,
+    max_inline_prompt_bytes: usize,
+    is_windows: bool,
+    command: &str,
+) -> bool {
+    if stdin {
+        return false;
+    }
+    if is_windows && is_windows_batch_shim(command) {
+        return true;
+    }
+    prompt_len > max_inline_prompt_bytes.max(1)
+}
 
 /// Tracks the timestamp of the last byte observed on child stdout or stderr so
 /// the idle-stall watchdog resets on any subprocess activity.
@@ -128,9 +154,13 @@ impl CliPipeDriver {
 
         let (full_prompt, attachments) =
             materialize_prompt_with_config(request, &self.attachments).await?;
-        let spill = if !self.config.stdin
-            && full_prompt.len() > self.config.max_inline_prompt_bytes.max(1)
-        {
+        let spill = if should_spill_prompt_to_file(
+            self.config.stdin,
+            full_prompt.len(),
+            self.config.max_inline_prompt_bytes,
+            cfg!(windows),
+            command_path,
+        ) {
             Some(PromptSpillFile::create(&full_prompt)?)
         } else {
             None
@@ -455,6 +485,21 @@ impl CliPipeDriver {
                             ReadMode::Chunk => utf8_decoder.feed(&buffer[..read]),
                             ReadMode::Line => {
                                 raw_line_carry.extend_from_slice(&buffer[..read]);
+                                if raw_line_carry
+                                    .split(|&b| b == b'\n')
+                                    .any(|seg| seg.len() > MAX_LINE_BUFFER_BYTES)
+                                {
+                                    guard.terminate();
+                                    let _ =
+                                        tokio::time::timeout(Duration::from_secs(2), child.wait())
+                                            .await;
+                                    let _ = sender
+                                        .send(Err(GatewayError::ProcessFailure(format!(
+                                            "backend {backend} exceeded {MAX_LINE_BUFFER_BYTES} byte single-line limit"
+                                        ))))
+                                        .await;
+                                    return;
+                                }
                                 if let Some(last_nl) =
                                     raw_line_carry.iter().rposition(|&b| b == b'\n')
                                 {
@@ -471,7 +516,8 @@ impl CliPipeDriver {
                         }
                         if produced.len() + stripped.len() > MAX_OUTPUT_BYTES {
                             guard.terminate();
-                            let _ = child.wait().await;
+                            let _ =
+                                tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
                             let _ = sender
                                 .send(Err(GatewayError::Upstream(format!(
                                     "backend {backend} exceeded the {MAX_OUTPUT_BYTES} byte output limit"
@@ -486,16 +532,45 @@ impl CliPipeDriver {
                                 if filtered.is_empty() {
                                     continue;
                                 }
-                                let chunks = filter.push(&filtered);
+                                let chunks = match filter.push(&filtered) {
+                                    Ok(chunks) => chunks,
+                                    Err(error) => {
+                                        guard.terminate();
+                                        let _ = tokio::time::timeout(
+                                            Duration::from_secs(2),
+                                            child.wait(),
+                                        )
+                                        .await;
+                                        let _ = sender.send(Err(error)).await;
+                                        return;
+                                    }
+                                };
                                 if !dispatch_stream_chunks(&sender, chunks).await {
                                     guard.terminate();
-                                    let _ = child.wait().await;
+                                    let _ =
+                                        tokio::time::timeout(Duration::from_secs(2), child.wait())
+                                            .await;
                                     return;
                                 }
                             }
                             OutputMode::Json => json_buffer.push_str(&stripped),
                             OutputMode::JsonLines => {
                                 line_buffer.push_str(&stripped);
+                                if line_buffer
+                                    .split('\n')
+                                    .any(|seg| seg.len() > MAX_LINE_BUFFER_BYTES)
+                                {
+                                    guard.terminate();
+                                    let _ =
+                                        tokio::time::timeout(Duration::from_secs(2), child.wait())
+                                            .await;
+                                    let _ = sender
+                                        .send(Err(GatewayError::ProcessFailure(format!(
+                                            "backend {backend} exceeded {MAX_LINE_BUFFER_BYTES} byte single-line limit"
+                                        ))))
+                                        .await;
+                                    return;
+                                }
                                 while let Some(position) = line_buffer.find('\n') {
                                     let line: String = line_buffer.drain(..=position).collect();
                                     let line = line.trim_end_matches(['\n', '\r']);
@@ -507,7 +582,11 @@ impl CliPipeDriver {
                                         && sender.send(Ok(StreamChunk::delta(delta))).await.is_err()
                                     {
                                         guard.terminate();
-                                        let _ = child.wait().await;
+                                        let _ = tokio::time::timeout(
+                                            Duration::from_secs(2),
+                                            child.wait(),
+                                        )
+                                        .await;
                                         return;
                                     }
                                 }
@@ -549,10 +628,19 @@ impl CliPipeDriver {
             if output_mode == OutputMode::Text {
                 tail_combined.push_str(&out_filter.finish());
                 if !tail_combined.is_empty() {
-                    let chunks = filter.push(&tail_combined);
+                    let chunks = match filter.push(&tail_combined) {
+                        Ok(chunks) => chunks,
+                        Err(error) => {
+                            guard.terminate();
+                            let _ =
+                                tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                            let _ = sender.send(Err(error)).await;
+                            return;
+                        }
+                    };
                     if !dispatch_stream_chunks(&sender, chunks).await {
                         guard.terminate();
-                        let _ = child.wait().await;
+                        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
                         return;
                     }
                 }
