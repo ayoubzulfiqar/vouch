@@ -8,13 +8,13 @@ A local authentication multiplexer and process-supervised gateway for AI orchest
 
 `vouch` runs under your host user account, binds only to loopback (and an optional `0600` Unix socket by default), and adds policy in the middle: routing, fallback chains, circuit breakers, sticky sessions, per-token quotas, worktree isolation, redacted logs, and process-group supervision.
 
-- OpenAI-compatible: `GET /v1/models`, `POST /v1/chat/completions` (JSON, SSE, `response_format`), stateful `POST` + WebSocket `GET /v1/responses` (`previous_response_id`, `store`, `text.format`)
+- OpenAI-compatible: `GET /v1/models`, `POST /v1/chat/completions` (JSON, SSE, `response_format`), `POST /v1/embeddings` (`float` & `base64`), stateful `POST` + WebSocket `GET /v1/responses` (`previous_response_id`, `store`, `text.format`)
 - Anthropic-compatible: `POST /v1/messages` (JSON, SSE, extended `thinking`, `cache_control`)
-- Google Gemini & Ollama ingress: `POST /v1beta/models/{model}:generateContent` & `:streamGenerateContent`, plus `GET /api/tags`, `POST /api/chat`, and `POST /api/generate` (NDJSON & buffered)
-- Multimodal & tool calling: base64/URL images (`0600` temp attachment lifecycle), parallel multi-tool streaming, schema auto-repair retries, and `tools` / `tool_calls` / `tool_use` bridged across drivers
-- Speculative routing & caching: `ordered`, `least_latency` (EWMA TTFT), and `hedged` strategies (`[route_policies.<model>]`), multi-profile credential rotation (`[[backends.profiles]]`), and deterministic SHA-256 response cache (`[cache]`)
+- Google Gemini & Ollama ingress: `POST /v1beta/models/{model}:generateContent` & `:streamGenerateContent` (`thought: true` & streaming `functionCall`), plus `GET /api/tags`, `POST /api/chat`, and `POST /api/generate` (`tool_calls`, NDJSON & buffered)
+- Multimodal & tool calling: base64/URL images (`0600` temp attachment lifecycle with startup crash-orphan sweep), parallel multi-tool streaming, schema auto-repair retries, and `tools` / `tool_calls` / `tool_use` bridged across drivers
+- Speculative routing, caching & guardrails: `ordered`, `least_latency`, and `hedged` strategies, singleflight request coalescing (`X-Vouch-Coalesced: true`), deterministic SHA-256 response cache (`[cache]`), outbound secret egress guardrails (`[security.egress_guard]`), and regex `[[backends.output_filters]]`
 - Dual-spec MCP ingress: `vouch mcp` (`stdio` / HTTP) and `POST /mcp` (`2024-11-05` + `2026-07-28`, `resources/*`, `prompts/*`, `[[mcp_upstreams]]` aggregation, async `tasks/*`)
-- Operations, budgets & CLI: `GET /healthz`, `/readyz`, `/metrics`, `GET /v1/usage`, `POST /admin/*` (`enable_admin = true`), per-token RPM/TPM/concurrency/expiry/USD pricing, `vouch init`, `vouch stats`, `vouch top`, `vouch token create`, `vouch bench`, and opt-in `GET /ui`
+- Operations, budgets, traces & CLI: `GET /healthz`, `/readyz`, `/metrics`, `GET /v1/usage`, `GET /v1/traces`, `POST /admin/*` (`enable_admin = true`), pre-execution token budget reservations, `[flight_recorder]` + `vouch replay`, `vouch doctor --fix`, `vouch config diff`, `vouch init`, `vouch stats`, `vouch top`, `vouch token create`, `vouch bench`, and interactive `GET /ui` Console v2
 - Egress: pooled HTTP/SSE proxy, headless stdin/stdout subprocess, and configurable PTY subprocess (`pty_auto_respond`, `idle_timeout_secs`, native session delta resumption)
 - Reload: `SIGHUP` or config-file change atomically swaps configuration without dropping in-flight requests
 
@@ -731,17 +731,19 @@ The integration suite (`tests/integration_test.rs`) is self-contained: it create
 Module map:
 
 ```
-src/main.rs        CLI, tracing, listeners, signals, graceful shutdown
+src/main.rs        CLI, tracing, listeners, orphan sweep, signals, drain shutdown
 src/config.rs      typed TOML schema, validation, ArcSwap snapshots
-src/error.rs       GatewayError -> OpenAI/Anthropic wire errors + auth/429 classification
-src/usage.rs       tiktoken-rs BPE token counting with char/4 fallback
-src/state.rs       shared AppState (sessions, responses, MCP tasks)
-src/auth/          discovery + virtual tokens
-src/router/        routing, affinity, native delta sessions, circuit breaker
-src/driver/        trait, HTTP proxy, CLI pipe, PTY, attachments/spill, tool bridge, worktree
-src/ingress/       OpenAI (/v1/chat/completions, /v1/responses), Anthropic, MCP, ops, /ui
-src/cli/           routes, doctor, service, mcp, top, token, bench
-src/telemetry.rs   JSON tracing + redaction
+src/error.rs       GatewayError -> OpenAI/Anthropic wire errors + egress block + auth/429 classification
+src/usage.rs       tiktoken-rs BPE token counting, profile-aware pricing, latency quantiles
+src/state.rs       shared AppState (sessions, responses, cache, egress guard, recorder, traces, MCP)
+src/recorder.rs    opt-in redacted JSONL flight recorder with bounded rotation
+src/security/      outbound secret/PII egress guardrails ([security.egress_guard])
+src/auth/          discovery + virtual tokens with atomic pre-execution quota reservations
+src/router/        routing, affinity, native delta sessions, hedged/EWMA scheduling, circuit breaker
+src/driver/        trait, HTTP proxy (+ embeddings), CLI pipe, PTY, attachments/spill, tool bridge, worktree
+src/ingress/       OpenAI (+ /v1/embeddings), Responses, Anthropic, Gemini, Ollama, MCP, admin, ops, /ui
+src/cli/           routes, doctor (--fix), service, mcp, top, token, bench, stats, init, replay, config diff
+src/telemetry.rs   JSON tracing, OTLP exporter, trace ring buffer (/v1/traces), secret redaction
 src/metrics.rs     Prometheus instruments
 ```
 
