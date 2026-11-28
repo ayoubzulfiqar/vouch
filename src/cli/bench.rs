@@ -252,6 +252,7 @@ async fn run_single_sample(
         max_tokens: Some(64),
         workspace_mode: WorkspaceMode::None,
         workdir: None,
+        workspace_root: None,
         cancel: CancellationToken::new(),
         tools: Vec::new(),
         tool_choice: None,
