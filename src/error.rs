@@ -28,6 +28,14 @@ pub enum GatewayError {
     #[error("invalid request: {0}")]
     BadRequest(String),
 
+    /// The client sent a request body with an unsupported `Content-Type`.
+    #[error("unsupported media type: {0}")]
+    UnsupportedMediaType(String),
+
+    /// A managed subprocess violated framing, line/tag buffering limits, or process execution invariants.
+    #[error("process failure: {0}")]
+    ProcessFailure(String),
+
     /// A credential is missing or invalid.
     #[error("authentication required: {0}")]
     Unauthorized(String),
@@ -142,6 +150,7 @@ impl GatewayError {
         match self {
             Self::Config(_) | Self::Internal(_) | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) | Self::EgressBlocked(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
@@ -149,7 +158,9 @@ impl GatewayError {
             | Self::DailyTokenBudgetExceeded { .. }
             | Self::UpstreamRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::Saturated(_) | Self::NoHealthyBackend(_) => StatusCode::SERVICE_UNAVAILABLE,
-            Self::Upstream(_) | Self::UpstreamAuthExpired(_) => StatusCode::BAD_GATEWAY,
+            Self::Upstream(_) | Self::UpstreamAuthExpired(_) | Self::ProcessFailure(_) => {
+                StatusCode::BAD_GATEWAY
+            }
             Self::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             Self::ClientDisconnected => StatusCode::REQUEST_TIMEOUT,
         }
@@ -182,6 +193,7 @@ impl GatewayError {
             Self::Saturated(_)
                 | Self::NoHealthyBackend(_)
                 | Self::Upstream(_)
+                | Self::ProcessFailure(_)
                 | Self::UpstreamRateLimited { .. }
                 | Self::UpstreamAuthExpired(_)
                 | Self::Timeout(_)
@@ -197,6 +209,7 @@ impl GatewayError {
         matches!(
             self,
             Self::Upstream(_)
+                | Self::ProcessFailure(_)
                 | Self::UpstreamRateLimited { .. }
                 | Self::UpstreamAuthExpired(_)
                 | Self::Timeout(_)
@@ -208,7 +221,7 @@ impl GatewayError {
     /// OpenAI error `type` field.
     fn openai_error_type(&self) -> &'static str {
         match self {
-            Self::BadRequest(_) => "invalid_request_error",
+            Self::BadRequest(_) | Self::UnsupportedMediaType(_) => "invalid_request_error",
             Self::Unauthorized(_) | Self::UpstreamAuthExpired(_) => "authentication_error",
             Self::Forbidden(_) | Self::EgressBlocked(_) => "permission_error",
             Self::NotFound(_) => "not_found_error",
@@ -217,7 +230,10 @@ impl GatewayError {
             | Self::UpstreamRateLimited { .. } => "rate_limit_error",
             Self::Saturated(_) | Self::NoHealthyBackend(_) => "service_unavailable_error",
             Self::Config(_) | Self::Internal(_) | Self::Io(_) => "server_error",
-            Self::Upstream(_) | Self::Timeout(_) | Self::ClientDisconnected => "api_error",
+            Self::Upstream(_)
+            | Self::ProcessFailure(_)
+            | Self::Timeout(_)
+            | Self::ClientDisconnected => "api_error",
         }
     }
 
@@ -226,6 +242,7 @@ impl GatewayError {
         match self {
             Self::Config(_) => "configuration_error",
             Self::BadRequest(_) => "invalid_request",
+            Self::UnsupportedMediaType(_) => "unsupported_media_type",
             Self::Unauthorized(_) => "invalid_api_key",
             Self::Forbidden(_) => "model_not_allowed",
             Self::EgressBlocked(_) => "egress_policy_blocked",
@@ -237,6 +254,7 @@ impl GatewayError {
             Self::Saturated(_) => "backend_saturated",
             Self::NoHealthyBackend(_) => "no_healthy_backend",
             Self::Upstream(_) => "upstream_error",
+            Self::ProcessFailure(_) => "process_failure",
             Self::Timeout(_) => "upstream_timeout",
             Self::ClientDisconnected => "client_disconnected",
             Self::Io(_) | Self::Internal(_) => "internal_error",
@@ -246,7 +264,7 @@ impl GatewayError {
     /// Anthropic error `type` field.
     fn anthropic_error_type(&self) -> &'static str {
         match self {
-            Self::BadRequest(_) => "invalid_request_error",
+            Self::BadRequest(_) | Self::UnsupportedMediaType(_) => "invalid_request_error",
             Self::Unauthorized(_) | Self::UpstreamAuthExpired(_) => "authentication_error",
             Self::Forbidden(_) | Self::EgressBlocked(_) => "permission_error",
             Self::NotFound(_) => "not_found_error",
@@ -254,7 +272,7 @@ impl GatewayError {
             | Self::DailyTokenBudgetExceeded { .. }
             | Self::UpstreamRateLimited { .. } => "rate_limit_error",
             Self::Saturated(_) | Self::NoHealthyBackend(_) => "overloaded_error",
-            Self::Upstream(_) | Self::Timeout(_) => "api_error",
+            Self::Upstream(_) | Self::ProcessFailure(_) | Self::Timeout(_) => "api_error",
             Self::ClientDisconnected => "api_error",
             Self::Config(_) | Self::Internal(_) | Self::Io(_) => "api_error",
         }
