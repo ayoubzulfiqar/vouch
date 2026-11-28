@@ -733,7 +733,7 @@ pub fn sanitize_relative_repo_path(raw: &str, workspace_root: Option<&Path>) -> 
 
     let candidate_path = Path::new(cleaned);
     let relative_buf;
-    let rel = if candidate_path.is_absolute() {
+    let rel = if candidate_path.has_root() || candidate_path.is_absolute() {
         let root = workspace_root?;
         if let Ok(stripped) = candidate_path.strip_prefix(root) {
             relative_buf = stripped.to_path_buf();
