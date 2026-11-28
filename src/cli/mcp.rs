@@ -1746,7 +1746,6 @@ async fn call_upstream_mcp(
             };
 
             let res = tokio::time::timeout(timeout, req_future).await;
-            #[cfg(unix)]
             if let Some(g) = guard {
                 g.terminate();
             }
